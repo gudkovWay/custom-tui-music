@@ -1,0 +1,30 @@
+[package]
+name = "tmus-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Демон tmusd: control-socket, MPRIS, SNI-трей, Discord RPC"
+
+[[bin]]
+name = "tmusd"
+path = "src/main.rs"
+
+[dependencies]
+tmus-core.workspace = true
+tmus-provider.workspace = true
+tmus-player.workspace = true
+tmus-ytmusic.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+discord-rich-presence.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zbus.workspace = true

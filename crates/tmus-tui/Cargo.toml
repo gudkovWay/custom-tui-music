@@ -1,0 +1,22 @@
+[package]
+name = "tmus-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Клиент tmus: ratatui-интерфейс и одноразовые подкоманды"
+
+[[bin]]
+name = "tmus"
+path = "src/main.rs"
+
+[dependencies]
+tmus-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

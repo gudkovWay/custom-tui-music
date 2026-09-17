@@ -1,0 +1,21 @@
+[package]
+name = "tmus-ytmusic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Провайдер YouTube Music: InnerTube, SAPISIDHASH, резолв через общий yt-dlp-хелпер"
+
+[dependencies]
+tmus-core.workspace = true
+tmus-provider.workspace = true
+async-trait.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

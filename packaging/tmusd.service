@@ -1,0 +1,37 @@
+[Unit]
+Description=tmus — терминальный музыкальный плеер (демон)
+Documentation=https://github.com/q/custom-tui-music
+# Демон публикует MPRIS и иконку SNI, поэтому ему нужна сессионная шина.
+# Оболочка (noctalia) может подняться позже — трей регистрируется с
+# повтором, так что жёсткой зависимости от неё здесь нет.
+After=graphical-session.target pipewire.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/tmusd
+Restart=on-failure
+RestartSec=3
+
+# Демон держит подпроцесс mpv. KillMode=control-group гасит и его:
+# иначе mpv остался бы играть без демона, и остановить его было бы нечем.
+KillMode=control-group
+TimeoutStopSec=10
+
+# Сеть, диск и D-Bus нужны; всё остальное — нет.
+NoNewPrivileges=yes
+PrivateTmp=no
+ProtectSystem=strict
+ProtectHome=read-write
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+# Кэш, состояние и сокет пишутся в XDG-каталоги; ProtectSystem=strict
+# делает остальную систему только для чтения.
+ReadWritePaths=%h/.cache/tmus %h/.local/state/tmus
+
+Environment=TMUS_LOG=info
+
+[Install]
+WantedBy=graphical-session.target
