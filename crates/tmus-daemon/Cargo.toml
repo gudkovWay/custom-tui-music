@@ -21,6 +21,7 @@ async-trait.workspace = true
 clap.workspace = true
 discord-rich-presence.workspace = true
 futures-util.workspace = true
+libc.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

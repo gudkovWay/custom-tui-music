@@ -244,16 +244,32 @@ impl App {
 
             Cmd::State => Ok(Payload::State(self.player.state().await)),
             Cmd::Providers => Ok(Payload::Providers(self.providers())),
+            // Каталожные операции разбирают мегабайты JSON: библиотека
+            // из 1000 треков приезжает десятком страниц продолжений.
+            // После них арены glibc остаются раздутыми — замерено:
+            // 9.9 МБ на старте → 187 МБ высокой метки, и на покое она
+            // не опускается. Поэтому страницы возвращаются системе
+            // явно, сразу после операции.
             Cmd::Search { query, kind, provider } => {
-                Ok(Payload::Results(self.search(&query, kind, provider.as_deref()).await?))
+                let out = self.search(&query, kind, provider.as_deref()).await?;
+                release_memory();
+                Ok(Payload::Results(out))
             }
             Cmd::Library { provider } => {
-                Ok(Payload::Playlists(self.library(provider.as_deref()).await?))
+                let out = self.library(provider.as_deref()).await?;
+                release_memory();
+                Ok(Payload::Playlists(out))
             }
             Cmd::LibraryTracks { playlist } => {
-                Ok(Payload::Tracks(self.playlist_tracks(&playlist).await?))
+                let out = self.playlist_tracks(&playlist).await?;
+                release_memory();
+                Ok(Payload::Tracks(out))
             }
-            Cmd::Liked { provider } => Ok(Payload::Tracks(self.liked(provider.as_deref()).await?)),
+            Cmd::Liked { provider } => {
+                let out = self.liked(provider.as_deref()).await?;
+                release_memory();
+                Ok(Payload::Tracks(out))
+            }
 
             Cmd::CacheStats => Ok(Payload::Cache(self.with_cache(|c| c.stats())?)),
             Cmd::CachePin { tracks } => {
@@ -507,6 +523,27 @@ impl App {
                 auth: provider.account().auth(),
             });
         }
+    }
+}
+
+/// Вернуть системе страницы, освобождённые аллокатором.
+///
+/// glibc держит освобождённую память в аренах и сам её не отдаёт, если
+/// та фрагментирована. После разбора библиотеки это видно прямо:
+/// замерено 9.9 МБ на старте демона, 14.4 МБ после чтения плейлистов,
+/// **187 МБ высокой метки** после чтения 1000 лайков — и на покое она
+/// не опускалась. Это не утечка: повторные вызовы упираются в то же
+/// плато. Но 187 МБ в покое сводят на нет весь смысл замены Electron,
+/// поэтому страницы возвращаются явно.
+///
+/// Функция специфична для glibc; на других аллокаторах она просто
+/// ничего не сделает и вернёт 0.
+fn release_memory() {
+    // SAFETY: malloc_trim не принимает указателей и не имеет
+    // предусловий; аргумент — сколько байт оставить в запасе на вершине
+    // кучи, 0 значит «вернуть всё, что можно».
+    unsafe {
+        libc::malloc_trim(0);
     }
 }
 

@@ -3142,6 +3142,7 @@ dependencies = [
  "clap",
  "discord-rich-presence",
  "futures-util",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
