@@ -58,14 +58,6 @@ pub struct YtDlpMedia {
     pub acodec: Option<String>,
 }
 
-/// Плоская запись из `--flat-playlist`.
-pub struct YtDlpEntry {
-    pub id: String,
-    pub title: String,
-    pub uploader: Option<String>,
-    pub duration: Option<Duration>,
-}
-
 impl YtDlp {
     #[must_use]
     pub fn new(binary: PathBuf) -> Self {
@@ -104,34 +96,6 @@ impl YtDlp {
                 reason: format!("yt-dlp вернул не-JSON: {e}"),
             })?;
         parse_media(req.provider, &value)
-    }
-
-    /// Плоский список: `yt-dlp --flat-playlist -J`. Замерено: лайки YTM
-    /// отвечают за 1.36 с — этого достаточно для каталога без метаданных.
-    pub async fn flat_playlist(
-        &self,
-        url: &str,
-        cookies: Option<&tmus_core::cookies::CookieSource>,
-    ) -> crate::Result<Vec<YtDlpEntry>> {
-        let mut args: Vec<String> = vec![
-            "--no-warnings".into(),
-            "--quiet".into(),
-            "--flat-playlist".into(),
-            "-J".into(),
-        ];
-        if let Some(cookies) = cookies {
-            args.extend(cookies.as_ytdlp_args());
-        }
-        args.push(url.into());
-
-        let out = self.run(&args, provider_for_url(url)).await?;
-        let value: serde_json::Value = serde_json::from_str(&out).map_err(|e| {
-            ProviderError::Format {
-                provider: provider_for_url(url),
-                reason: format!("yt-dlp вернул не-JSON: {e}"),
-            }
-        })?;
-        Ok(parse_entries(&value))
     }
 
     /// Запуск с таймаутом и разбором статуса. `provider` нужен только
@@ -180,17 +144,6 @@ impl YtDlp {
             user_agent: media.user_agent,
             expires_at: media.expires_at,
         }
-    }
-}
-
-/// Провайдер по домену URL — нужен только для сообщений об ошибках:
-/// контракт `flat_playlist` не принимает провайдера, а ошибка должна
-/// указывать, кто именно ответил неожиданным форматом.
-fn provider_for_url(url: &str) -> ProviderId {
-    if url.contains("music.youtube.com") || url.contains("youtube.com") {
-        ProviderId::YTMUSIC
-    } else {
-        ProviderId::SOUNDCLOUD
     }
 }
 
@@ -267,39 +220,6 @@ fn parse_expire(url: &str) -> Option<std::time::SystemTime> {
     let start = url.split(&['?', '&']).find_map(|q| q.strip_prefix("expire="))?;
     let ts: u64 = start.parse().ok()?;
     Some(std::time::UNIX_EPOCH + Duration::from_secs(ts))
-}
-
-/// Разбор `entries[]` из `--flat-playlist`. Запись без `id` пропускается:
-/// без идентификатора трек не адресуем, а остальное — восполняемо.
-fn parse_entries(value: &serde_json::Value) -> Vec<YtDlpEntry> {
-    let empty = Vec::new();
-    let entries = value
-        .get("entries")
-        .and_then(serde_json::Value::as_array)
-        .unwrap_or(&empty);
-
-    entries
-        .iter()
-        .filter_map(|e| {
-            let id = e.get("id")?.as_str()?.to_owned();
-            Some(YtDlpEntry {
-                title: e
-                    .get("title")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                uploader: e
-                    .get("uploader")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned),
-                duration: e
-                    .get("duration")
-                    .and_then(serde_json::Value::as_f64)
-                    .map(|s| Duration::from_secs_f64(s.max(0.0))),
-                id,
-            })
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -384,28 +304,6 @@ mod tests {
         };
         assert!(expired.is_expired(now));
         let _ = expires_at;
-    }
-
-    #[test]
-    fn flat_playlist_skips_entries_without_id() {
-        let v: serde_json::Value = serde_json::from_str(
-            r#"{"entries": [
-                {"id": "abc", "title": "Song", "uploader": "Artist", "duration": 201.5},
-                {"title": "no id here"},
-                {"id": "def"}
-            ]}"#,
-        )
-        .unwrap();
-        let entries = parse_entries(&v);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].id, "abc");
-        assert_eq!(
-            entries[0].duration,
-            Some(Duration::from_secs_f64(201.5))
-        );
-        assert_eq!(entries[1].title, "");
-        assert_eq!(entries[1].uploader, None);
-        assert_eq!(entries[1].duration, None);
     }
 
     #[test]
