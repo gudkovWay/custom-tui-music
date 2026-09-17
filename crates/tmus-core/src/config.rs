@@ -50,6 +50,12 @@ pub struct Config {
     /// Показывать текущий трек в Discord.
     pub discord_rpc: bool,
 
+    /// Application ID из Discord Developer Portal. Своё приложение
+    /// обязательно: чужой ID показывал бы в профиле чужое имя и чужую
+    /// иконку. `None` — берём из переменной `TMUS_DISCORD_APP_ID`
+    /// (удобно, когда id не хочется держать в файле конфига).
+    pub discord_app_id: Option<String>,
+
     pub cache: CacheConfig,
 
     pub browser: BrowserConfig,
@@ -70,6 +76,7 @@ impl Default for Config {
             volume: DEFAULT_VOLUME,
             audio_format: "bestaudio[acodec=opus]/bestaudio".to_owned(),
             discord_rpc: true,
+            discord_app_id: None,
             cache: CacheConfig::default(),
             browser: BrowserConfig::default(),
             providers: BTreeMap::new(),

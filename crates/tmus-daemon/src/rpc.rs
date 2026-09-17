@@ -118,13 +118,19 @@ fn now_ms() -> i64 {
 
 /// Полный цикл подсистемы.
 pub async fn run(app: Arc<crate::app::App>) -> anyhow::Result<()> {
-    let app_id = std::env::var(APP_ID_ENV).with_context(|| {
-        format!(
-            "переменная {APP_ID_ENV} не задана: создайте приложение в Discord Developer \
-             Portal и укажите его Application ID — вымышленный ID показывал бы в профиле \
-             чужое приложение"
-        )
-    })?;
+    // Конфиг важнее окружения: у systemd-юнита своё окружение, и
+    // держать id в `Environment=` неудобнее, чем в `config.toml`.
+    // Переменная остаётся для случая, когда id не хочется класть в файл.
+    let app_id = match app.config().discord_app_id.clone() {
+        Some(id) if !id.trim().is_empty() => id,
+        _ => std::env::var(APP_ID_ENV).with_context(|| {
+            format!(
+                "Application ID не задан: создайте приложение в Discord Developer Portal и \
+                 укажите его как `discord_app_id` в ~/.config/tmus/config.toml либо через \
+                 переменную {APP_ID_ENV}. Чужой ID показывал бы в профиле чужое приложение"
+            )
+        })?,
+    };
 
     // Канал без границ: отправитель — асинхронная задача, приёмник —
     // блокирующий поток. Переполнение невозможно по построению:
@@ -215,7 +221,18 @@ fn connect(app_id: &str) -> anyhow::Result<DiscordIpcClient> {
 }
 
 fn build_activity(p: PresenceData) -> activity::Activity<'static> {
-    let mut act = activity::Activity::new().details(p.details);
+    // Тип активности обязателен, и по умолчанию его нет: без него
+    // Discord пишет «Playing tmus», как про игру. Музыке нужен
+    // `Listening` — тогда строка становится «Listening to …».
+    //
+    // `status_display_type` решает, ЧТО подставить после «Listening to»
+    // в списке участников: `Name` даёт имя приложения, `State` —
+    // артиста, `Details` — название трека. Берём `Details`: в списке
+    // видно именно то, что играет, а артист и так стоит строкой ниже.
+    let mut act = activity::Activity::new()
+        .activity_type(activity::ActivityType::Listening)
+        .status_display_type(activity::StatusDisplayType::Details)
+        .details(p.details);
     if let Some(state) = p.state {
         act = act.state(state);
     }

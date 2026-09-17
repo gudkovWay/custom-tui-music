@@ -20,16 +20,29 @@ TimeoutStopSec=10
 
 # Сеть, диск и D-Bus нужны; всё остальное — нет.
 NoNewPrivileges=yes
-PrivateTmp=no
+# Приватный /tmp обязателен: ProtectSystem=strict делает общий /tmp
+# только для чтения, а cookies браузера читаются через копию базы во
+# временном каталоге (живой браузер держит её залоченной). Без этого
+# провайдер не поднимался: «временный каталог не создался:
+# Read-only file system».
+PrivateTmp=yes
 ProtectSystem=strict
-ProtectHome=read-write
+# ProtectHome принимает только yes|no|read-only|tmpfs. `read-write`
+# systemd игнорировал с предупреждением в журнале. Домашний каталог
+# нужен на запись (кэш, состояние, чтение cookies), поэтому `no`.
+ProtectHome=no
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
-# Кэш, состояние и сокет пишутся в XDG-каталоги; ProtectSystem=strict
-# делает остальную систему только для чтения.
-ReadWritePaths=%h/.cache/tmus %h/.local/state/tmus
+# Кэш и состояние объявляем systemd, а не через ReadWritePaths: тот
+# требует, чтобы каталоги УЖЕ существовали, и на чистой системе юнит
+# падал с `status=226/NAMESPACE` ещё до запуска демона — а создаёт их
+# как раз демон. CacheDirectory/StateDirectory создают их сами и дают
+# на запись. В user-юните они разворачиваются в $XDG_CACHE_HOME/tmus и
+# $XDG_STATE_HOME/tmus.
+CacheDirectory=tmus
+StateDirectory=tmus
 
 Environment=TMUS_LOG=info
 
