@@ -75,6 +75,15 @@ mpv = "mpv"
 yt_dlp = "yt-dlp"
 audio_format = "bestaudio[acodec=opus]/bestaudio"
 discord_rpc = true
+# Application ID из Discord Developer Portal. Своё приложение
+# обязательно: с чужим в профиле было бы чужое имя и чужая иконка.
+# Ассеты загружать не нужно — обложка отдаётся внешней ссылкой.
+discord_app_id = "0000000000000000000"
+
+# ВНИМАНИЕ: все поля верхнего уровня обязаны идти ДО первой секции в
+# квадратных скобках. Ключ ниже `[cache]` TOML относит внутрь `[cache]`.
+# Незнакомый ключ демон отвергает с указанием строки, а не проглатывает
+# молча — на этом уже попались с `discord_app_id`.
 
 [cache]
 limit_bytes = 8589934592   # лимит офлайн-кэша, вытеснение LRU
@@ -88,9 +97,14 @@ profile = "chromium:/path/to/profile"
 enabled = true
 ```
 
-Discord RPC требует своего приложения: завести его в Discord Developer
-Portal и передать id через `TMUS_DISCORD_APP_ID`. Чужой id подставлять
-нельзя — в профиле человека отображалось бы чужое приложение.
+Discord RPC требует своего приложения: `discord.com/developers/applications`
+→ `New Application` → имя (его увидят друзья как «Listening to …») →
+скопировать `Application ID` в `discord_app_id`. Ассеты в
+`Rich Presence → Art Assets` загружать не нужно: обложка отдаётся
+внешним URL. Чужой id подставлять нельзя — в профиле человека
+отображалось бы чужое приложение.
+
+Запасной путь — переменная `TMUS_DISCORD_APP_ID`; конфиг важнее её.
 
 ## Офлайн
 
@@ -138,3 +152,15 @@ Portal и передать id через `TMUS_DISCORD_APP_ID`. Чужой id п
 ## Лицензия
 
 MIT.
+
+## Медиа-клавиши Hyprland
+
+```conf
+bindl = , XF86AudioPlay,  exec, tmus toggle
+bindl = , XF86AudioNext,  exec, tmus next
+bindl = , XF86AudioPrev,  exec, tmus prev
+bindl = , XF86AudioStop,  exec, tmus stop
+bind  = SUPER, M,         exec, kitty -e tmus
+```
+
+`bindl` вместо `bind` — чтобы клавиши работали и на залоченном экране.

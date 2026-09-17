@@ -26,7 +26,13 @@ const DEFAULT_VOLUME: f64 = 70.0;
 const DEFAULT_CACHE_LIMIT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Настройки приложения целиком.
+// Незнакомый ключ — громкая ошибка, а не тишина. Причина замерена:
+// `discord_app_id`, поставленный в файле НИЖЕ `[cache]`, TOML относит
+// внутрь этой секции; без этой проверки serde его молча проглатывал, и
+// демон жаловался на незаданный Application ID при заполненном конфиге.
+// Опечатка в имени ключа прячется так же.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct Config {
     /// Путь к `mpv`. Именно путь, а не только имя: у части людей mpv
@@ -137,6 +143,7 @@ impl Config {
 
 /// Офлайн-кэш аудио.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct CacheConfig {
     /// Предел занимаемого места. Кэш — не главное хранилище: при
@@ -158,6 +165,7 @@ impl Default for CacheConfig {
 
 /// Браузер, из которого берутся cookies.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct BrowserConfig {
     /// Явная спецификация профиля в формате yt-dlp: `chromium:/путь`
@@ -167,6 +175,7 @@ pub struct BrowserConfig {
 
 /// Настройки одного провайдера.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct ProviderConfig {
     /// Выключенный провайдер не попадает в реестр: его треки не
