@@ -17,8 +17,9 @@ mod auth;
 mod innertube;
 mod parse;
 
+use std::collections::HashMap;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
@@ -68,6 +69,13 @@ pub struct YtMusic {
     /// же источника, но своим jar'ом; источнику здесь принадлежит
     /// последнее слово, потому что его перечитывает `refresh`.
     cookies: CookieSource,
+    /// `setVideoId` записей плейлистов: (id плейлиста, id видео) →
+    /// служебный идентификатор записи. В памяти, а не в БД, потому что
+    /// карта наполняется штатным листингом плейлиста: после рестарта
+    /// демона достаточно один раз открыть плейлист, и правка снова
+    /// работает — постоянное хранение ничего бы не добавило, зато
+    /// потребовало бы инвалидации при чужих правках из веб-интерфейса.
+    set_video_ids: Mutex<HashMap<(String, String), String>>,
 }
 
 impl YtMusic {
@@ -91,6 +99,7 @@ impl YtMusic {
             format: config.audio_format.clone(),
             fast_resolve: config.provider("ytmusic").fast_resolve,
             cookies,
+            set_video_ids: Mutex::new(HashMap::new()),
         })
     }
 
@@ -205,7 +214,29 @@ impl Catalog for YtMusic {
         // Префикс `VL` обязателен: browse по сырому id плейлист не открывает.
         let browse_id = parse::playlist_browse_id(&playlist.id);
         let pages = self.tube.browse_pages(&browse_id).await?;
-        Ok(pages.iter().flat_map(|page| parse::tracks(page)).collect())
+        let entries: Vec<_> = pages.iter().flat_map(|page| parse::playlist_entries(page)).collect();
+
+        // Разбор заодно отдал `setVideoId` каждой записи — складываем
+        // сюда, чтобы `playlist_remove` смог убрать трек без повторного
+        // хода в сервис. Устаревшие записи выцветают: следующее
+        // перечисление перезаписывает карту целиком.
+        {
+            let mut map = self
+                .set_video_ids
+                .lock()
+                .expect("карта setVideoId не может быть отравлена");
+            map.retain(|(playlist_id, _), _| playlist_id != &playlist.id);
+            for (track, set_video_id) in &entries {
+                if let Some(set_video_id) = set_video_id {
+                    map.insert(
+                        (playlist.id.clone(), track.id.id.clone()),
+                        set_video_id.clone(),
+                    );
+                }
+            }
+        }
+
+        Ok(entries.into_iter().map(|(track, _)| track).collect())
     }
 
     async fn liked(&self) -> Result<Vec<Track>> {
@@ -220,6 +251,72 @@ impl Catalog for YtMusic {
             return Err(ProviderError::NoSuchTrack(track.clone()));
         }
         self.tube.like(&track.id, rating).await
+    }
+
+    async fn playlist_create(&self, title: &str) -> Result<Playlist> {
+        let id = self.tube.playlist_create(title).await?;
+        // Описание собирается локально: сервис в ответе отдаёт только id,
+        // а ход за перечитыванием библиотеки ради одной строки не нужен.
+        // Размер известен точно — плейлист создан пустым.
+        Ok(Playlist {
+            id: PlaylistId::new(self.id, id),
+            title: title.to_owned(),
+            subtitle: None,
+            art_url: None,
+            track_count: Some(0),
+        })
+    }
+
+    async fn playlist_add(&self, playlist: &PlaylistId, track: &TrackId) -> Result<()> {
+        // И плейлист, и трек обязаны быть нашими: править чужой
+        // идентификатор провайдер не может, см. `playlist_tracks`/`rate`.
+        if playlist.provider != self.id {
+            return Err(ProviderError::NoSuchPlaylist(playlist.clone()));
+        }
+        if track.provider != self.id {
+            return Err(ProviderError::NoSuchTrack(track.clone()));
+        }
+        self.tube.playlist_edit_add(&playlist.id, &track.id).await
+    }
+
+    async fn playlist_remove(&self, playlist: &PlaylistId, track: &TrackId) -> Result<()> {
+        if playlist.provider != self.id {
+            return Err(ProviderError::NoSuchPlaylist(playlist.clone()));
+        }
+        if track.provider != self.id {
+            return Err(ProviderError::NoSuchTrack(track.clone()));
+        }
+        // `setVideoId` негде взять, кроме перечисления плейлиста: пока
+        // плейлист не открывали (или после рестарта демона), убрать трек
+        // нельзя — честная ошибка вместо вслепую отправленного запроса.
+        let set_video_id = self
+            .set_video_ids
+            .lock()
+            .expect("карта setVideoId не может быть отравлена")
+            .get(&(playlist.id.clone(), track.id.clone()))
+            .cloned();
+        let Some(set_video_id) = set_video_id else {
+            return Err(ProviderError::Format {
+                provider: self.id,
+                reason: "open the playlist first".into(),
+            });
+        };
+        self.tube
+            .playlist_edit_remove(&playlist.id, &track.id, &set_video_id)
+            .await
+    }
+
+    async fn playlist_delete(&self, playlist: &PlaylistId) -> Result<()> {
+        if playlist.provider != self.id {
+            return Err(ProviderError::NoSuchPlaylist(playlist.clone()));
+        }
+        self.tube.playlist_delete(&playlist.id).await?;
+        // Плейлиста больше нет — и его setVideoId тоже.
+        self.set_video_ids
+            .lock()
+            .expect("карта setVideoId не может быть отравлена")
+            .retain(|(playlist_id, _), _| playlist_id != &playlist.id);
+        Ok(())
     }
 }
 

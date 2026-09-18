@@ -113,6 +113,57 @@ pub trait Catalog: Send + Sync {
             what: "оценки",
         })
     }
+
+    /// Создать пустой плейлист у провайдера, вернуть его описание.
+    ///
+    /// Дефолт обязателен по той же причине, что и у [`Catalog::rate`]:
+    /// реестр мультипровайдерный, и не каждый сервис даёт редактировать
+    /// библиотеку аккаунта (у части провайдеров плейлисты живут только
+    /// на стороне плеера). [`ProviderError::Unsupported`] — не сбой:
+    /// вызывающий обязан трактовать её как «здесь плейлист не создать».
+    async fn playlist_create(&self, _title: &str) -> Result<Playlist> {
+        Err(ProviderError::Unsupported {
+            provider: self.provider(),
+            what: "создание плейлистов",
+        })
+    }
+
+    /// Добавить трек в плейлист аккаунта.
+    ///
+    /// Дефолт `Unsupported`: редактирование плейлистов — операция над
+    /// аккаунтом, и провайдер без такой возможности не должен её
+    /// изображать. Вызывающий обязан считать ошибку признаком «операция
+    /// для этого провайдера недоступна», а не падать.
+    async fn playlist_add(&self, _playlist: &PlaylistId, _track: &TrackId) -> Result<()> {
+        Err(ProviderError::Unsupported {
+            provider: self.provider(),
+            what: "добавление в плейлист",
+        })
+    }
+
+    /// Убрать трек из плейлиста аккаунта.
+    ///
+    /// Дефолт `Unsupported` — см. [`Catalog::playlist_add`]: не каждый
+    /// сервис умеет менять содержимое плейлистов, и обязанность
+    /// выдумывать поведение у него нет.
+    async fn playlist_remove(&self, _playlist: &PlaylistId, _track: &TrackId) -> Result<()> {
+        Err(ProviderError::Unsupported {
+            provider: self.provider(),
+            what: "удаление из плейлиста",
+        })
+    }
+
+    /// Удалить плейлист аккаунта целиком.
+    ///
+    /// Дефолт `Unsupported` — см. [`Catalog::playlist_create`]:
+    /// уничтожение данных аккаунта тем более не должно изображаться
+    /// провайдером, который такой операции не имеет.
+    async fn playlist_delete(&self, _playlist: &PlaylistId) -> Result<()> {
+        Err(ProviderError::Unsupported {
+            provider: self.provider(),
+            what: "удаление плейлиста",
+        })
+    }
 }
 
 /// Резолвер: `TrackId` → откуда играть.

@@ -74,10 +74,40 @@ pub(crate) fn parse_duration(text: &str) -> Option<Duration> {
 
 /// Треки страницы: все `musicResponsiveListItemRenderer` (так приходят и
 /// результаты поиска, и содержимое плейлиста, и лайкнутое).
+///
+/// С переходом `playlist_tracks` на [`playlist_entries`] внутри крейта
+/// живого вызывающего не осталось — записи плейлиста нужны вместе с
+/// `setVideoId`. Оставлена как упрощённая выборка для тестов: в lib-сборе
+/// отсутствует (`cfg(test)`), поэтому не стреляет ни dead_code, ни
+/// unfulfilled-ожидание — оба срабатывали на разных целях сборки.
+#[cfg(test)]
 pub(crate) fn tracks(page: &Value) -> Vec<Track> {
+    playlist_entries(page)
+        .into_iter()
+        .map(|(track, _set_video_id)| track)
+        .collect()
+}
+
+/// Треки плейлиста вместе с `setVideoId` каждой записи.
+///
+/// `setVideoId` — служебный идентификатор записи внутри плейлиста
+/// (`playlistItemData.setVideoId`): без него эндпоинт
+/// `browse/edit_playlist` не даёт убрать трек. Он существует только
+/// внутри конкретного плейлиста и приходит только при его перечислении,
+/// поэтому добывается здесь, на месте, а не отдельным запросом. Для
+/// записей без `playlistItemData` (внеплейлистовые раскладки) — `None`.
+pub(crate) fn playlist_entries(page: &Value) -> Vec<(Track, Option<String>)> {
     renderers(page, "musicResponsiveListItemRenderer")
         .iter()
-        .filter_map(|item| track_from_responsive(item))
+        .filter_map(|item| {
+            let track = track_from_responsive(item)?;
+            let set_video_id = item
+                .pointer("/playlistItemData/setVideoId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned);
+            Some((track, set_video_id))
+        })
         .collect()
 }
 
@@ -658,7 +688,7 @@ mod tests {
 
         json!({
             "musicResponsiveListItemRenderer": {
-                "playlistItemData": { "videoId": "dQw4w9WgXcQ" },
+                "playlistItemData": { "videoId": "dQw4w9WgXcQ", "setVideoId": "SVabc123" },
                 "flexColumns": [
                     column(json!({ "runs": [{ "text": "Заголовок" }] })),
                     column(json!({ "runs": [
@@ -693,6 +723,37 @@ mod tests {
             track.page_url.as_deref(),
             Some("https://music.youtube.com/watch?v=dQw4w9WgXcQ")
         );
+    }
+
+    #[test]
+    fn playlist_entry_carries_set_video_id() {
+        // `setVideoId` нужен `playlist_remove`: без него эндпоинт
+        // редактирования плейлиста трек не убирает. Разбор обязан
+        // доставать его из той же записи, что и сам трек.
+        let found = playlist_entries(&song_renderer());
+        let (track, set_video_id) = found.first().expect("запись разобрана");
+
+        assert_eq!(track.id, TrackId::new(ProviderId::YTMUSIC, "dQw4w9WgXcQ"));
+        assert_eq!(set_video_id.as_deref(), Some("SVabc123"));
+    }
+
+    #[test]
+    fn entry_without_playlist_item_data_has_no_set_video_id() {
+        // Внеплейлистовые раскладки (поиск, лайкнутое без item-данных)
+        // `setVideoId` не имеют — наружу уходит `None`, а не пустая строка.
+        let stripped = json!({
+            "musicResponsiveListItemRenderer": {
+                "videoId": "dQw4w9WgXcQ",
+                "flexColumns": song_renderer()["musicResponsiveListItemRenderer"]["flexColumns"]
+            }
+        });
+
+        let (track, set_video_id) = playlist_entries(&stripped)
+            .into_iter()
+            .next()
+            .expect("запись без item-данных разобрана");
+        assert_eq!(track.id, TrackId::new(ProviderId::YTMUSIC, "dQw4w9WgXcQ"));
+        assert_eq!(set_video_id, None);
     }
 
     #[test]

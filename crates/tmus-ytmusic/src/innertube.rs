@@ -138,6 +138,72 @@ impl InnerTube {
         Ok(())
     }
 
+    /// Создать закрытый плейлист, вернуть его id.
+    ///
+    /// Эндпоинт `playlist/create` в ответе отдаёт только `playlistId`:
+    /// остальное описание (заголовок, размер) вызывающий собирает сам —
+    /// перечитывать библиотеку ради одной строки сервис не заставляет.
+    pub async fn playlist_create(&self, title: &str) -> Result<String> {
+        let value = self
+            .post("playlist/create", playlist_create_body(title))
+            .await?;
+        playlist_id_from_create(&value).ok_or_else(|| ProviderError::Format {
+            provider: PROVIDER,
+            reason: format!("playlist/create: нет playlistId: {}", snippet(&value.to_string())),
+        })
+    }
+
+    /// Удалить плейлист аккаунта.
+    pub async fn playlist_delete(&self, playlist_id: &str) -> Result<()> {
+        let value = self
+            .post("playlist/delete", json!({ "playlistId": playlist_id }))
+            .await?;
+        ensure_edit_succeeded("playlist/delete", &value)
+    }
+
+    /// Добавить видео в плейлист (`browse/edit_playlist`).
+    pub async fn playlist_edit_add(&self, playlist_id: &str, video_id: &str) -> Result<()> {
+        let value = self
+            .post(
+                "browse/edit_playlist",
+                playlist_edit_body(
+                    playlist_id,
+                    json!([{ "action": "ACTION_ADD_VIDEO", "addedVideoId": video_id }]),
+                ),
+            )
+            .await?;
+        ensure_edit_succeeded("browse/edit_playlist", &value)
+    }
+
+    /// Убрать видео из плейлиста.
+    ///
+    /// `setVideoId` обязателен: это внутренний идентификатор записи
+    /// внутри плейлиста, и без него сервис не знает, какую из одинаковых
+    /// записей убрать. Он не возвращается никаким эндпоинтом редактирования
+    /// — только разбором перечисления плейлиста, поэтому его приносит
+    /// вызывающий.
+    pub async fn playlist_edit_remove(
+        &self,
+        playlist_id: &str,
+        video_id: &str,
+        set_video_id: &str,
+    ) -> Result<()> {
+        let value = self
+            .post(
+                "browse/edit_playlist",
+                playlist_edit_body(
+                    playlist_id,
+                    json!([{
+                        "action": "ACTION_REMOVE_VIDEO",
+                        "removedVideoId": video_id,
+                        "setVideoId": set_video_id
+                    }]),
+                ),
+            )
+            .await?;
+        ensure_edit_succeeded("browse/edit_playlist", &value)
+    }
+
     /// Страница `browse` со всеми продолжениями, но не глубже [`MAX_PAGES`].
     pub async fn browse_pages(&self, browse_id: &str) -> Result<Vec<Value>> {
         let first = self.browse(browse_id).await?;
@@ -268,6 +334,43 @@ fn like_endpoint(rating: Rating) -> &'static str {
 /// Тело запроса оценки: единственное поле — идентификатор видео.
 fn like_body(video_id: &str) -> Value {
     json!({ "target": { "videoId": video_id } })
+}
+
+/// Тело создания плейлиста: заголовок плюс `PRIVATE` — плейлист создаётся
+/// закрытым всегда, публичность у библиотеки хозяина не переключается из
+/// плеера.
+fn playlist_create_body(title: &str) -> Value {
+    json!({ "title": title, "privacyStatus": "PRIVATE" })
+}
+
+/// Тело правки плейлиста: список действий над записями. Одним вызовом
+/// сервис позволяет и добавить, и убрать — различие только в элементах
+/// `actions`, поэтому тело собирает здесь один сборщик.
+fn playlist_edit_body(playlist_id: &str, actions: Value) -> Value {
+    json!({ "playlistId": playlist_id, "actions": actions })
+}
+
+/// `playlistId` из ответа `playlist/create`.
+fn playlist_id_from_create(value: &Value) -> Option<String> {
+    value
+        .get("playlistId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
+/// Успех правки плейлиста/удаления: сервис отвечает `STATUS_SUCCEEDED`
+/// в теле с HTTP 200, отказ приходит тоже телом — по статусу HTTP это
+/// не отличить.
+fn ensure_edit_succeeded(endpoint: &str, value: &Value) -> Result<()> {
+    if value.get("status").and_then(Value::as_str) == Some("STATUS_SUCCEEDED") {
+        Ok(())
+    } else {
+        Err(ProviderError::Format {
+            provider: PROVIDER,
+            reason: format!("{endpoint}: {}", snippet(&value.to_string())),
+        })
+    }
 }
 
 /// Тело запроса: контекст клиента плюс поля конкретного эндпоинта.
@@ -451,6 +554,59 @@ mod tests {
             body,
             json!({ "target": { "videoId": "dQw4w9WgXcQ" } })
         );
+    }
+
+    #[test]
+    fn playlist_create_body_is_private_with_title() {
+        // Схема сверена с youtubei: без privacyStatus сервис молча
+        // создаёт плейлист с неопределённой видимостью — фиксируем
+        // PRIVATE явно.
+        assert_eq!(
+            playlist_create_body("Мой плейлист"),
+            json!({ "title": "Мой плейлист", "privacyStatus": "PRIVATE" })
+        );
+    }
+
+    #[test]
+    fn playlist_edit_bodies_match_actions() {
+        // Добавление: только addedVideoId. Удаление: removedVideoId плюс
+        // setVideoId — без него сервис не знает, какую запись убрать.
+        assert_eq!(
+            playlist_edit_body("PLabc", json!([{ "action": "ACTION_ADD_VIDEO", "addedVideoId": "vid1" }])),
+            json!({ "playlistId": "PLabc", "actions": [
+                { "action": "ACTION_ADD_VIDEO", "addedVideoId": "vid1" }
+            ]})
+        );
+        assert_eq!(
+            playlist_edit_body(
+                "PLabc",
+                json!([{ "action": "ACTION_REMOVE_VIDEO", "removedVideoId": "vid1", "setVideoId": "sv1" }])
+            ),
+            json!({ "playlistId": "PLabc", "actions": [
+                { "action": "ACTION_REMOVE_VIDEO", "removedVideoId": "vid1", "setVideoId": "sv1" }
+            ]})
+        );
+    }
+
+    #[test]
+    fn create_answer_yields_playlist_id() {
+        assert_eq!(
+            playlist_id_from_create(&json!({ "playlistId": "PLnew1" })),
+            Some("PLnew1".to_owned())
+        );
+        // Пустой или отсутствующий id — не ответ: вызывающий обязан
+        // увидеть ошибку формата, а не пустое имя плейлиста.
+        assert_eq!(playlist_id_from_create(&json!({ "playlistId": "" })), None);
+        assert_eq!(playlist_id_from_create(&json!({})), None);
+    }
+
+    #[test]
+    fn edit_succeeded_only_on_status_succeeded() {
+        assert!(ensure_edit_succeeded("e", &json!({ "status": "STATUS_SUCCEEDED" })).is_ok());
+        // Отказ приходит с HTTP 200: статус в теле — единственный признак.
+        let failed = ensure_edit_succeeded("e", &json!({ "status": "STATUS_FAILED" }));
+        assert!(failed.is_err());
+        assert!(ensure_edit_succeeded("e", &json!({})).is_err());
     }
 
     /// Компактный фейк ответа player: OK, два аудио-формата и один
