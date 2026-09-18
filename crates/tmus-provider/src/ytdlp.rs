@@ -105,7 +105,12 @@ impl YtDlp {
         cmd.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Отмена обязана убивать процесс, а не отпускать его на волю.
+            // Без этого брошенный резолв (отменённая предзагрузка при
+            // скипе, истёкший таймаут) оставлял бы yt-dlp доживать своё:
+            // 0.9 CPU-с и 335 МБ на процесс, замерено 18.09.2026.
+            .kill_on_drop(true);
 
         let child = cmd
             .spawn()

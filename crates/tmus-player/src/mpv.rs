@@ -373,6 +373,20 @@ impl Mpv {
         Ok(())
     }
 
+    /// Пуст ли плейлист mpv прямо сейчас.
+    ///
+    /// Событие `idle` приходит в общей очереди и разбирается позже, чем
+    /// случилось: конец трека обрабатывается с ожиданием резолва и
+    /// загрузки, а стоящий за ним `idle` тогда относится уже к прошлому
+    /// файлу. Свойство отвечает про «сейчас», поэтому вопрос задаём
+    /// mpv, а не догадываемся по порядку событий.
+    pub async fn idle_active(&self) -> Result<bool, MpvError> {
+        let value = self
+            .request(vec![json!("get_property"), json!("idle-active")])
+            .await?;
+        Ok(value.as_bool().unwrap_or(false))
+    }
+
     async fn set_property(&self, name: &str, value: Value) -> Result<(), MpvError> {
         self.request(vec![json!("set_property"), json!(name), value])
             .await?;
