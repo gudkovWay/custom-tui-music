@@ -176,9 +176,13 @@ impl Queue {
     }
 
     /// Следующий трек без сдвига курсора — для предзагрузки.
+    ///
+    /// Предзагрузка — часть естественного продвижения: при repeat-track
+    /// следующий «логически» — тот же трек, и готовить надо его
+    /// (обновлять протухший URL), а не соседний.
     #[must_use]
     pub fn peek_next(&self) -> Option<&Track> {
-        let cursor = self.advance_from(self.cursor?, 1)?;
+        let cursor = self.advance_from(self.cursor?, 1, true)?;
         self.track_at_cursor(cursor)
     }
 
@@ -195,7 +199,7 @@ impl Queue {
             None => return out,
         };
         for _ in 0..depth {
-            let Some(next) = self.advance_from(cursor, 1) else {
+            let Some(next) = self.advance_from(cursor, 1, true) else {
                 break;
             };
             cursor = next;
@@ -206,10 +210,13 @@ impl Queue {
         out
     }
 
+    /// Ручная навигация (скип кнопкой/биндом): `LoopMode::Track`
+    /// игнорируется, трек меняется всегда — иначе next на последнем
+    /// треке залипал бы на месте.
     pub fn next(&mut self) -> Option<&Track> {
         let cursor = match self.cursor {
             None if !self.tracks.is_empty() => 0,
-            Some(cursor) => match self.advance_from(cursor, 1) {
+            Some(cursor) => match self.advance_from(cursor, 1, false) {
                 Some(next) => next,
                 None => return None,
             },
@@ -219,10 +226,25 @@ impl Queue {
         self.track_at_cursor(cursor)
     }
 
+    /// Естественное продвижение (конец трека, предзагрузка): при
+    /// `LoopMode::Track` остаёмся на текущем треке в ЛЮБОМ месте
+    /// очереди, а не только на границе.
+    pub fn next_natural(&mut self) -> Option<&Track> {
+        let cursor = match self.cursor {
+            None if !self.tracks.is_empty() => 0,
+            Some(cursor) => self.advance_from(cursor, 1, true)?,
+            None => return None,
+        };
+        self.cursor = Some(cursor);
+        self.track_at_cursor(cursor)
+    }
+
+    /// Ручная навигация назад: `LoopMode::Track` игнорируется, на
+    /// первом треке — wrap к последнему (симметрично `next`).
     pub fn prev(&mut self) -> Option<&Track> {
         let cursor = match self.cursor {
             None if !self.tracks.is_empty() => 0,
-            Some(cursor) => match self.advance_from(cursor, -1) {
+            Some(cursor) => match self.advance_from(cursor, -1, false) {
                 Some(prev) => prev,
                 None => return None,
             },
@@ -233,16 +255,25 @@ impl Queue {
     }
 
     /// Сдвиг курсора с учётом loop-режима. `delta` = ±1.
-    fn advance_from(&self, cursor: usize, delta: i64) -> Option<usize> {
+    ///
+    /// `natural == true` — естественное продвижение (конец трека,
+    /// предзагрузка, кэш-филлер): при `LoopMode::Track` повтор
+    /// срабатывает в любом месте очереди. `natural == false` — ручная
+    /// навигация: `LoopMode::Track` полностью игнорируется, на границе
+    /// ведёт себя как `LoopMode::Queue` (wrap), при `LoopMode::None` —
+    /// `None`.
+    fn advance_from(&self, cursor: usize, delta: i64, natural: bool) -> Option<usize> {
         let len = self.order_len();
         debug_assert!(len > 0);
+        if natural && self.loop_mode == LoopMode::Track {
+            return Some(cursor);
+        }
         let next = cursor as i64 + delta;
         if (0..len as i64).contains(&next) {
             return Some(next as usize);
         }
         match self.loop_mode {
-            LoopMode::Track => Some(cursor),
-            LoopMode::Queue => {
+            LoopMode::Track | LoopMode::Queue => {
                 if delta > 0 { Some(0) } else { Some(len - 1) }
             }
             LoopMode::None => None,
@@ -339,6 +370,11 @@ mod tests {
         assert_eq!(got.id.id, expected);
     }
 
+    fn assert_next_natural(q: &mut Queue, expected: &str) {
+        let got = q.next_natural().expect("трек ожидался");
+        assert_eq!(got.id.id, expected);
+    }
+
     #[test]
     fn next_without_loop_stops_at_end() {
         let mut q = queue(&["ytmusic:a", "ytmusic:b", "soundcloud:c"]);
@@ -361,13 +397,68 @@ mod tests {
 
     #[test]
     fn next_with_track_loop_stays_put() {
+        // Естественный конец трека идёт через next_natural: repeat-track
+        // обязан работать в ЛЮБОМ месте очереди, а не только на границе.
         let mut q = queue(&["ytmusic:a", "ytmusic:b"]);
         q.set_loop_mode(LoopMode::Track);
         q.goto(1);
-        assert_next(&mut q, "b");
-        // Конец очереди при LoopMode::Track → остаёмся на том же треке.
+        assert_next_natural(&mut q, "b");
+        assert_next_natural(&mut q, "b");
+        assert_eq!(q.current_index(), Some(1));
+    }
+
+    #[test]
+    fn natural_advance_mid_queue_with_track_loop_repeats_current() {
+        // Главный кейс бага: трек кончился в середине очереди — repeat
+        // track должен повторить его, а не утащить на следующий.
+        let mut q = queue(&["ytmusic:a", "ytmusic:b", "ytmusic:c"]);
+        q.set_loop_mode(LoopMode::Track);
+        q.goto(1);
+        assert_next_natural(&mut q, "b");
+        assert_eq!(q.current_index(), Some(1));
+    }
+
+    #[test]
+    fn manual_next_mid_queue_with_track_loop_advances() {
+        // Ручной скип при repeat-track обязан менять трек: человек
+        // нажал next — он хочет следующий, а не тот же.
+        let mut q = queue(&["ytmusic:a", "ytmusic:b", "ytmusic:c"]);
+        q.set_loop_mode(LoopMode::Track);
+        q.goto(0);
         assert_next(&mut q, "b");
         assert_eq!(q.current_index(), Some(1));
+    }
+
+    #[test]
+    fn manual_next_on_last_track_with_track_loop_wraps() {
+        // Регресс залипания: раньше next на последнем треке при
+        // LoopMode::Track возвращал тот же трек. Ручной скип — wrap.
+        let mut q = queue(&["ytmusic:a", "ytmusic:b"]);
+        q.set_loop_mode(LoopMode::Track);
+        q.goto(1);
+        assert_next(&mut q, "a");
+        assert_eq!(q.current_index(), Some(0));
+    }
+
+    #[test]
+    fn manual_prev_on_first_track_with_track_loop_wraps_to_last() {
+        // Симметрия с next: ручной prev на первом треке — к последнему.
+        let mut q = queue(&["ytmusic:a", "ytmusic:b"]);
+        q.set_loop_mode(LoopMode::Track);
+        q.goto(0);
+        let got = q.prev().expect("трек ожидался");
+        assert_eq!(got.id.id, "b");
+        assert_eq!(q.current_index(), Some(1));
+    }
+
+    #[test]
+    fn peek_next_mid_queue_with_track_loop_returns_current() {
+        // Предзагрузка — часть естественного продвижения: при repeat
+        // track готовить надо тот же трек (обновление протухшего URL).
+        let mut q = queue(&["ytmusic:a", "ytmusic:b", "ytmusic:c"]);
+        q.set_loop_mode(LoopMode::Track);
+        q.goto(1);
+        assert_eq!(q.peek_next().expect("трек ожидался").id.id, "b");
     }
 
     #[test]
