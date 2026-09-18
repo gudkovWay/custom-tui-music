@@ -711,6 +711,11 @@ pub async fn run_state_watcher(app: Arc<App>) {
     }
 }
 
+/// Сколько треков вперёд докачивает фоновый филлер. Глубина 3, а не 1:
+/// скип-серия и пара треков вперёд не должны натыкаться на ~5-секундный
+/// yt-dlp (замер 18.09: закэшированный старт — 8 мс). Дальше трёх —
+/// лишний трафик на дальний прогноз при смене настроения слушателя.
+const PREFETCH_DEPTH: usize = 3;
 /// Фоновая докачка в офлайн-кэш.
 ///
 /// Хозяин заказал офлайн явно, и «скачать по требованию» его не закрывает:
@@ -725,11 +730,21 @@ pub async fn run_cache_filler(app: Arc<App>) {
         let wanted = {
             let state = app.player.state().await;
             let current = state.track.map(|t| t.id);
-            let next = app.player.with_queue(|q| q.peek_next().map(|t| t.id.clone())).await;
-            [current, next]
+            // Глубина 3, а не 1: скип-серия и просто пара треков вперёд
+            // не должны натыкаться на ~5-секундный yt-dlp (замер:
+            // закэшированный старт 8 мс). Дальше трёх — лишний трафик
+            // на дальний прогноз при смене настроения слушателя.
+            let ahead = app
+                .player
+                .with_queue(|q| q.peek_ahead(PREFETCH_DEPTH).into_iter().map(|t| t.id).collect::<Vec<_>>())
+                .await;
+            let mut wanted: Vec<TrackId> = Vec::with_capacity(1 + ahead.len());
+            wanted.extend(current);
+            wanted.extend(ahead);
+            wanted
         };
 
-        for id in wanted.into_iter().flatten() {
+        for id in wanted {
             match app.with_cache(|c| c.lookup_audio(&id)) {
                 Ok(Some(_)) => continue,
                 Ok(None) => {}

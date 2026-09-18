@@ -182,6 +182,30 @@ impl Queue {
         self.track_at_cursor(cursor)
     }
 
+    /// Следующие `depth` треков без сдвига курсора — для фоновой докачки
+    /// в офлайн-кэш. Глубина 1 — это `peek_next`; глубже — прогноз
+    /// последовательного слушателя: замер 18.09 показал 8 мс старта
+    /// закэшированного трека против ~5 с yt-dlp у незакэшированного,
+    /// и пара скипов подряд не должна натыкаться на сеть.
+    #[must_use]
+    pub fn peek_ahead(&self, depth: usize) -> Vec<Track> {
+        let mut out = Vec::with_capacity(depth);
+        let mut cursor = match self.cursor {
+            Some(cursor) => cursor,
+            None => return out,
+        };
+        for _ in 0..depth {
+            let Some(next) = self.advance_from(cursor, 1) else {
+                break;
+            };
+            cursor = next;
+            if let Some(track) = self.track_at_cursor(cursor) {
+                out.push(track.clone());
+            }
+        }
+        out
+    }
+
     pub fn next(&mut self) -> Option<&Track> {
         let cursor = match self.cursor {
             None if !self.tracks.is_empty() => 0,
