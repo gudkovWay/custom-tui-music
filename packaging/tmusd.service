@@ -1,6 +1,6 @@
 [Unit]
 Description=tmus — терминальный музыкальный плеер (демон)
-Documentation=https://github.com/q/custom-tui-music
+Documentation=https://github.com/gudkovWay/custom-tui-music
 # Демон публикует MPRIS и иконку SNI, поэтому ему нужна сессионная шина.
 # Оболочка (noctalia) может подняться позже — трей регистрируется с
 # повтором, так что жёсткой зависимости от неё здесь нет.

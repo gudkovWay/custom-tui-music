@@ -14,7 +14,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-repository = "https://github.com/q/custom-tui-music"
+repository = "https://github.com/gudkovWay/custom-tui-music"
 
 [workspace.dependencies]
 tmus-core = { path = "crates/tmus-core" }
