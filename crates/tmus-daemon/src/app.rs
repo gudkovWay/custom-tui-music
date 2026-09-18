@@ -50,7 +50,7 @@ pub struct App {
     config: Config,
     paths: Paths,
     events: broadcast::Sender<Event>,
-    catalog_source: std::sync::Mutex<CatalogSource>,
+    pub(crate) catalog_source: std::sync::Mutex<CatalogSource>,
     /// Сигнал «пора гаситься». Нужен, потому что `Cmd::Shutdown`
     /// приходит из задачи control-socket, а гасить обязан `main`: только
     /// он снимает файл сокета и убивает mpv. Вызов `std::process::exit`
@@ -385,6 +385,27 @@ impl App {
             }
             Cmd::Ratings => Ok(Payload::Ratings(self.with_cache(|c| c.ratings())?)),
 
+            // Плейлистные мутации идут напрямую в провайдер (кэш
+            // рейтингов их не касается), после успеха демон рассылает
+            // `PlaylistsChanged`, а список клиенты перечитывают сами —
+            // см. `playlist_*` в catalog.rs.
+            Cmd::PlaylistCreate { title } => {
+                let playlist = self.playlist_create(&title).await?;
+                Ok(Payload::PlaylistCreated { playlist: playlist.id })
+            }
+            Cmd::PlaylistAdd { playlist, track } => {
+                self.playlist_add(&playlist, &track).await?;
+                Ok(Payload::Ack(Ack::default()))
+            }
+            Cmd::PlaylistRemove { playlist, track } => {
+                self.playlist_remove(&playlist, &track).await?;
+                Ok(Payload::Ack(Ack::default()))
+            }
+            Cmd::PlaylistDelete { playlist } => {
+                self.playlist_delete(&playlist).await?;
+                Ok(Payload::Ack(Ack::default()))
+            }
+
             Cmd::GetCatalogSource => {
                 Ok(Payload::Catalog(self.catalog_source.lock().expect("catalog source").clone()))
             }
@@ -561,7 +582,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use tmus_core::model::{AuthStatus, ProviderId, Rating};
+    use tmus_core::model::{AuthStatus, Playlist, PlaylistId, ProviderId, Rating};
     use tmus_provider::{Catalog, Provider, ProviderError, Resolver};
 
     /// Фейковый провайдер: резолв отдаёт локальный WAV (mpv играет его
@@ -571,6 +592,27 @@ mod tests {
         id: ProviderId,
         audio: PathBuf,
         fail_rate: AtomicBool,
+        /// Сбой плейлистных операций: отдельный флаг, чтобы не
+        /// пересекаться с проверками rate.
+        fail_playlist: AtomicBool,
+        /// Журнал плейлистных вызовов: тесты проверяют не только ответ,
+        /// но и что вызов дошёл до провайдера с правильными аргументами.
+        playlist_calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeProvider {
+        fn record(&self, call: &str) {
+            self.playlist_calls.lock().expect("calls").push(call.to_owned());
+        }
+        fn calls(&self) -> Vec<String> {
+            self.playlist_calls.lock().expect("calls").clone()
+        }
+        fn playlist_error(&self) -> ProviderError {
+            ProviderError::Format {
+                provider: self.id,
+                reason: "тестовый сбой сети".to_owned(),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -622,6 +664,48 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+        async fn playlist_create(&self, title: &str) -> Result<Playlist, ProviderError> {
+            if self.fail_playlist.load(Ordering::SeqCst) {
+                return Err(self.playlist_error());
+            }
+            self.record(&format!("create:{title}"));
+            Ok(Playlist {
+                id: PlaylistId::new(self.id, "PLnew"),
+                title: title.to_owned(),
+                subtitle: None,
+                art_url: None,
+                track_count: Some(0),
+            })
+        }
+        async fn playlist_add(
+            &self,
+            playlist: &PlaylistId,
+            track: &TrackId,
+        ) -> Result<(), ProviderError> {
+            if self.fail_playlist.load(Ordering::SeqCst) {
+                return Err(self.playlist_error());
+            }
+            self.record(&format!("add:{playlist}:{track}"));
+            Ok(())
+        }
+        async fn playlist_remove(
+            &self,
+            playlist: &PlaylistId,
+            track: &TrackId,
+        ) -> Result<(), ProviderError> {
+            if self.fail_playlist.load(Ordering::SeqCst) {
+                return Err(self.playlist_error());
+            }
+            self.record(&format!("remove:{playlist}:{track}"));
+            Ok(())
+        }
+        async fn playlist_delete(&self, playlist: &PlaylistId) -> Result<(), ProviderError> {
+            if self.fail_playlist.load(Ordering::SeqCst) {
+                return Err(self.playlist_error());
+            }
+            self.record(&format!("delete:{playlist}"));
+            Ok(())
         }
     }
 
@@ -691,17 +775,30 @@ mod tests {
     /// Полный `App` с живым mpv (headless, сокет во временном каталоге)
     /// и одним фейковым провайдером.
     async fn app(fail_rate: bool) -> (Arc<App>, tempfile::TempDir) {
+        let (app, _provider, dir) = app_full(fail_rate, false).await;
+        (app, dir)
+    }
+
+    /// Вариант стенда с доступом к типизированному фейку: тесты читают
+    /// журнал плейлистных вызовов, не даункастя `dyn Provider`.
+    async fn app_full(
+        fail_rate: bool,
+        fail_playlist: bool,
+    ) -> (Arc<App>, Arc<FakeProvider>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = Paths::under(dir.path());
         // mpv создаёт IPC-сокет сам, но каталог run/ должен уже быть.
         paths.ensure_dirs().expect("dirs");
         let audio = write_silence_wav(dir.path().join("audio/silence.wav"));
         let mut registry = Registry::new();
-        registry.insert(Arc::new(FakeProvider {
+        let provider = Arc::new(FakeProvider {
             id: ProviderId::YTMUSIC,
             audio,
             fail_rate: AtomicBool::new(fail_rate),
-        }));
+            fail_playlist: AtomicBool::new(fail_playlist),
+            playlist_calls: std::sync::Mutex::new(Vec::new()),
+        });
+        registry.insert(Arc::clone(&provider) as Arc<dyn Provider>);
         let gate = Arc::new(tokio::sync::Semaphore::new(2));
         let player = Player::new(
             registry.clone(),
@@ -716,7 +813,7 @@ mod tests {
             Cache::open(&paths, u64::MAX).expect("cache"),
         ));
         let app = App::new(player, registry, cache, Config::default(), paths, gate);
-        (app, dir)
+        (app, provider, dir)
     }
 
     /// Успешная оценка: пишется в кэш, вещается событие и видна в
@@ -822,6 +919,102 @@ mod tests {
         assert!(
             events.try_recv().is_err(),
             "при ошибке сети RatingChanged вещаться не должен"
+        );
+    }
+
+    /// Успешное создание: провайдер получил заголовок, клиент — id
+    /// нового плейлиста, шина — сигнал перечитать список.
+    #[tokio::test]
+    async fn playlist_create_returns_id_and_broadcasts() {
+        let (app, provider, _dir) = app_full(false, false).await;
+        let mut events = app.subscribe();
+
+        let payload = app
+            .handle(Cmd::PlaylistCreate { title: "Chill".into() })
+            .await
+            .expect("create");
+        match payload {
+            Payload::PlaylistCreated { playlist } => {
+                assert_eq!(playlist, PlaylistId::new(ProviderId::YTMUSIC, "PLnew"));
+            }
+            other => panic!("неожиданный ответ: {other:?}"),
+        }
+        assert_eq!(provider.calls(), vec!["create:Chill".to_owned()]);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("событие пришло")
+            .expect("шина жива");
+        assert!(
+            matches!(event, Event::PlaylistsChanged),
+            "неожиданное событие: {event:?}"
+        );
+    }
+
+    /// Add/remove/delete проходят в провайдер с правильными аргументами
+    /// и каждый успех сопровождается сигналом.
+    #[tokio::test]
+    async fn playlist_mutations_reach_provider_and_broadcast() {
+        let (app, provider, _dir) = app_full(false, false).await;
+        let playlist = PlaylistId::new(ProviderId::YTMUSIC, "PL1");
+        let track = TrackId::new(ProviderId::YTMUSIC, "vid-1");
+        let mut events = app.subscribe();
+
+        app.handle(Cmd::PlaylistAdd { playlist: playlist.clone(), track: track.clone() })
+            .await
+            .expect("add");
+        app.handle(Cmd::PlaylistRemove { playlist: playlist.clone(), track: track.clone() })
+            .await
+            .expect("remove");
+        app.handle(Cmd::PlaylistDelete { playlist: playlist.clone() })
+            .await
+            .expect("delete");
+
+        assert_eq!(
+            provider.calls(),
+            vec![
+                format!("add:{playlist}:{track}"),
+                format!("remove:{playlist}:{track}"),
+                format!("delete:{playlist}"),
+            ]
+        );
+        // Ровно три сигнала — по одному на каждую мутацию, без лишних.
+        for _ in 0..3 {
+            let event = events.try_recv().expect("событие в шине");
+            assert!(matches!(event, Event::PlaylistsChanged));
+        }
+        assert!(events.try_recv().is_err(), "лишних событий быть не должно");
+    }
+
+    /// Ошибка провайдера доходит наружу как обычная ошибка команды,
+    /// вызова-ответа `PlaylistCreated` нет, и сигнал не разлетается.
+    #[tokio::test]
+    async fn playlist_provider_error_yields_err_without_event() {
+        let (app, provider, _dir) = app_full(false, true).await;
+        let playlist = PlaylistId::new(ProviderId::YTMUSIC, "PL1");
+        let track = TrackId::new(ProviderId::YTMUSIC, "vid-1");
+        let mut events = app.subscribe();
+
+        assert!(
+            app.handle(Cmd::PlaylistCreate { title: "Chill".into() })
+                .await
+                .is_err(),
+            "ошибка создания обязана дойти наружу"
+        );
+        assert!(
+            app.handle(Cmd::PlaylistAdd { playlist: playlist.clone(), track: track.clone() })
+                .await
+                .is_err()
+        );
+        assert!(app.handle(Cmd::PlaylistDelete { playlist: playlist.clone() }).await.is_err());
+
+        assert!(
+            provider.calls().is_empty(),
+            "при сбое журнал вызовов обязан остаться пустым"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "при ошибке провайдера PlaylistsChanged вещаться не должен"
         );
     }
 }

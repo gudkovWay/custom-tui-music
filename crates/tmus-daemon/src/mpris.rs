@@ -531,11 +531,13 @@ pub async fn run(app: Arc<App>) -> anyhow::Result<()> {
                     }
                     cache.store(state);
                 }
-                // Прогресс кэша и авторизация провайдеров в MPRIS не видны.
+                // Прогресс кэша, авторизация и правки плейлистов в MPRIS
+                // не видны: список плейлистов — не часть MPRIS-модели.
                 Event::QueueChanged { .. }
                 | Event::CacheProgress { .. }
                 | Event::AuthChanged { .. }
-                | Event::RatingChanged { .. } => {}
+                | Event::RatingChanged { .. }
+                | Event::PlaylistsChanged => {}
             }
         }
 

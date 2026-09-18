@@ -195,6 +195,113 @@ impl App {
         }
     }
 
+    /// Провайдер для плейлистных операций без явного адресата
+    /// (`PlaylistCreate`): берётся выбранный источник каталога, а без
+    /// выбора — единственный/первый подключённый. Create — единственная
+    /// операция, у которой нет id плейлиста, по которому можно понять
+    /// провайдера.
+    fn playlist_provider(
+        &self,
+    ) -> anyhow::Result<&Arc<dyn tmus_provider::Provider>> {
+        let saved: Option<String> = self
+            .catalog_source
+            .lock()
+            .expect("catalog source")
+            .provider
+            .clone();
+        match saved {
+            Some(name) => self
+                .registry
+                .get_by_str(&name)
+                .ok_or_else(|| anyhow::anyhow!("провайдер {name} не подключён")),
+            None => self
+                .registry
+                .iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("нет подключённых провайдеров")),
+        }
+    }
+
+    /// Единый хвост плейлистных мутаций: auth-ошибки уходят в отчёт и
+    /// возможный reauth (как у `rate_track`), остальные — наружу в
+    /// стандартном формате ошибок демона. Reauth не чинит текущий
+    /// запрос — ошибка всё равно идёт клиенту, но следующая пройдёт
+    /// уже со свежей сессией.
+    async fn report_playlist_error(
+        &self,
+        provider: &Arc<dyn tmus_provider::Provider>,
+        err: tmus_provider::ProviderError,
+    ) -> anyhow::Error {
+        tracing::warn!(provider = %provider.id(), %err, "плейлистная операция не принята");
+        self.report_auth(provider, &err);
+        if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
+            self.try_reauth(provider).await;
+        }
+        err.into()
+    }
+
+    /// Создать плейлист у выбранного провайдера и разослать сигнал.
+    pub(crate) async fn playlist_create(&self, title: &str) -> anyhow::Result<Playlist> {
+        let provider = self.playlist_provider()?;
+        match provider.catalog().playlist_create(title).await {
+            Ok(playlist) => {
+                self.emit(Event::PlaylistsChanged);
+                Ok(playlist)
+            }
+            Err(err) => Err(self.report_playlist_error(provider, err).await),
+        }
+    }
+
+    /// Добавить трек в плейлист и разослать сигнал.
+    pub(crate) async fn playlist_add(
+        &self,
+        playlist: &PlaylistId,
+        track: &TrackId,
+    ) -> anyhow::Result<()> {
+        let provider = self.registry.get(playlist.provider).ok_or_else(|| {
+            anyhow::anyhow!("провайдер {} не подключён", playlist.provider)
+        })?;
+        match provider.catalog().playlist_add(playlist, track).await {
+            Ok(()) => {
+                self.emit(Event::PlaylistsChanged);
+                Ok(())
+            }
+            Err(err) => Err(self.report_playlist_error(provider, err).await),
+        }
+    }
+
+    /// Убрать трек из плейлиста и разослать сигнал.
+    pub(crate) async fn playlist_remove(
+        &self,
+        playlist: &PlaylistId,
+        track: &TrackId,
+    ) -> anyhow::Result<()> {
+        let provider = self.registry.get(playlist.provider).ok_or_else(|| {
+            anyhow::anyhow!("провайдер {} не подключён", playlist.provider)
+        })?;
+        match provider.catalog().playlist_remove(playlist, track).await {
+            Ok(()) => {
+                self.emit(Event::PlaylistsChanged);
+                Ok(())
+            }
+            Err(err) => Err(self.report_playlist_error(provider, err).await),
+        }
+    }
+
+    /// Удалить плейлист и разослать сигнал.
+    pub(crate) async fn playlist_delete(&self, playlist: &PlaylistId) -> anyhow::Result<()> {
+        let provider = self.registry.get(playlist.provider).ok_or_else(|| {
+            anyhow::anyhow!("провайдер {} не подключён", playlist.provider)
+        })?;
+        match provider.catalog().playlist_delete(playlist).await {
+            Ok(()) => {
+                self.emit(Event::PlaylistsChanged);
+                Ok(())
+            }
+            Err(err) => Err(self.report_playlist_error(provider, err).await),
+        }
+    }
+
     pub(crate) fn remember(&self, results: &[SearchResult]) -> anyhow::Result<()> {
         let tracks: Vec<Track> = results
             .iter()
