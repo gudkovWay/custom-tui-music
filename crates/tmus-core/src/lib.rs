@@ -12,6 +12,7 @@
 //! `tmus-ytmusic`, поломка провайдера остаётся поломкой провайдера.
 
 pub mod cache;
+pub mod catalog_source;
 pub mod config;
 pub mod cookies;
 pub mod error;

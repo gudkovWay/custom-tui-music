@@ -1,0 +1,51 @@
+id = "q/tmus"
+name = "Музыка"
+version = "0.2.0"
+plugin_api = 18
+author = "q"
+license = "MIT"
+dependencies = []
+icon = "music"
+description = "Что играет в tmusd и пульт: библиотека, плейлисты, очередь, поиск, клиенты."
+tags = ["multimedia"]
+
+[[widget]]
+id = "tmus-widget"
+entry = "widget.luau"
+
+  [[widget.setting]]
+  key = "title_width"
+  type = "int"
+  label_key = "settings.title_width.label"
+  description_key = "settings.title_width.description"
+  default = 28
+
+[widget.actions]
+middle = "none"
+
+[[panel]]
+id = "library"
+entry = "panel.luau"
+width = 900
+height = 700
+capture_keys = [
+  "Left", "Right", "Up", "Down", "Return", "Escape", "Space", "slash",
+  "G", "H", "J", "K", "L", "N", "O", "P", "R", "S",
+  "1", "2", "3", "4", "5",
+  "Cyrillic_pe", "Cyrillic_er", "Cyrillic_o", "Cyrillic_el", "Cyrillic_de",
+  "Cyrillic_te", "Cyrillic_shcha", "Cyrillic_ze", "Cyrillic_ka",
+  "Cyrillic_yeru", "Cyrillic_PE", "Cyrillic_ER", "Cyrillic_O", "Cyrillic_EL",
+  "Cyrillic_DE", "Cyrillic_TE", "Cyrillic_SHCHA", "Cyrillic_ZE", "Cyrillic_KA",
+  "Cyrillic_YERU",
+]
+
+[[service]]
+id = "watch"
+entry = "service.luau"
+
+[[setting]]
+key = "terminal"
+type = "string"
+label_key = "settings.terminal.label"
+description_key = "settings.terminal.description"
+default = "kitty -e %s"

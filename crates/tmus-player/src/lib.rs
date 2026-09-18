@@ -199,7 +199,8 @@ impl Player {
                 MpvEvent::EndOfFile => self.on_track_end().await,
                 MpvEvent::Idle => {
                     // idle после stop или после неудачной загрузки — это
-                    // остановка, а не конец трека (конец несёт eof-reached).
+                    // остановка, а не конец трека (конец несёт end-file
+                    // с reason=eof).
                     *self.inner.status.lock().await = PlaybackStatus::Stopped;
                 }
                 MpvEvent::Restarted | MpvEvent::GaveUp { .. } => {

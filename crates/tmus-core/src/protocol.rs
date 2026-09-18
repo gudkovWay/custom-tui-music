@@ -39,6 +39,12 @@ pub enum Response {
     Err { id: u64, err: String },
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CatalogSource {
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Cmd {
@@ -81,6 +87,8 @@ pub enum Cmd {
     Library { provider: Option<String> },
     LibraryTracks { playlist: PlaylistId },
     Liked { provider: Option<String> },
+    GetCatalogSource,
+    SetCatalogSource { source: CatalogSource },
 
     // --- офлайн-кэш ---
     CacheStats,
@@ -103,6 +111,7 @@ pub enum Payload {
     Playlists(Vec<crate::model::Playlist>),
     Providers(Vec<ProviderView>),
     Cache(CacheStats),
+    Catalog(CatalogSource),
 }
 
 /// Ответ на команду без данных. Отдельный тип вместо `null`, чтобы
@@ -226,6 +235,57 @@ mod tests {
                 assert_eq!(index, Some(0));
             }
             other => panic!("expected a queue event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn catalog_source_defaults_to_all() {
+        let all = serde_json::from_str::<CatalogSource>("{}").expect("parse");
+        assert_eq!(all, CatalogSource { provider: None });
+        let saved = serde_json::from_str::<CatalogSource>(r#"{"provider":"soundcloud"}"#).expect("parse");
+        assert_eq!(saved.provider.as_deref(), Some("soundcloud"));
+    }
+
+    #[test]
+    fn catalog_source_commands_stay_flat() {
+        let get = line(&Request { id: 2, cmd: Cmd::GetCatalogSource });
+        assert_eq!(get, r#"{"id":2,"cmd":"get_catalog_source"}"#);
+
+        let set = line(&Request {
+            id: 3,
+            cmd: Cmd::SetCatalogSource { source: CatalogSource { provider: Some("ytmusic".into()) } },
+        });
+        assert_eq!(set, r#"{"id":3,"cmd":"set_catalog_source","source":{"provider":"ytmusic"}}"#);
+    }
+
+    #[test]
+    fn catalog_payload_roundtrips() {
+        let response = line(&Response::Ok { id: 5, ok: Payload::Catalog(CatalogSource { provider: None }) });
+        match serde_json::from_str::<Frame>(&response).expect("parse response") {
+            Frame::Response(Response::Ok { id, ok: Payload::Catalog(source) }) => {
+                assert_eq!(id, 5);
+                assert_eq!(source, CatalogSource { provider: None });
+            }
+            other => panic!("expected a catalog response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_payload_stays_cache_despite_catalog_variant() {
+        let stats = CacheStats {
+            tracks: 12,
+            bytes: 4096,
+            limit_bytes: 1 << 30,
+            pinned_tracks: 2,
+            pinned_bytes: 512,
+        };
+        let response = line(&Response::Ok { id: 9, ok: Payload::Cache(stats) });
+        match serde_json::from_str::<Frame>(&response).expect("parse response") {
+            Frame::Response(Response::Ok { id, ok: Payload::Cache(stats) }) => {
+                assert_eq!(id, 9);
+                assert_eq!(stats.tracks, 12);
+            }
+            other => panic!("cache payload must not degrade to Catalog, got {other:?}"),
         }
     }
 

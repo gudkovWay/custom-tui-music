@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use tmus_core::model::{PlaylistId, ProviderId, TrackId};
+use tmus_core::model::{LoopMode, PlaylistId, ProviderId, TrackId};
 use tmus_core::protocol::{Cmd, Payload};
 use tmus_core::Paths;
 
@@ -43,13 +43,32 @@ enum CliCmd {
         #[arg(long)]
         json: bool,
     },
-    Library {
-        #[arg(long)]
-        json: bool,
-    },
     Liked {
         #[arg(long)]
         json: bool,
+    },
+    Source {
+        arg: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Library {
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Треки плейлиста.
+    LibraryTracks {
+        playlist_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Loop {
+        mode: String,
+    },
+    Shuffle {
+        mode: String,
     },
     Queue {
         #[arg(long)]
@@ -58,10 +77,16 @@ enum CliCmd {
     Search {
         query: String,
         #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
         json: bool,
     },
-    /// Играть плейлист с начала.
-    PlayPlaylist { playlist_id: String },
+    /// Играть плейлист с начала или с `--start`.
+    PlayPlaylist {
+        playlist_id: String,
+        #[arg(long)]
+        start: Option<usize>,
+    },
     #[command(subcommand)]
     Cache(CacheCmd),
     /// Стрим событий демона построчно в stdout (для noctalia.runStream).
@@ -114,18 +139,52 @@ async fn main() -> Result<()> {
         CliCmd::Vol { value } => parse_vol(&value, current_volume(&mut client).await?)?,
         CliCmd::Status { json } => return print_payload(client.call(Cmd::State).await?, json),
         CliCmd::Providers { json } => return print_payload(client.call(Cmd::Providers).await?, json),
-        CliCmd::Library { json } => return print_payload(client.call(Cmd::Library { provider: None }).await?, json),
+        CliCmd::Library { provider, json } => {
+            let provider = resolve_provider(&mut client, provider.as_deref()).await?;
+            return print_payload(client.call(Cmd::Library { provider }).await?, json);
+        }
         CliCmd::Liked { json } => return print_payload(client.call(Cmd::Liked { provider: None }).await?, json),
+        CliCmd::Source { arg, json } => {
+            let cmd = match arg {
+                Some(arg) => Cmd::SetCatalogSource {
+                    source: tmus_core::protocol::CatalogSource { provider: parse_source_arg(&arg)? },
+                },
+                None => Cmd::GetCatalogSource,
+            };
+            return print_payload(client.call(cmd).await?, json);
+        }
+        CliCmd::LibraryTracks { playlist_id, json } => {
+            let cmd = Cmd::LibraryTracks { playlist: parse_playlist_id(&playlist_id)? };
+            return print_payload(client.call(cmd).await?, json);
+        }
+        CliCmd::Loop { mode } => Cmd::SetLoop { mode: parse_loop(&mode)? },
+        CliCmd::Shuffle { mode } => match parse_shuffle(&mode)? {
+            Some(shuffle) => Cmd::SetShuffle { shuffle },
+            None => {
+                let current = match client.call(Cmd::State).await? {
+                    Payload::State(state) => state.shuffle,
+                    _ => false,
+                };
+                Cmd::SetShuffle { shuffle: !current }
+            }
+        },
         CliCmd::Queue { json } => return print_payload(client.call(Cmd::Queue).await?, json),
-        CliCmd::Search { query, json } => {
+        CliCmd::Search { query, provider, json } => {
+            let provider = resolve_provider(&mut client, provider.as_deref()).await?;
             return print_payload(
-                client.call(Cmd::Search { query, kind: tmus_core::model::SearchKind::Tracks, provider: None }).await?,
+                client
+                    .call(Cmd::Search {
+                        query,
+                        kind: tmus_core::model::SearchKind::Tracks,
+                        provider,
+                    })
+                    .await?,
                 json,
             );
         }
-        CliCmd::PlayPlaylist { playlist_id } => Cmd::PlayPlaylist {
+        CliCmd::PlayPlaylist { playlist_id, start } => Cmd::PlayPlaylist {
             playlist: parse_playlist_id(&playlist_id)?,
-            start: Some(0),
+            start: Some(start.unwrap_or(0)),
         },
         CliCmd::Cache(cache) => match cache {
             CacheCmd::Stats { json } => return print_payload(client.call(Cmd::CacheStats).await?, json),
@@ -212,6 +271,7 @@ fn format_payload(payload: &Payload) -> String {
             .map(|p| format!("{} ({}): {:?}", p.id, p.name, p.auth))
             .collect::<Vec<_>>()
             .join("\n"),
+        Payload::Catalog(s) => s.provider.clone().unwrap_or_else(|| "all".to_owned()),
         Payload::Cache(c) => format!(
             "треков {} ({:.1} МиБ), закреплено {} ({:.1} МиБ), лимит {:.1} МиБ",
             c.tracks,
@@ -285,6 +345,49 @@ pub fn parse_vol(s: &str, current: f64) -> Result<Cmd> {
     Ok(Cmd::SetVolume { volume: value })
 }
 
+fn parse_source_arg(s: &str) -> Result<Option<String>> {
+    if s == "all" {
+        Ok(None)
+    } else {
+        Ok(Some(s.to_owned()))
+    }
+}
+
+fn parse_provider_flag(s: &str) -> Option<String> {
+    (s != "all").then(|| s.to_owned())
+}
+
+async fn resolve_provider(
+    client: &mut client::Client,
+    flag: Option<&str>,
+) -> Result<Option<String>> {
+    match flag {
+        Some(flag) => Ok(parse_provider_flag(flag)),
+        None => Ok(match client.call(Cmd::GetCatalogSource).await? {
+            Payload::Catalog(source) => source.provider,
+            _ => None,
+        }),
+    }
+}
+
+fn parse_loop(s: &str) -> Result<LoopMode> {
+    match s {
+        "none" => Ok(LoopMode::None),
+        "track" => Ok(LoopMode::Track),
+        "queue" => Ok(LoopMode::Queue),
+        _ => bail!("режим повтора: none|track|queue, получено {s:?}"),
+    }
+}
+
+fn parse_shuffle(s: &str) -> Result<Option<bool>> {
+    match s {
+        "on" => Ok(Some(true)),
+        "off" => Ok(Some(false)),
+        "toggle" => Ok(None),
+        _ => bail!("режим шафла: on|off|toggle, получено {s:?}"),
+    }
+}
+
 /// `187 с → "3:07"`, `3723 с → "1:02:03"`. `None` — длительность
 /// неизвестна провайдеру.
 pub fn fmt_time(secs: Option<u64>) -> String {
@@ -339,6 +442,34 @@ mod tests {
         assert!(matches!(parse_vol("+5", 99.0).expect("ok"), Cmd::SetVolume { volume } if volume == 100.0));
         assert!(matches!(parse_vol("-5", 3.0).expect("ok"), Cmd::SetVolume { volume } if volume == 0.0));
         assert!(matches!(parse_vol("40", 10.0).expect("ok"), Cmd::SetVolume { volume } if volume == 40.0));
+    }
+
+    #[test]
+    fn source_arg_maps_all_to_none_else_provider() {
+        assert_eq!(parse_source_arg("all").expect("ok"), None);
+        assert_eq!(parse_source_arg("ytmusic").expect("ok"), Some("ytmusic".to_owned()));
+    }
+
+    #[test]
+    fn provider_flag_maps_all_to_none_else_provider() {
+        assert_eq!(parse_provider_flag("all"), None);
+        assert_eq!(parse_provider_flag("soundcloud"), Some("soundcloud".to_owned()));
+    }
+
+    #[test]
+    fn loop_mode_parses_three_names_only() {
+        assert_eq!(parse_loop("none").expect("ok"), LoopMode::None);
+        assert_eq!(parse_loop("track").expect("ok"), LoopMode::Track);
+        assert_eq!(parse_loop("queue").expect("ok"), LoopMode::Queue);
+        assert!(parse_loop("forever").is_err());
+    }
+
+    #[test]
+    fn shuffle_parses_on_off_toggle() {
+        assert_eq!(parse_shuffle("on").expect("ok"), Some(true));
+        assert_eq!(parse_shuffle("off").expect("ok"), Some(false));
+        assert_eq!(parse_shuffle("toggle").expect("ok"), None);
+        assert!(parse_shuffle("maybe").is_err());
     }
 
     #[test]

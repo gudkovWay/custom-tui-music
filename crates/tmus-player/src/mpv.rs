@@ -178,12 +178,13 @@ fn map_event(name: &str, data: &Value) -> Option<MpvEvent> {
                     .and_then(secs_to_duration)
                     .map(MpvEvent::Duration),
                 "pause" => value.as_bool().map(MpvEvent::Paused),
-                // `eof-reached=false` приходит при загрузке нового файла —
-                // концом трека считаем только `true`.
-                "eof-reached" => value.as_bool().and_then(|eof| eof.then_some(MpvEvent::EndOfFile)),
                 _ => None,
             }
         }
+        "end-file" => match data.get("reason").and_then(Value::as_str) {
+            Some("eof") => Some(MpvEvent::EndOfFile),
+            _ => None,
+        },
         "idle" => Some(MpvEvent::Idle),
         _ => None,
     }
@@ -324,7 +325,7 @@ impl Mpv {
 
     /// Наблюдать свойства, из которых собираются `MpvEvent`.
     pub async fn observe(&self) -> Result<(), MpvError> {
-        for (id, name) in [(1u64, "time-pos"), (2, "duration"), (3, "pause"), (4, "eof-reached")] {
+        for (id, name) in [(1u64, "time-pos"), (2, "duration"), (3, "pause")] {
             self.request(vec![json!("observe_property"), json!(id), json!(name)])
                 .await?;
         }
@@ -646,15 +647,13 @@ mod tests {
         );
         assert_eq!(pos, Some(MpvEvent::Position { position: Duration::from_millis(12500) }));
 
-        let eof = map_event(
-            "property-change",
-            &json!({"event":"property-change","id":4,"name":"eof-reached","data":true}),
-        );
-        assert_eq!(eof, Some(MpvEvent::EndOfFile));
-
         // false не должен изображать конец трека.
         assert_eq!(
             map_event("property-change", &json!({"event":"property-change","id":4,"name":"eof-reached","data":false})),
+            None
+        );
+        assert_eq!(
+            map_event("property-change", &json!({"event":"property-change","id":4,"name":"eof-reached","data":true})),
             None
         );
 
@@ -669,6 +668,31 @@ mod tests {
             None
         );
         assert_eq!(map_event("exit", &json!({"event":"exit"})), None);
+    }
+
+    #[test]
+    fn end_file_reason_eof_maps_to_end_of_file() {
+        let eof = map_event(
+            "end-file",
+            &json!({"event":"end-file","reason":"eof","playlist_entry_id":1}),
+        );
+        assert_eq!(eof, Some(MpvEvent::EndOfFile));
+    }
+
+    #[test]
+    fn end_file_other_reasons_do_not_advance() {
+        for reason in ["stop", "quit", "error", "redirect", "unknown"] {
+            let event = map_event(
+                "end-file",
+                &json!({"event":"end-file","reason":reason,"playlist_entry_id":1}),
+            );
+            assert_eq!(event, None, "reason={reason} не должен давать EndOfFile");
+        }
+        assert_eq!(
+            map_event("end-file", &json!({"event":"end-file","playlist_entry_id":1})),
+            None,
+            "отсутствие reason не должен давать EndOfFile"
+        );
     }
 
     #[test]

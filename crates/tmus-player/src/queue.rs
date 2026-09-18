@@ -415,6 +415,25 @@ mod tests {
     }
 
     #[test]
+    fn shuffle_with_queue_loop_repeats_same_cycle_order() {
+        let mut q = queue(&["ytmusic:a", "ytmusic:b", "ytmusic:c", "ytmusic:d", "ytmusic:e"]);
+        q.set_loop_mode(LoopMode::Queue);
+        q.set_shuffle(true);
+        q.goto(q.order[0]);
+
+        let mut first_cycle: Vec<String> = vec![q.current().expect("текущий").id.id.clone()];
+        for _ in 1..q.len() {
+            first_cycle.push(q.next().expect("трек").id.id.clone());
+        }
+        assert_eq!(first_cycle.len(), 5);
+        let mut second_cycle: Vec<String> = Vec::new();
+        for _ in 0..q.len() {
+            second_cycle.push(q.next().expect("трек").id.id.clone());
+        }
+        assert_eq!(second_cycle, first_cycle, "второй цикл обязан повторить порядок первого");
+    }
+
+    #[test]
     fn append_after_shuffle_enabled_extends_traversal() {
         let mut q = queue(&["ytmusic:a", "ytmusic:b"]);
         q.set_shuffle(true);

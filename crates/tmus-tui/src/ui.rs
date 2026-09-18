@@ -17,33 +17,113 @@ use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 
 use tmus_core::model::{LoopMode, PlaybackStatus, Playlist, SearchResult, Track};
-use tmus_core::protocol::{Cmd, Event, Payload, PlayerState};
+use tmus_core::protocol::{CatalogSource, Cmd, Event, Payload, PlayerState};
 use tmus_core::Paths;
 
 use crate::client::Client;
 use crate::fmt_time;
 
 /// Панели левой колонки. Tab переключает по кругу.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Panel {
     Library,
     Queue,
     Search,
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Focus {
+    Panel,
+    Tracks,
+}
+
+struct Nav {
+    panel: Panel,
+    focus: Focus,
+    open_playlist: Option<usize>,
+    library_sel: ListState,
+    queue_sel: ListState,
+    search_sel: ListState,
+    playlist_sel: ListState,
+}
+
+impl Nav {
+    fn new() -> Self {
+        Self {
+            panel: Panel::Library,
+            focus: Focus::Panel,
+            open_playlist: None,
+            library_sel: ListState::default(),
+            queue_sel: ListState::default(),
+            search_sel: ListState::default(),
+            playlist_sel: ListState::default(),
+        }
+    }
+
+    fn enter_playlist(&mut self, playlists_len: usize) -> bool {
+        if self.focus != Focus::Panel || self.panel != Panel::Library {
+            return false;
+        }
+        let Some(idx) = self.library_sel.selected() else {
+            return false;
+        };
+        if idx >= playlists_len {
+            return false;
+        }
+        self.focus = Focus::Tracks;
+        self.open_playlist = Some(idx);
+        self.playlist_sel.select(Some(0));
+        true
+    }
+
+    fn leave_playlist(&mut self) {
+        self.focus = Focus::Panel;
+        self.open_playlist = None;
+    }
+
+    fn tab(&mut self) {
+        self.focus = Focus::Panel;
+        self.open_playlist = None;
+        self.panel = match self.panel {
+            Panel::Library => Panel::Queue,
+            Panel::Queue => Panel::Search,
+            Panel::Search => Panel::Library,
+        };
+    }
+
+    fn move_active(&mut self, delta: i64, panel_len: usize, queue_len: usize, search_len: usize, tracks_len: usize) {
+        let (len, sel) = match (self.focus, self.panel) {
+            (Focus::Tracks, _) => (tracks_len, &mut self.playlist_sel),
+            (Focus::Panel, Panel::Library) => (panel_len, &mut self.library_sel),
+            (Focus::Panel, Panel::Queue) => (queue_len, &mut self.queue_sel),
+            (Focus::Panel, Panel::Search) => (search_len, &mut self.search_sel),
+        };
+        if len == 0 {
+            return;
+        }
+        let current = sel.selected().unwrap_or(0) as i64;
+        let next = (current + delta).clamp(0, len as i64 - 1);
+        sel.select(Some(next as usize));
+    }
+
+    fn track_play_sel(&self) -> Option<(usize, usize)> {
+        let idx = self.open_playlist?;
+        let start = self.playlist_sel.selected()?;
+        Some((idx, start))
+    }
+}
+
 struct App {
     client: Client,
     state: PlayerState,
+    source: CatalogSource,
     playlists: Vec<Playlist>,
     /// Треки выбранного плейлиста — правая колонка.
     playlist_tracks: Vec<Track>,
     search_results: Vec<SearchResult>,
     search_input: String,
     search_mode: bool,
-    panel: Panel,
-    library_sel: ListState,
-    queue_sel: ListState,
-    search_sel: ListState,
+    nav: Nav,
     /// Что показать в строке состояния при отсутствии живых данных:
     /// «демон не отвечает» вместо падения при обрыве.
     notice: Option<String>,
@@ -55,27 +135,31 @@ pub async fn run(paths: &Paths) -> Result<()> {
 
     let mut state = PlayerState::default();
     let mut playlists = Vec::new();
+    let mut source = CatalogSource::default();
     // Стартовый снимок: подписка сообщает только об изменениях, без
     // первого `state` интерфейс был бы пуст до первого действия.
     if let Ok(Payload::State(s)) = client.call(Cmd::State).await {
         state = s;
     }
-    if let Ok(Payload::Playlists(ps)) = client.call(Cmd::Library { provider: None }).await {
+    if let Ok(Payload::Catalog(s)) = client.call(Cmd::GetCatalogSource).await {
+        source = s;
+    }
+    if let Ok(Payload::Playlists(ps)) =
+        client.call(Cmd::Library { provider: source.provider.clone() }).await
+    {
         playlists = ps;
     }
 
     let mut app = App {
         client,
         state,
+        source,
         playlists,
         playlist_tracks: Vec::new(),
         search_results: Vec::new(),
         search_input: String::new(),
         search_mode: false,
-        panel: Panel::Library,
-        library_sel: ListState::default(),
-        queue_sel: ListState::default(),
-        search_sel: ListState::default(),
+        nav: Nav::new(),
         notice: None,
     };
 
@@ -179,23 +263,47 @@ async fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Re
     match code {
         KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(true),
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return Ok(true),
-        KeyCode::Tab => {
-            app.panel = match app.panel {
-                Panel::Library => Panel::Queue,
-                Panel::Queue => Panel::Search,
-                Panel::Search => Panel::Library,
-            };
+        KeyCode::Tab => app.nav.tab(),
+        KeyCode::Char('l') | KeyCode::Right => {
+            if app.nav.enter_playlist(app.playlists.len()) {
+                load_selected_playlist(app).await;
+            }
         }
+        KeyCode::Char('h') | KeyCode::Left => app.nav.leave_playlist(),
         KeyCode::Char('j') | KeyCode::Down => {
-            move_sel(app, 1);
-            load_selected_playlist(app).await;
+            let (p, q, s, t) = (
+                app.playlists.len(),
+                app.state.queue_len,
+                app.search_results.len(),
+                app.playlist_tracks.len(),
+            );
+            app.nav.move_active(1, p, q, s, t);
+            if app.nav.focus == Focus::Panel && app.nav.panel == Panel::Library {
+                load_selected_playlist(app).await;
+            }
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            move_sel(app, -1);
-            load_selected_playlist(app).await;
+            let (p, q, s, t) = (
+                app.playlists.len(),
+                app.state.queue_len,
+                app.search_results.len(),
+                app.playlist_tracks.len(),
+            );
+            app.nav.move_active(-1, p, q, s, t);
+            if app.nav.focus == Focus::Panel && app.nav.panel == Panel::Library {
+                load_selected_playlist(app).await;
+            }
         }
         KeyCode::Enter => play_selected(app).await,
-        KeyCode::Char(' ') => call_quiet(app, Cmd::Toggle).await,
+        KeyCode::Char(' ') => {
+            if app.nav.focus == Focus::Tracks {
+                if let Some(cmd) = track_cmd(app) {
+                    call_quiet(app, cmd).await;
+                }
+            } else {
+                call_quiet(app, Cmd::Toggle).await;
+            }
+        }
         KeyCode::Char('n') => call_quiet(app, Cmd::Next).await,
         KeyCode::Char('p') => call_quiet(app, Cmd::Prev).await,
         KeyCode::Char('+') | KeyCode::Char('=') => {
@@ -214,6 +322,7 @@ async fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Re
             call_quiet(app, Cmd::SetLoop { mode: next }).await;
         }
         KeyCode::Char('/') => {
+            app.nav.leave_playlist();
             app.search_mode = true;
             app.search_input.clear();
         }
@@ -235,12 +344,16 @@ async fn handle_search_key(app: &mut App, code: KeyCode) -> Result<()> {
             let query = app.search_input.clone();
             if let Ok(Payload::Results(results)) = app
                 .client
-                .call(Cmd::Search { query, kind: tmus_core::model::SearchKind::Tracks, provider: None })
+                .call(Cmd::Search {
+                    query,
+                    kind: tmus_core::model::SearchKind::Tracks,
+                    provider: app.source.provider.clone(),
+                })
                 .await
             {
                 app.search_results = results;
-                app.panel = Panel::Search;
-                app.search_sel.select(Some(0));
+                app.nav.panel = Panel::Search;
+                app.nav.search_sel.select(Some(0));
             }
         }
         KeyCode::Backspace => {
@@ -256,42 +369,43 @@ async fn handle_search_key(app: &mut App, code: KeyCode) -> Result<()> {
 /// шаг курсора — один запрос; треки не кэшируются, каталог может
 /// меняться под ногами.
 async fn load_selected_playlist(app: &mut App) {
-    let Some(idx) = app.library_sel.selected() else { return };
+    let Some(idx) = app.nav.library_sel.selected() else { return };
     let Some(playlist) = app.playlists.get(idx) else { return };
     let id = playlist.id.clone();
-    if let Ok(Payload::Tracks(tracks)) = app.client.call(Cmd::LibraryTracks { playlist: id }).await {
-        app.playlist_tracks = tracks;
+    app.playlist_tracks.clear();
+    match app.client.call(Cmd::LibraryTracks { playlist: id }).await {
+        Ok(Payload::Tracks(tracks)) => app.playlist_tracks = tracks,
+        Ok(_) => app.notice = Some("неожиданный ответ на LibraryTracks".to_owned()),
+        Err(e) => app.notice = Some(e.to_string()),
     }
 }
 
-fn move_sel(app: &mut App, delta: i64) {
-    let (len, sel) = match app.panel {
-        Panel::Library => (app.playlists.len(), &mut app.library_sel),
-        Panel::Queue => (app.state.queue_len, &mut app.queue_sel),
-        Panel::Search => (app.search_results.len(), &mut app.search_sel),
-    };
-    if len == 0 {
-        return;
-    }
-    let current = sel.selected().unwrap_or(0) as i64;
-    let next = (current + delta).clamp(0, len as i64 - 1);
-    sel.select(Some(next as usize));
+fn track_cmd(app: &App) -> Option<Cmd> {
+    let (idx, start) = app.nav.track_play_sel()?;
+    let playlist = app.playlists.get(idx)?;
+    Some(Cmd::PlayPlaylist { playlist: playlist.id.clone(), start: Some(start) })
 }
 
 async fn play_selected(app: &mut App) {
-    match app.panel {
+    if app.nav.focus == Focus::Tracks {
+        if let Some(cmd) = track_cmd(app) {
+            call_quiet(app, cmd).await;
+        }
+        return;
+    }
+    match app.nav.panel {
         Panel::Library => {
-            let Some(idx) = app.library_sel.selected() else { return };
+            let Some(idx) = app.nav.library_sel.selected() else { return };
             let Some(playlist) = app.playlists.get(idx) else { return };
             call_quiet(app, Cmd::PlayPlaylist { playlist: playlist.id.clone(), start: Some(0) }).await;
         }
         Panel::Queue => {
-            if let Some(idx) = app.queue_sel.selected() {
+            if let Some(idx) = app.nav.queue_sel.selected() {
                 call_quiet(app, Cmd::QueueGoto { index: idx }).await;
             }
         }
         Panel::Search => {
-            let Some(idx) = app.search_sel.selected() else { return };
+            let Some(idx) = app.nav.search_sel.selected() else { return };
             if let Some(SearchResult::Track(track)) = app.search_results.get(idx) {
                 call_quiet(app, Cmd::PlayTrack { track: track.id.clone() }).await;
             }
@@ -322,9 +436,9 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // Левая колонка: текущая панель. В режиме поиска заголовок
     // показывает ввод.
-    let (title, items, sel_panel) = match app.panel {
+    let (title, items, sel_panel) = match app.nav.panel {
         Panel::Library => (
-            "Библиотека [Tab]".to_owned(),
+            "Библиотека [Tab] [l]".to_owned(),
             app.playlists
                 .iter()
                 .map(|p| {
@@ -332,17 +446,17 @@ fn draw(f: &mut Frame, app: &mut App) {
                     ListItem::new(Line::from(format!("{}{}", p.title, count)))
                 })
                 .collect(),
-            &mut app.library_sel,
+            &mut app.nav.library_sel,
         ),
         Panel::Queue => (
             "Очередь [Tab]".to_owned(),
             queue_items(app),
-            &mut app.queue_sel,
+            &mut app.nav.queue_sel,
         ),
         Panel::Search => (
             format!("Результаты: {}", app.search_input),
             search_items(app),
-            &mut app.search_sel,
+            &mut app.nav.search_sel,
         ),
     };
 
@@ -351,18 +465,24 @@ fn draw(f: &mut Frame, app: &mut App) {
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(left_list, left, sel_panel);
 
-    // Правая колонка: треки выбранного плейлиста (или очередь, если
-    // плейлист не выбран). Источник трека виден в списке: очередь
+    // Правая колонка: в режиме плейлиста — его треки с собственным
+    // курсором, иначе очередь. Источник трека виден в списке: очередь
     // смешанная, без колонки провайдера она нечитаема.
-    let right_items: Vec<ListItem> = if !app.playlist_tracks.is_empty() {
-        app.playlist_tracks.iter().map(track_line).collect()
+    if app.nav.focus == Focus::Tracks {
+        let title = match app.nav.open_playlist.and_then(|i| app.playlists.get(i)) {
+            Some(p) => format!("Плейлист: {} [h]", p.title),
+            None => "Плейлист [h]".to_owned(),
+        };
+        let items: Vec<ListItem> = app.playlist_tracks.iter().map(track_line).collect();
+        let right_list = List::new(items)
+            .block(Block::new().borders(Borders::ALL).title(title))
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        f.render_stateful_widget(right_list, right, &mut app.nav.playlist_sel);
     } else {
-        queue_items(app)
-    };
-    let right_list = List::new(right_items)
-        .block(Block::new().borders(Borders::ALL).title("Треки [Tab]"))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    f.render_stateful_widget(right_list, right, &mut app.queue_sel.clone());
+        let right_list = List::new(queue_items(app))
+            .block(Block::new().borders(Borders::ALL).title("Очередь [Tab]"));
+        f.render_widget(right_list, right);
+    }
 
     draw_status(f, app, status);
 }
@@ -470,6 +590,7 @@ fn progress_bar(position: Option<u64>, duration: Option<u64>, width: usize) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tmus_core::model::{PlaylistId, ProviderId};
 
     fn cyrillic(s: &str, width: usize) -> String {
         trim_fit(s, width)
@@ -491,6 +612,114 @@ mod tests {
         assert_eq!(trim_fit("ok", 10), "ok");
         assert!(trim_fit("abcdef", 3).contains('\u{2026}'));
         assert_eq!(trim_fit("abcdef", 3).chars().count(), 3);
+    }
+
+    fn pl(id: &str) -> Playlist {
+        Playlist {
+            id: PlaylistId { provider: ProviderId::YTMUSIC, id: id.into() },
+            title: id.into(),
+            subtitle: None,
+            art_url: None,
+            track_count: None,
+        }
+    }
+
+    fn nav_at(sel: Option<usize>) -> Nav {
+        let mut nav = Nav::new();
+        nav.library_sel.select(sel);
+        nav
+    }
+
+    #[test]
+    fn enter_opens_playlist_tracks_with_cursor_at_top() {
+        let mut nav = nav_at(Some(1));
+        assert!(nav.enter_playlist(3));
+        assert_eq!(nav.focus, Focus::Tracks);
+        assert_eq!(nav.open_playlist, Some(1));
+        assert_eq!(nav.playlist_sel.selected(), Some(0));
+        assert_eq!(nav.library_sel.selected(), Some(1));
+        assert!(!nav_at(None).enter_playlist(3));
+        assert!(!nav_at(Some(5)).enter_playlist(3));
+    }
+
+    #[test]
+    fn back_restores_panel_focus_and_library_cursor() {
+        let mut nav = nav_at(Some(2));
+        assert!(nav.enter_playlist(3));
+        nav.leave_playlist();
+        assert_eq!(nav.focus, Focus::Panel);
+        assert_eq!(nav.library_sel.selected(), Some(2));
+        assert_eq!(nav.open_playlist, None);
+        assert_eq!(nav.track_play_sel(), None);
+    }
+
+    #[test]
+    fn tab_clears_open_playlist() {
+        let mut nav = nav_at(Some(0));
+        nav.enter_playlist(3);
+        nav.tab();
+        assert_eq!(nav.focus, Focus::Panel);
+        assert_eq!(nav.open_playlist, None);
+        assert_eq!(nav.track_play_sel(), None);
+    }
+
+    #[test]
+    fn tab_rotates_panels_and_leaves_playlist_focus() {
+        let mut nav = nav_at(Some(0));
+        nav.enter_playlist(3);
+        nav.tab();
+        assert_eq!(nav.focus, Focus::Panel);
+        assert_eq!(nav.panel, Panel::Queue);
+        nav.tab();
+        assert_eq!(nav.panel, Panel::Search);
+        nav.tab();
+        assert_eq!(nav.panel, Panel::Library);
+    }
+
+    #[test]
+    fn movement_targets_active_list_only() {
+        let mut nav = nav_at(Some(0));
+        nav.move_active(1, 3, 0, 0, 0);
+        assert_eq!(nav.library_sel.selected(), Some(1));
+
+        nav.enter_playlist(3);
+        nav.move_active(1, 3, 0, 0, 5);
+        nav.move_active(1, 3, 0, 0, 5);
+        assert_eq!(nav.playlist_sel.selected(), Some(2));
+        assert_eq!(nav.library_sel.selected(), Some(1));
+
+        nav.move_active(-1, 3, 0, 0, 5);
+        assert_eq!(nav.playlist_sel.selected(), Some(1));
+        nav.move_active(-10, 3, 0, 0, 5);
+        assert_eq!(nav.playlist_sel.selected(), Some(0));
+        nav.move_active(10, 3, 0, 0, 5);
+        assert_eq!(nav.playlist_sel.selected(), Some(4));
+
+        nav.leave_playlist();
+        nav.move_active(-10, 3, 0, 0, 5);
+        assert_eq!(nav.library_sel.selected(), Some(0));
+        assert_eq!(nav.playlist_sel.selected(), Some(4));
+    }
+
+    #[test]
+    fn empty_active_list_does_not_move() {
+        let mut nav = Nav::new();
+        nav.move_active(1, 0, 4, 2, 0);
+        assert_eq!(nav.library_sel.selected(), None);
+    }
+
+    #[test]
+    fn track_play_cmd_uses_selected_index_and_full_playlist() {
+        let playlists = vec![pl("a"), pl("b")];
+        let mut nav = nav_at(Some(0));
+        assert!(nav.enter_playlist(2));
+        nav.move_active(2, 2, 0, 0, 5);
+        assert_eq!(nav.track_play_sel(), Some((0, 2)));
+        let (idx, start) = nav.track_play_sel().unwrap();
+        assert_eq!(playlists[idx].id.id, "a");
+        assert_eq!(start, 2);
+        nav.leave_playlist();
+        assert_eq!(nav.track_play_sel(), None);
     }
 
     #[test]

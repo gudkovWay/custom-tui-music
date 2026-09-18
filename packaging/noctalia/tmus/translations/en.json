@@ -1,0 +1,12 @@
+{
+  "settings": {
+    "terminal": {
+      "description": "Command that opens tmus. %s is replaced with the binary.",
+      "label": "Terminal for the TUI"
+    },
+    "title_width": {
+      "description": "Title characters shown in the bar. 0 keeps only the glyph.",
+      "label": "Title length"
+    }
+  }
+}

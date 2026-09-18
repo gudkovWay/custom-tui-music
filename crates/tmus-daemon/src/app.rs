@@ -21,7 +21,7 @@ use tmus_core::model::{
     PlaybackStatus, Playlist, PlaylistId, SearchKind, SearchResult, Track, TrackId,
 };
 use tmus_core::paths::Paths;
-use tmus_core::protocol::{Ack, Cmd, Event, Payload, ProviderView, QueueView};
+use tmus_core::protocol::{Ack, CatalogSource, Cmd, Event, Payload, ProviderView, QueueView};
 use tmus_player::Player;
 use tmus_provider::Registry;
 use tokio::sync::broadcast;
@@ -46,6 +46,7 @@ pub struct App {
     config: Config,
     paths: Paths,
     events: broadcast::Sender<Event>,
+    catalog_source: std::sync::Mutex<CatalogSource>,
     /// Сигнал «пора гаситься». Нужен, потому что `Cmd::Shutdown`
     /// приходит из задачи control-socket, а гасить обязан `main`: только
     /// он снимает файл сокета и убивает mpv. Вызов `std::process::exit`
@@ -63,6 +64,10 @@ impl App {
         paths: Paths,
     ) -> Arc<Self> {
         let (events, _) = broadcast::channel(EVENT_BUFFER);
+        let saved = tmus_core::catalog_source::load(&paths);
+        let connected: Vec<String> =
+            registry.iter().map(|provider| provider.id().as_str().to_owned()).collect();
+        let catalog_source = resolve_catalog_source(saved.as_ref(), connected);
         Arc::new(Self {
             player,
             registry,
@@ -70,6 +75,7 @@ impl App {
             config,
             paths,
             events,
+            catalog_source: std::sync::Mutex::new(catalog_source),
             shutdown: tokio::sync::Notify::new(),
         })
     }
@@ -269,6 +275,21 @@ impl App {
                 let out = self.liked(provider.as_deref()).await?;
                 release_memory();
                 Ok(Payload::Tracks(out))
+            }
+
+            Cmd::GetCatalogSource => {
+                Ok(Payload::Catalog(self.catalog_source.lock().expect("catalog source").clone()))
+            }
+            Cmd::SetCatalogSource { source } => {
+                let mut guard = self.catalog_source.lock().expect("catalog source");
+                if let Some(provider) = &source.provider {
+                    if self.registry.get_by_str(provider).is_none() {
+                        anyhow::bail!("провайдер {provider} не подключён");
+                    }
+                }
+                tmus_core::catalog_source::save(&self.paths, &source)?;
+                *guard = source;
+                Ok(Payload::Catalog(guard.clone()))
             }
 
             Cmd::CacheStats => Ok(Payload::Cache(self.with_cache(|c| c.stats())?)),
@@ -523,6 +544,69 @@ impl App {
                 auth: provider.account().auth(),
             });
         }
+    }
+}
+
+pub fn resolve_catalog_source(
+    saved: Option<&CatalogSource>,
+    connected: Vec<String>,
+) -> CatalogSource {
+    match saved {
+        Some(source)
+            if source
+                .provider
+                .as_deref()
+                .is_none_or(|provider| connected.iter().any(|known| known == provider)) =>
+        {
+            source.clone()
+        }
+        _ => CatalogSource { provider: connected.into_iter().next() },
+    }
+}
+
+#[cfg(test)]
+mod catalog_source_tests {
+    use tmus_core::protocol::CatalogSource;
+
+    use super::resolve_catalog_source;
+
+    #[test]
+    fn saved_provider_is_kept() {
+        let saved = CatalogSource { provider: Some("soundcloud".into()) };
+        assert_eq!(
+            resolve_catalog_source(Some(&saved), vec!["ytmusic".into(), "soundcloud".into()]),
+            saved
+        );
+    }
+
+    #[test]
+    fn invalid_saved_provider_falls_back_to_first_connected() {
+        let saved = CatalogSource { provider: Some("spotify".into()) };
+        assert_eq!(
+            resolve_catalog_source(Some(&saved), vec!["ytmusic".into(), "soundcloud".into()]),
+            CatalogSource { provider: Some("ytmusic".into()) }
+        );
+    }
+
+    #[test]
+    fn saved_all_is_kept() {
+        let saved = CatalogSource { provider: None };
+        assert_eq!(
+            resolve_catalog_source(Some(&saved), vec!["ytmusic".into()]),
+            CatalogSource { provider: None }
+        );
+    }
+
+    #[test]
+    fn no_saved_source_selects_first_connected_or_all() {
+        assert_eq!(
+            resolve_catalog_source(None, Vec::new()),
+            CatalogSource { provider: None }
+        );
+        assert_eq!(
+            resolve_catalog_source(None, vec!["soundcloud".into()]),
+            CatalogSource { provider: Some("soundcloud".into()) }
+        );
     }
 }
 
