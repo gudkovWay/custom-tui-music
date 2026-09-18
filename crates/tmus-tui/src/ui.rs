@@ -198,17 +198,27 @@ async fn event_loop(
     events: &mut mpsc::Receiver<Event>,
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
 ) -> Result<()> {
+    // Рисуем только по изменению: poll(100ms) тикает 10 раз в секунду,
+    // и безусловный draw давал ~10 полных кадров в секунду впустую.
+    let mut dirty = true;
     loop {
-        // Демон может перезапуститься между командами: обрыв здесь не
-        // фатален, следующий удачный вызов продолжит работу.
-        if let Err(e) = terminal.draw(|f| draw(f, app)) {
-            return Err(e.into());
+        if dirty {
+            // Демон может перезапуститься между командами: обрыв здесь не
+            // фатален, следующий удачный вызов продолжит работу.
+            if let Err(e) = terminal.draw(|f| draw(f, app)) {
+                return Err(e.into());
+            }
+            dirty = false;
         }
 
         // Сначала выгребаем то, что уже копилось из подписки.
         loop {
             match events.try_recv() {
-                Ok(event) => apply_event(app, event).await,
+                Ok(event) => {
+                    if apply_event(app, event).await {
+                        dirty = true;
+                    }
+                }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     app.notice = Some("поток событий потерян; выход".to_owned());
@@ -218,39 +228,53 @@ async fn event_loop(
         }
 
         if event::poll(Duration::from_millis(100))? {
-            if let TermEvent::Key(key) = event::read()? {
-                // Зажатие клавиши в некоторых терминалах даёт повторные
-                // Press + Release; реагируем только на Press.
-                if key.kind != KeyEventKind::Press {
-                    continue;
+            // Читаем ровно один раз: второй `event::read()` в ветке else
+            // блокировал бы цикл до следующего события терминала.
+            match event::read()? {
+                TermEvent::Key(key) => {
+                    // Зажатие клавиши в некоторых терминалах даёт повторные
+                    // Press + Release; реагируем только на Press.
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    dirty = true;
+                    if handle_key(app, key.code, key.modifiers).await? {
+                        return Ok(());
+                    }
                 }
-                if handle_key(app, key.code, key.modifiers).await? {
-                    return Ok(());
-                }
+                // После ресайза буфер терминала битый; без перерисовки
+                // интерфейс остался бы искажённым до следующего события.
+                TermEvent::Resize(..) => dirty = true,
+                _ => {}
             }
         }
     }
 }
 
-async fn apply_event(app: &mut App, event: Event) {
+async fn apply_event(app: &mut App, event: Event) -> bool {
+    // Возврат — «видимый стейт изменился, кадр надо перерисовать»:
+    // цикл рисует только по изменению, поэтому игнорируемые события
+    // обязаны отличаться от меняющих стейт.
     match event {
-        Event::StateChanged { state } => app.state = state,
+        Event::StateChanged { state } => {
+            app.state = state;
+            true
+        }
         Event::Position { position, duration } => {
             app.state.position = Some(position);
             if duration.is_some() {
                 app.state.duration = duration;
             }
+            true
         }
-        // Очередь изменилась не нами — перечитываем, чтобы список был
-        // честным. Ошибка обрыва не страшна: при следующем событии
-        // попробуем снова.
-        Event::QueueChanged { .. } => {
-            if let Ok(Payload::Queue(q)) = app.client.call(Cmd::Queue).await {
-                app.state.queue_len = q.tracks.len();
-                app.state.queue_index = q.index;
-            }
+        // 339 КиБ JSON на очереди из 1000 треков ради двух чисел, которые
+        // уже лежат в самом событии, — полный Cmd::Queue не запрашиваем.
+        Event::QueueChanged { len, index } => {
+            app.state.queue_len = len;
+            app.state.queue_index = index;
+            true
         }
-        Event::TrackChanged { .. } | Event::CacheProgress { .. } | Event::AuthChanged { .. } => {}
+        Event::TrackChanged { .. } | Event::CacheProgress { .. } | Event::AuthChanged { .. } => false,
     }
 }
 
