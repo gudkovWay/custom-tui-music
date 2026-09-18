@@ -120,6 +120,24 @@ pub enum Cmd {
     /// отвечает `Ack`, прогресс идёт потоком `CacheProgress`.
     CacheWarm { tracks: Vec<TrackId> },
 
+    // --- плейлисты ---
+    /// Создать пустой приватный плейлист. Полей приватности здесь нет
+    /// сознательно: провайдер сам решает, каким создаёт плейлист по
+    /// умолчанию (YouTube Music — `PRIVATE`, чтобы пользовательский
+    /// выбор приватности не приходилось тащить через весь протокол).
+    /// Демон отвечает [`Payload::PlaylistCreated`] с новым id.
+    PlaylistCreate { title: String },
+    /// Добавить трек в плейлист. И плейлист, и трек нужны явно: одна и
+    /// та же операция осмысленна для любого плейлиста библиотеки, а
+    /// «текущего плейлиста» в демоне нет — он играет очередь.
+    PlaylistAdd { playlist: PlaylistId, track: TrackId },
+    /// Убрать трек из плейлиста. Плейлист указывается по той же
+    /// причине, что и в `PlaylistAdd`, — команда не привязана к тому,
+    /// что сейчас играет или открыто на экране.
+    PlaylistRemove { playlist: PlaylistId, track: TrackId },
+    /// Удалить плейлист целиком вместе с содержимым.
+    PlaylistDelete { playlist: PlaylistId },
+
     Shutdown,
 }
 
@@ -140,6 +158,9 @@ pub enum Payload {
     Ratings(Vec<(TrackId, Rating)>),
     Tracks(Vec<Track>),
     Playlists(Vec<crate::model::Playlist>),
+    /// Ответ на `PlaylistCreate`: id нового плейлиста, по которому его
+    /// можно сразу пополнять и открывать.
+    PlaylistCreated { playlist: PlaylistId },
     Providers(Vec<ProviderView>),
     Cache(CacheStats),
     Catalog(CatalogSource),
@@ -224,6 +245,11 @@ pub enum Event {
     /// Оценка трека изменилась (локально или на стороне провайдера) —
     /// клиенты перерисовывают значок лайка/дизлайка.
     RatingChanged { track: TrackId, rating: Rating },
+    /// Состав плейлистов изменился (создан, удалён, пополнен) —
+    /// получатель сам перечитывает список через `Cmd::Library`:
+    /// событие — только сигнал, чтобы не дублировать в кадре весь
+    /// список плейлистов при каждой мелкой правке.
+    PlaylistsChanged,
 }
 
 /// Обёртка кадра события: событие всегда приходит отдельным объектом,
@@ -358,6 +384,73 @@ mod tests {
                 assert_eq!(back, pairs);
             }
             other => panic!("expected a ratings payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn playlist_commands_stay_flat_and_roundtrip() {
+        let playlist = PlaylistId::new(ProviderId::YTMUSIC, "PL1");
+        let track_id = TrackId::new(ProviderId::YTMUSIC, "abc");
+
+        // create: только title, приватность решает провайдер.
+        let create = line(&Request { id: 20, cmd: Cmd::PlaylistCreate { title: "Chill".into() } });
+        assert_eq!(create, r#"{"id":20,"cmd":"playlist_create","title":"Chill"}"#);
+        let back: Request = serde_json::from_str(&create).expect("parse");
+        assert_eq!(back.id, 20);
+        assert_eq!(back.cmd, Cmd::PlaylistCreate { title: "Chill".into() });
+
+        // add/remove: кадр плоский, оба id разворачиваются на месте.
+        let add = line(&Request {
+            id: 21,
+            cmd: Cmd::PlaylistAdd { playlist: playlist.clone(), track: track_id.clone() },
+        });
+        assert_eq!(
+            add,
+            r#"{"id":21,"cmd":"playlist_add","playlist":{"provider":"ytmusic","id":"PL1"},"track":{"provider":"ytmusic","id":"abc"}}"#
+        );
+        let back: Request = serde_json::from_str(&add).expect("parse");
+        assert_eq!(back.cmd, Cmd::PlaylistAdd { playlist: playlist.clone(), track: track_id.clone() });
+
+        let remove = line(&Request {
+            id: 22,
+            cmd: Cmd::PlaylistRemove { playlist: playlist.clone(), track: track_id.clone() },
+        });
+        assert_eq!(
+            remove,
+            r#"{"id":22,"cmd":"playlist_remove","playlist":{"provider":"ytmusic","id":"PL1"},"track":{"provider":"ytmusic","id":"abc"}}"#
+        );
+        let back: Request = serde_json::from_str(&remove).expect("parse");
+        assert_eq!(back.cmd, Cmd::PlaylistRemove { playlist: playlist.clone(), track: track_id.clone() });
+
+        let delete = line(&Request { id: 23, cmd: Cmd::PlaylistDelete { playlist: playlist.clone() } });
+        assert_eq!(delete, r#"{"id":23,"cmd":"playlist_delete","playlist":{"provider":"ytmusic","id":"PL1"}}"#);
+        let back: Request = serde_json::from_str(&delete).expect("parse");
+        assert_eq!(back.cmd, Cmd::PlaylistDelete { playlist });
+    }
+
+    #[test]
+    fn playlists_changed_event_is_tagged_and_bare() {
+        let event = line(&Event::PlaylistsChanged);
+        // Событие без полей — объект только с тегом; тег в snake_case.
+        assert_eq!(event, r#"{"event":"playlists_changed"}"#);
+        match serde_json::from_str::<Frame>(&event).expect("parse event") {
+            Frame::Event(Event::PlaylistsChanged) => {}
+            other => panic!("expected a playlists_changed event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn playlist_created_payload_roundtrips() {
+        let playlist = PlaylistId::new(ProviderId::YTMUSIC, "PLnew");
+        let response = line(&Response::Ok { id: 24, ok: Payload::PlaylistCreated { playlist: playlist.clone() } });
+        // Фиксируем форму untagged-контракта: объект с ключом playlist.
+        assert!(response.contains(r#""ok":{"playlist""#), "playlist_created must stay an object: {response}");
+        match serde_json::from_str::<Frame>(&response).expect("parse response") {
+            Frame::Response(Response::Ok { id, ok: Payload::PlaylistCreated { playlist } }) => {
+                assert_eq!(id, 24);
+                assert_eq!(playlist.to_string(), "ytmusic:PLnew");
+            }
+            other => panic!("expected a playlist_created payload, got {other:?}"),
         }
     }
 
