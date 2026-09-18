@@ -15,6 +15,7 @@ mod catalog;
 mod control;
 mod filler;
 mod mpris;
+mod persist;
 mod rpc;
 mod tray;
 mod watcher;
@@ -82,6 +83,10 @@ async fn main() -> anyhow::Result<()> {
 
     let app = App::new(player.clone(), registry, cache, config, paths);
 
+    // Очередь восстанавливаем ДО поднятия подсистем: watcher и MPRIS
+    // должны увидеть уже восстановленное состояние, а не пустую очередь,
+    // которая «вдруг» сменится на заполненную через миллисекунды.
+    persist::restore(&app).await;
 
     let mut tasks = tokio::task::JoinSet::new();
 
@@ -90,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
     // вахтер: он замечает смену трека опросом и рассылает её
     // подписчикам.
     tasks.spawn(watcher::run_state_watcher(app.clone()));
+    tasks.spawn(persist::run(app.clone()));
     if app.config().cache.prefetch_next {
         tasks.spawn(filler::run_cache_filler(app.clone()));
     }
@@ -146,6 +152,12 @@ async fn main() -> anyhow::Result<()> {
     // сокета, иначе следующий запуск увидит мёртвый сокет и откажется
     // стартовать.
     tasks.shutdown().await;
+    // Финальный сброс очереди: задачи уже сняты, их грязный тик не
+    // случится — пишем сами. Ошибка не критична, но молчать о ней нельзя:
+    // человек потеряет очередь и не поймёт почему.
+    if let Err(err) = persist::flush_now(&app).await {
+        tracing::warn!(%err, "финальный сброс очереди не удался");
+    }
     player.mpv().shutdown().await;
     let _ = std::fs::remove_file(app.paths().control_socket());
     Ok(())

@@ -272,6 +272,27 @@ impl Queue {
     pub fn track_at(&self, index: usize) -> Option<&Track> {
         self.tracks.get(index)
     }
+
+    /// Полный срез треков в исходном порядке — для персиста очереди.
+    #[must_use]
+    pub fn tracks(&self) -> &[Track] {
+        &self.tracks
+    }
+
+    /// Восстановление из персиста: треки, позиция, режимы. Порядок обхода
+    /// при shuffle пересобирается через set_shuffle — курсор остаётся на месте.
+    pub fn restore(&mut self, tracks: Vec<Track>, index: Option<usize>, loop_mode: LoopMode, shuffle: bool) {
+        self.tracks = tracks;
+        self.order.clear();
+        self.cursor = None;
+        self.loop_mode = loop_mode;
+        if shuffle {
+            self.set_shuffle(true);
+        }
+        if let Some(i) = index {
+            self.goto(i);
+        }
+    }
 }
 
 impl Default for Queue {
@@ -469,6 +490,44 @@ mod tests {
             second_cycle.push(q.next().expect("трек").id.id.clone());
         }
         assert_eq!(second_cycle, first_cycle, "второй цикл обязан повторить порядок первого");
+    }
+
+    #[test]
+    fn restore_without_shuffle_keeps_index_and_modes() {
+        let tracks = vec![
+            track("ytmusic:a"),
+            track("ytmusic:b"),
+            track("ytmusic:c"),
+            track("ytmusic:d"),
+            track("ytmusic:e"),
+        ];
+        let mut q = Queue::new();
+        q.restore(tracks.clone(), Some(2), LoopMode::Queue, false);
+        assert_eq!(q.current_index(), Some(2));
+        assert_eq!(q.current().expect("текущий трек").id.id, "c");
+        assert_eq!(q.loop_mode(), LoopMode::Queue);
+        assert_eq!(q.len(), 5);
+        assert_eq!(q.tracks(), tracks.as_slice());
+        assert!(!q.shuffle());
+    }
+
+    #[test]
+    fn restore_with_shuffle_keeps_current_track() {
+        // Shuffle детерминировать нельзя, но текущий трек обязан
+        // остаться тем, что был под сохранённым индексом: порядок обхода
+        // пересобирается, а goto маппит индекс в новую перестановку.
+        let tracks = vec![
+            track("ytmusic:a"),
+            track("ytmusic:b"),
+            track("ytmusic:c"),
+            track("ytmusic:d"),
+            track("ytmusic:e"),
+        ];
+        let mut q = Queue::new();
+        q.restore(tracks, Some(2), LoopMode::None, true);
+        assert!(q.shuffle());
+        assert_eq!(q.current_index(), Some(2));
+        assert_eq!(q.current().expect("текущий трек").id.id, "c");
     }
 
     #[test]
