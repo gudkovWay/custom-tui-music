@@ -110,6 +110,13 @@ enum CacheCmd {
     Gc,
 }
 
+/// Метка жизни потока `events`: печатается при простое, парсится
+/// сервисом плагина как неизвестное событие и игнорируется всем
+/// остальным. Отдельная const, а не литерал в `println!`: у форм-строки
+/// с одним строковым литералом clippy справедливо спрашивает, зачем
+/// формат вообще, а литерал с `{}` в `println!` — это сломанный формат.
+const KEEPALIVE_LINE: &str = r#"{"event":"keepalive"}"#;
+
 /// `--kind` команды `search`. Отдельный тип, а не свободная строка:
 /// набор значений задаёт clap, поэтому опечатка падает до похода в
 /// демон, а не превращается в пустой результат.
@@ -306,12 +313,28 @@ fn format_payload(payload: &Payload) -> String {
 
 async fn run_events(paths: &Paths) -> Result<()> {
     let mut rx = client::Client::subscribe(paths).await?;
-    while let Some(event) = rx.recv().await {
+    loop {
         // По одному JSON на строку с flush: потребитель — runStream
         // плагина, без flush бар обновляется рывками по буферу.
-        println!("{}", serde_json::to_string(&event)?);
-        use std::io::Write as _;
-        std::io::stdout().flush()?;
+        //
+        // Keepalive при простое: у noctalia.runStream нет колбэка
+        // смерти потока, и сервис плагина отличает «демон молчит,
+        // потому что на паузе» от «поток умер вместе с демоном» только
+        // по молчанию. На паузе демон событий не шлёт вовсе, поэтому
+        // клиент сам отмечается каждые 2 с простоя.
+        tokio::select! {
+            event = rx.recv() => {
+                let Some(event) = event else { break };
+                println!("{}", serde_json::to_string(&event)?);
+                use std::io::Write as _;
+                std::io::stdout().flush()?;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                println!("{}", KEEPALIVE_LINE);
+                use std::io::Write as _;
+                std::io::stdout().flush()?;
+            }
+        }
     }
     Ok(())
 }
