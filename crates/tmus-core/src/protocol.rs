@@ -15,7 +15,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    LoopMode, PlaybackStatus, PlaylistId, SearchKind, SearchResult, Track, TrackId,
+    EqState, LoopMode, PlaybackStatus, PlaylistId, Rating, SearchKind, SearchResult, Track,
+    TrackId,
 };
 
 /// `id`, после которого соединение переходит в режим потока событий.
@@ -45,7 +46,7 @@ pub struct CatalogSource {
     pub provider: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Cmd {
     /// Перевести соединение в поток событий.
@@ -67,6 +68,19 @@ pub enum Cmd {
     /// Относительный сдвиг в секундах; отрицательный — назад.
     SeekBy { delta: f64 },
     SetVolume { volume: f64 },
+    /// Инкрементальное обновление эквалайзера: `None` — поле не менять.
+    ///
+    /// Почему Option-поля, а не отдельные команды: клиент (TUI-слайдер,
+    /// CLI-однострочник) обычно правит одно поле за раз, и при трёх
+    /// отдельных командах демону пришлось бы блокировать состояние
+    /// трижды либо рисковать разъехавшимся `(enabled, preset, bands)`.
+    /// Один кадр — одна атомарная правка.
+    Equalizer {
+        enabled: Option<bool>,
+        preset: Option<String>,
+        /// Усиления полос в дБ; короче/длиннее 10 значений — ошибка демона.
+        bands: Option<Vec<f64>>,
+    },
     SetLoop { mode: LoopMode },
     SetShuffle { shuffle: bool },
 
@@ -87,6 +101,12 @@ pub enum Cmd {
     Library { provider: Option<String> },
     LibraryTracks { playlist: PlaylistId },
     Liked { provider: Option<String> },
+    /// Поставить оценку треку: провайдер получает лайк/дизлайк, демон
+    /// сохраняет её локально и рассылает [`Event::RatingChanged`].
+    Rate { track: TrackId, rating: Rating },
+    /// Все известные локально оценки. Провайдеры не опрашиваются:
+    /// источник истины — локальное хранилище демона.
+    Ratings,
     GetCatalogSource,
     SetCatalogSource { source: CatalogSource },
 
@@ -113,6 +133,11 @@ pub enum Payload {
     // `kind`, поэтому `Vec<SearchResult>` в untagged-enum иначе
     // ошибочно декодируется как `Vec<Track>`.
     Results(Vec<SearchResult>),
+    // `Ratings` — по той же причине раньше `Tracks`: пара
+    // `(TrackId, Rating)` в JSON — массив из двух элементов, а serde
+    // умеет разбирать структуру и из массива (по порядку полей), так
+    // что пары иначе уходят в `Tracks`.
+    Ratings(Vec<(TrackId, Rating)>),
     Tracks(Vec<Track>),
     Playlists(Vec<crate::model::Playlist>),
     Providers(Vec<ProviderView>),
@@ -151,6 +176,10 @@ pub struct PlayerState {
     pub queue_len: usize,
     /// Играем из офлайн-кэша, а не из сети.
     pub offline: bool,
+    /// Состояние эквалайзера. `default` нужен, чтобы снапшоты и клиенты,
+    /// написанные до появления эквалайзера, продолжали парситься.
+    #[serde(default)]
+    pub equalizer: EqState,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -192,6 +221,9 @@ pub enum Event {
     /// Авторизация провайдера отвалилась — повод показать это в баре,
     /// а не молча ловить «bot check».
     AuthChanged { provider: String, auth: crate::model::AuthStatus },
+    /// Оценка трека изменилась (локально или на стороне провайдера) —
+    /// клиенты перерисовывают значок лайка/дизлайка.
+    RatingChanged { track: TrackId, rating: Rating },
 }
 
 /// Обёртка кадра события: событие всегда приходит отдельным объектом,
@@ -206,6 +238,7 @@ pub enum Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ProviderId;
 
     fn line<T: Serialize>(value: &T) -> String {
         serde_json::to_string(value).expect("serialize")
@@ -293,6 +326,101 @@ mod tests {
             }
             other => panic!("cache payload must not degrade to Catalog, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rate_command_stays_flat() {
+        let track = TrackId::new(ProviderId::YTMUSIC, "abc");
+        let got = line(&Request { id: 4, cmd: Cmd::Rate { track, rating: Rating::Liked } });
+        assert_eq!(
+            got,
+            r#"{"id":4,"cmd":"rate","track":{"provider":"ytmusic","id":"abc"},"rating":"liked"}"#
+        );
+
+        let list = line(&Request { id: 5, cmd: Cmd::Ratings });
+        assert_eq!(list, r#"{"id":5,"cmd":"ratings"}"#);
+    }
+
+    #[test]
+    fn ratings_payload_roundtrips() {
+        // Tuple-vec сериализуется как массив пар — фиксируем форму:
+        let pairs = vec![
+            (TrackId::new(ProviderId::YTMUSIC, "abc"), Rating::Liked),
+            (TrackId::new(ProviderId::SOUNDCLOUD, "xyz"), Rating::Disliked),
+        ];
+        let response = line(&Response::Ok { id: 6, ok: Payload::Ratings(pairs.clone()) });
+        assert!(
+            response.contains(r#""ok":[["#), "tuple-vec must stay a JSON array of pairs: {response}"
+        );
+        match serde_json::from_str::<Frame>(&response).expect("parse response") {
+            Frame::Response(Response::Ok { id, ok: Payload::Ratings(back) }) => {
+                assert_eq!(id, 6);
+                assert_eq!(back, pairs);
+            }
+            other => panic!("expected a ratings payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rating_changed_event_is_tagged() {
+        let track = TrackId::new(ProviderId::YTMUSIC, "abc");
+        let event = line(&Event::RatingChanged { track, rating: Rating::Disliked });
+        let tag = r#""event":"rating_changed""#;
+        assert!(event.contains(tag), "event tag must be rating_changed: {event}");
+        match serde_json::from_str::<Frame>(&event).expect("parse event") {
+            Frame::Event(Event::RatingChanged { track, rating }) => {
+                assert_eq!(rating, Rating::Disliked);
+                assert_eq!(track.to_string(), "ytmusic:abc");
+            }
+            other => panic!("expected a rating event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn equalizer_command_serializes_flat_with_nulls_for_none() {
+        // Фиксируем фактическую форму контракта: serde для Option-полей
+        // без skip_serializing_if пишет null, а не выбрасывает ключ.
+        // Полный кадр — все три поля:
+        let full = line(&Request {
+            id: 11,
+            cmd: Cmd::Equalizer {
+                enabled: Some(true),
+                preset: Some("Rock".into()),
+                bands: Some(vec![5.0, 4.0, 2.0, 0.0, -1.0, -1.0, 0.0, 2.0, 4.0, 5.0]),
+            },
+        });
+        assert_eq!(
+            full,
+            r#"{"id":11,"cmd":"equalizer","enabled":true,"preset":"Rock","bands":[5.0,4.0,2.0,0.0,-1.0,-1.0,0.0,2.0,4.0,5.0]}"#
+        );
+
+        // Частичное обновление: незаданные поля остаются на месте с null.
+        let partial = line(&Request { id: 12, cmd: Cmd::Equalizer { enabled: Some(false), preset: None, bands: None } });
+        assert_eq!(partial, r#"{"id":12,"cmd":"equalizer","enabled":false,"preset":null,"bands":null}"#);
+
+        // Обратный разбор: ключи можно опускать целиком — это None.
+        let parsed: Request = serde_json::from_str(r#"{"id":13,"cmd":"equalizer","bands":[1.0,2.0]}"#).expect("parse");
+        assert_eq!(
+            parsed.cmd,
+            Cmd::Equalizer { enabled: None, preset: None, bands: Some(vec![1.0, 2.0]) }
+        );
+    }
+
+    #[test]
+    fn player_state_parses_with_and_without_equalizer() {
+        let without: PlayerState = serde_json::from_str(
+            r#"{"status":"stopped","volume":70.0,"loop_mode":"none","shuffle":false,"queue_len":0,"offline":false}"#,
+        )
+        .expect("старый снапшот без equalizer обязан парситься");
+        assert_eq!(without.equalizer, EqState::default());
+
+        let with: PlayerState = serde_json::from_str(
+            r#"{"status":"playing","volume":50.0,"loop_mode":"track","shuffle":true,"queue_len":3,"offline":false,"equalizer":{"enabled":true,"preset":"Bass Boost","bands":[6.0,5.0,4.0,2.0,0.0,0.0,0.0,0.0,0.0,0.0]}}"#,
+        )
+        .expect("снапшот с equalizer обязан парситься");
+        assert!(with.equalizer.enabled);
+        assert_eq!(with.equalizer.preset, "Bass Boost");
+        assert_eq!(with.equalizer.bands[0], 6.0);
     }
 
     #[test]

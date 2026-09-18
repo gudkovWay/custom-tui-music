@@ -3146,6 +3146,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tmus-core",
  "tmus-player",
  "tmus-provider",

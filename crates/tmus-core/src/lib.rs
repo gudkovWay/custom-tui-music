@@ -22,7 +22,7 @@ pub mod protocol;
 
 pub use error::{CoreError, Result};
 pub use model::{
-    AuthStatus, LoopMode, PlaybackStatus, Playlist, PlaylistId, ProviderId, SearchKind,
-    SearchResult, StreamSource, Track, TrackId,
+    AuthStatus, EqState, LoopMode, PlaybackStatus, Playlist, PlaylistId, ProviderId, Rating,
+    SearchKind, SearchResult, StreamSource, Track, TrackId, EQ_FREQUENCIES_HZ,
 };
 pub use paths::{APP, MPRIS_BUS_NAME, Paths};

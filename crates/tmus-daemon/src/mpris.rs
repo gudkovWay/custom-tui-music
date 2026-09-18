@@ -534,7 +534,8 @@ pub async fn run(app: Arc<App>) -> anyhow::Result<()> {
                 // Прогресс кэша и авторизация провайдеров в MPRIS не видны.
                 Event::QueueChanged { .. }
                 | Event::CacheProgress { .. }
-                | Event::AuthChanged { .. } => {}
+                | Event::AuthChanged { .. }
+                | Event::RatingChanged { .. } => {}
             }
         }
 
@@ -662,6 +663,7 @@ mod tests {
             position: None,
             duration: None,
             volume: 42.0,
+            equalizer: tmus_core::model::EqState::default(),
             loop_mode: LoopMode::Queue,
             shuffle: true,
             queue_index: Some(3),

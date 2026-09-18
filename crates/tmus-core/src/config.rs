@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
+use crate::model::EqState;
 use crate::paths::Paths;
 
 /// Громкость по умолчанию.
@@ -66,6 +67,13 @@ pub struct Config {
 
     pub browser: BrowserConfig,
 
+    /// Состояние эквалайзера, секция `[equalizer]`.
+    ///
+    /// Живёт в конфиге, а не только в демоне: настройка — часть
+    /// пользовательского окружения и обязана переживать перезапуск,
+    /// как `volume`.
+    pub equalizer: EqState,
+
     /// Секция на провайдера: `[providers.ytmusic]`.
     ///
     /// `BTreeMap`, а не `HashMap`: порядок обхода детерминирован, иначе
@@ -85,6 +93,7 @@ impl Default for Config {
             discord_app_id: None,
             cache: CacheConfig::default(),
             browser: BrowserConfig::default(),
+            equalizer: EqState::default(),
             providers: BTreeMap::new(),
         }
     }
@@ -185,6 +194,17 @@ pub struct ProviderConfig {
     /// Профиль браузера именно для этого провайдера. `None` — общий
     /// [`BrowserConfig::profile`].
     pub browser_profile: Option<String>,
+
+    /// Резолвить трек прямым player-запросом InnerTube, минуя yt-dlp
+    /// (~4 с и ~335 МБ на резолв против долей секунды у player).
+    ///
+    /// По умолчанию выключен: клиент VISIONOS неофициален так же, как
+    /// весь InnerTube, но хуже — yt-dlp подхватывает поломки клиента
+    /// апдейтами, а наш код нет; фолбэк на yt-dlp при любой негативной
+    /// ответке делает выключенное значение консервативно верным.
+    /// Известное ограничение: VISIONOS не отдаёт «made for kids» —
+    /// такие треки штатно уходят в yt-dlp-фолбэк.
+    pub fast_resolve: bool,
 }
 
 impl Default for ProviderConfig {
@@ -192,6 +212,7 @@ impl Default for ProviderConfig {
         Self {
             enabled: true,
             browser_profile: None,
+            fast_resolve: false,
         }
     }
 }
@@ -258,6 +279,55 @@ mod tests {
     }
 
     #[test]
+    fn equalizer_section_round_trips_and_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = paths_under(dir.path());
+        std::fs::create_dir_all(paths.config_dir()).expect("config dir");
+        std::fs::write(
+            paths.config_file(),
+            "[equalizer]\nenabled = true\npreset = \"Rock\"\nbands = [5.0, 4.0, 2.0, 0.0, -1.0, -1.0, 0.0, 2.0, 4.0, 5.0]\n",
+        )
+        .expect("write");
+
+        let config = Config::load(&paths).expect("разбор");
+        let eq = &config.equalizer;
+        assert!(eq.enabled);
+        assert_eq!(eq.preset, "Rock");
+        assert_eq!(eq.bands, [5.0, 4.0, 2.0, 0.0, -1.0, -1.0, 0.0, 2.0, 4.0, 5.0]);
+
+        // Секция отсутствует — дефолт: выключено, Flat, нули.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = Config::load(&paths_under(dir.path())).expect("разбор");
+        assert_eq!(config.equalizer, EqState::default());
+        assert!(!config.equalizer.enabled);
+        assert_eq!(config.equalizer.preset, "Flat");
+    }
+
+    #[test]
+    fn fast_resolve_defaults_to_false_and_reads_true() {
+        // Секция без поля — дефолт: прямой резолв выключен, пока хозяин
+        // не попросил его явно; клиент VISIONOS неофициален.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = paths_under(dir.path());
+        std::fs::create_dir_all(paths.config_dir()).expect("config dir");
+        std::fs::write(
+            paths.config_file(),
+            "[providers.ytmusic]\nbrowser_profile = \"chromium:/tmp/ytm\"\n",
+        )
+        .expect("write");
+        let config = Config::load(&paths).expect("разбор");
+        assert!(!config.provider("ytmusic").fast_resolve);
+
+        std::fs::write(
+            paths.config_file(),
+            "[providers.ytmusic]\nfast_resolve = true\n",
+        )
+        .expect("write");
+        let config = Config::load(&paths).expect("разбор");
+        assert!(config.provider("ytmusic").fast_resolve);
+    }
+
+    #[test]
     fn provider_profile_wins_over_general() {
         let mut config = Config {
             browser: BrowserConfig {
@@ -270,6 +340,7 @@ mod tests {
             ProviderConfig {
                 enabled: true,
                 browser_profile: Some("firefox:/tmp/свой".to_owned()),
+                fast_resolve: false,
             },
         );
 

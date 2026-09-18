@@ -204,6 +204,83 @@ impl StreamSource {
     }
 }
 
+/// Центральные частоты полос эквалайзера, Гц.
+///
+/// ISO-октавный ряд: каждая следующая полоса вдвое больше предыдущей,
+/// поэтому усиление распределяется по спектру равномерно в
+/// логарифмической шкале — так слышит человек. Десять полос покрывают
+/// весь слышимый диапазон от нижнего баса до верхней воздушной
+/// полки; именно эти значения mpv-эквалайзер и клиенты показывают
+/// подписями полос.
+pub const EQ_FREQUENCIES_HZ: [u32; 10] =
+    [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+
+/// Максимальное усиление полосы эквалайзера, дБ. Дальше клиппинг.
+pub const EQ_GAIN_LIMIT_DB: f64 = 15.0;
+
+/// Состояние эквалайзера: включённость, выбранный пресет и усиления
+/// десяти полос в дБ по [`EQ_FREQUENCIES_HZ`].
+///
+/// `preset` — строка, а не enum: пресеты описаны в ядре таблицей
+/// [`eq_presets`], но пользовательский (набранный вручную) набор
+/// полос не обязан совпадать ни с одним из них, и хранить его пришлось
+/// бы как отдельный вариант enum во всех слоях. Строка `"Custom"` —
+/// дешевле. `bands` — массив фиксированной длины: число полос
+/// зашито в протокол и в mpv-фильтр, `Vec` добавил бы аллокацию
+/// без гибкости.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EqState {
+    /// Применять ли эквалайзер к воспроизведению. Выключенный
+    /// эквалайзер сохраняет полосы — пользователь ожидает вернуть
+    /// настройку, а не набирать её заново.
+    pub enabled: bool,
+    /// Имя последнего применённого пресета из [`eq_presets`] либо
+    /// `"Custom"`, если полосы правились вручную.
+    pub preset: String,
+    /// Усиления полос в дБ, диапазон −15..=+15
+    /// ([`EQ_GAIN_LIMIT_DB`]). Индекс соответствует
+    /// [`EQ_FREQUENCIES_HZ`].
+    pub bands: [f64; 10],
+}
+
+impl Default for EqState {
+    fn default() -> Self {
+        Self { enabled: false, preset: "Flat".to_owned(), bands: [0.0; 10] }
+    }
+}
+
+/// Таблица типовых пресетов эквалайзера: `(имя, усиления полос в дБ)`.
+///
+/// Значения — распространённые кривые для десятиполосной схемы; ядро
+/// не обязано знать, какой провайдер или фильтр их применит. Возвращается
+/// срез статических данных: чтение не аллоцирует, а клиенты (TUI-меню,
+/// CLI-подсказка) могут перечислить пресеты без копирования.
+#[must_use]
+pub fn eq_presets() -> &'static [(&'static str, [f64; 10])] {
+    &[
+        ("Flat", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        ("Bass Boost", [6.0, 5.0, 4.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        ("Vocal Boost", [-2.0, -2.0, -1.0, 0.0, 4.0, 5.0, 4.0, 2.0, 0.0, -1.0]),
+        ("Pop", [-1.0, 1.0, 3.0, 4.0, 3.0, 1.0, -1.0, -1.0, 2.0, 2.0]),
+        ("Rock", [5.0, 4.0, 2.0, 0.0, -1.0, -1.0, 0.0, 2.0, 4.0, 5.0]),
+        ("Hip-Hop", [6.0, 5.0, 3.0, 1.0, -1.0, -1.0, 1.0, 2.0, 3.0, 3.0]),
+        ("Jazz", [3.0, 2.0, 1.0, 0.0, -1.0, -1.0, 0.0, 1.0, 2.0, 3.0]),
+        ("Classical", [4.0, 3.0, 2.0, 1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0]),
+        ("Electronic", [5.0, 4.0, 2.0, 0.0, -2.0, -1.0, 0.0, 2.0, 4.0, 5.0]),
+        ("Acoustic", [3.0, 2.0, 1.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 2.0]),
+        ("Deep Bass", [8.0, 6.0, 3.0, 0.0, -2.0, -2.0, -1.0, 0.0, 0.0, 0.0]),
+        ("Bright", [-2.0, -1.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 5.0]),
+        ("Crisp", [-1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 4.0]),
+        ("Live", [-2.0, 0.0, 2.0, 3.0, 3.0, 3.0, 2.0, 1.0, 2.0, 2.0]),
+        ("Headphones", [3.0, 4.0, 3.0, 1.0, -1.0, -1.0, 0.0, 2.0, 3.0, 4.0]),
+        ("Small Speakers", [6.0, 5.0, 4.0, 2.0, 1.0, 0.0, 0.0, 1.0, 2.0, 2.0]),
+        ("Laptop", [5.0, 4.0, 3.0, 1.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0]),
+        ("Car", [4.0, 3.0, 1.0, 0.0, -1.0, -1.0, 0.0, 2.0, 4.0, 5.0]),
+        ("Earbuds", [4.0, 3.0, 2.0, 1.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0]),
+        ("Podcast", [-3.0, -2.0, 0.0, 2.0, 4.0, 5.0, 4.0, 2.0, 0.0, -2.0]),
+    ]
+}
+
 /// Состояние авторизации провайдера.
 ///
 /// `Expired` и `Missing` разделены намеренно: чинят их по-разному, а
@@ -238,6 +315,23 @@ pub enum SearchKind {
     Albums,
     Artists,
     Playlists,
+}
+
+/// Оценка трека: лайк, дизлайк или её отсутствие.
+///
+/// `Default = None` нужен, чтобы история без оценок не писала в SQLite
+/// и в JSON ничего лишнего: отсутствие оценки — нормальное состояние
+/// большинства треков, а не отдельный признак. `Copy` — оценка
+/// передаётся по значению в протоколе и в провайдер, клонировать её
+/// незачем. Имена вариантов в JSON — `snake_case`, как у остальных
+/// перечислений протокола.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Rating {
+    #[default]
+    None,
+    Liked,
+    Disliked,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,6 +424,58 @@ mod tests {
         };
         assert!(!remote.is_expired(deadline - Duration::from_secs(1)));
         assert!(remote.is_expired(deadline));
+    }
+
+    #[test]
+    fn eq_presets_are_well_formed() {
+        let presets = eq_presets();
+        assert!(presets.iter().any(|(name, _)| *name == "Flat"), "Flat обязан существовать");
+
+        for (name, bands) in presets {
+            assert_eq!(bands.len(), EQ_FREQUENCIES_HZ.len(), "{name}: полос не 10");
+            for (i, gain) in bands.iter().enumerate() {
+                assert!(
+                    (-EQ_GAIN_LIMIT_DB..=EQ_GAIN_LIMIT_DB).contains(gain),
+                    "{name}: полоса {} ({}) Гц вне −15..=15 дБ: {gain}",
+                    i,
+                    EQ_FREQUENCIES_HZ[i],
+                );
+            }
+        }
+
+        let (flat, bands) = presets.iter().find(|(name, _)| *name == "Flat").expect("Flat");
+        assert_eq!(*flat, "Flat");
+        assert!(bands.iter().all(|gain| *gain == 0.0), "Flat — нули");
+    }
+
+    #[test]
+    fn eq_state_default_is_flat_and_disabled() {
+        let state = EqState::default();
+        assert!(!state.enabled);
+        assert_eq!(state.preset, "Flat");
+        assert_eq!(state.bands, [0.0; 10]);
+    }
+
+    #[test]
+    fn eq_state_round_trips_through_json() {
+        let state = EqState {
+            enabled: true,
+            preset: "Rock".to_owned(),
+            bands: eq_presets().iter().find(|(n, _)| *n == "Rock").expect("Rock").1,
+        };
+        let json = serde_json::to_string(&state).expect("serialize");
+        let back: EqState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, state);
+    }
+
+    #[test]
+    fn rating_serializes_with_snake_case_names() {
+        // Имена вариантов — часть контракта протокола и схемы SQLite:
+        // клиент и демон должны видеть ровно "none"/"liked"/"disliked".
+        assert_eq!(serde_json::to_string(&Rating::None).expect("serialize"), r#""none""#);
+        assert_eq!(serde_json::to_string(&Rating::Liked).expect("serialize"), r#""liked""#);
+        assert_eq!(serde_json::to_string(&Rating::Disliked).expect("serialize"), r#""disliked""#);
+        assert_eq!(Rating::default(), Rating::None);
     }
 
     #[test]
