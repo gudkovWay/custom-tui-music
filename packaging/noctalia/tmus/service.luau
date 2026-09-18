@@ -28,6 +28,8 @@ local data = {
   source = "all",
   providers = {},
   playlists = {},
+  ratings = {},
+  trackId = "",
   queue = {},
   queueIndex = nil,
   results = {},
@@ -78,6 +80,10 @@ local function publishNow()
     status = data.status,
     position = data.position,
     duration = data.duration,
+    -- Громкость волатильна и меняется чаще всего; в панели её чип в
+    -- Now-Playing обновляется по лёгкому ключу без перечитывания
+    -- тяжёлого снапшота.
+    volume = data.volume,
     at = data.at,
   })
 end
@@ -188,6 +194,14 @@ end
 
 local function applyTrack(track)
   data.title, data.artist, data.album, data.provider, data.artUrl = trackFields(track)
+  -- Строка "provider:id" для биндов f/d панели: текущий трек в
+  -- Now-Playing не лежит ни в одном списке, панели нужен его id.
+  local tid = type(track) == "table" and track.id or nil
+  if type(tid) == "table" then
+    data.trackId = tostring(tid.provider or "") .. ":" .. tostring(tid.id or "")
+  else
+    data.trackId = ""
+  end
   if type(track) == "table" then
     data.duration = seconds(track.duration)
   else
@@ -223,6 +237,11 @@ local function applyState(state)
   data.offline = state.offline == true
   data.queueLen = tonumber(state.queue_len) or 0
   data.queueIndex = tonumber(state.queue_index)
+  -- Эквалайзер опционален: старый демон шлёт состояние без поля —
+  -- тогда панель показывает заглушку, а не nil-ошибку.
+  if type(state.equalizer) == "table" then
+    data.equalizer = state.equalizer
+  end
   applyTrack(state.track)
   if data.duration == 0 then
     data.duration = seconds(state.duration)
@@ -293,6 +312,21 @@ local function pullLibrary()
   end)
 end
 
+local function pullRatings()
+  -- Payload::Ratings — массив пар [{provider,id},"liked"|...]; "none"
+  -- в список не попадает: отсутствие оценки ключа не имеет.
+  call({ "ratings", "--json" }, function(got)
+    local out = {}
+    for _, pair in ipairs(type(got) == "table" and got or {}) do
+      local tid, rating = pair[1], pair[2]
+      if type(tid) == "table" and type(rating) == "string" and rating ~= "none" then
+        out[tostring(tid.provider or "") .. ":" .. tostring(tid.id or "")] = rating
+      end
+    end
+    data.ratings = out
+  end)
+end
+
 local function pullSource()
   call({ "source", "--json" }, function(got)
     local p = type(got) == "table" and got.provider or nil
@@ -355,6 +389,20 @@ local function onEvent(line)
   elseif kind == "track_changed" then
     applyTrack(got.track)
     data.queueIndex = tonumber(got.queue_index)
+  elseif kind == "rating_changed" then
+    -- Одна запись из события: полный Cmd::Ratings ради одного трека
+    -- не запрашиваем. "none" удаляет ключ — отсутствие оценки и
+    -- "none" в панели одно и то же.
+    local tid = type(got.track) == "table" and got.track or {}
+    local key = tostring(tid.provider or "") .. ":" .. tostring(tid.id or "")
+    if type(data.ratings) ~= "table" then
+      data.ratings = {}
+    end
+    if got.rating == "none" or got.rating == nil then
+      data.ratings[key] = nil
+    else
+      data.ratings[key] = tostring(got.rating)
+    end
   elseif kind == "state_changed" then
     applyState(got.state)
   elseif kind == "queue_changed" then
@@ -391,6 +439,7 @@ local function refreshAll()
   pullProviders()
   pullSource()
   pullQueue()
+  pullRatings()
 end
 
 function update()
@@ -442,6 +491,14 @@ function onIpc(event, payload)
     poke({ "vol", tostring(payload) })
   elseif event == "play" and payload then
     poke({ "play", payload })
+  elseif event == "rate" and payload then
+    -- Панель шлёт "like|dislike|none:<provider>:<id>"; argv CLI —
+    -- `tmus rate <provider>:<id> like|dislike|none`. Ответ не нужен:
+    -- демон разошлёт rating_changed, и запись обновится сама.
+    local want, id = tostring(payload):match("^([%a]+):(.+)$")
+    if (want == "like" or want == "dislike" or want == "none") and id and id ~= "" then
+      poke({ "rate", id, want })
+    end
   elseif event == "playlist" and payload then
     poke({ "play-playlist", payload, "--start", "0" })
   elseif event == "playlist-at" and payload then
@@ -495,6 +552,24 @@ function onIpc(event, payload)
     poke({ "loop", tostring(payload) })
   elseif event == "shuffle" and payload then
     poke({ "shuffle", tostring(payload) })
+  elseif event == "eq" and payload then
+    -- Payload панели → флаги `tmus eq`; валидность имени/диапазона
+    -- проверяет CLI и демон, сюда дублировать незачем.
+    local what = tostring(payload)
+    if what == "on" then
+      poke({ "eq", "--on" })
+    elseif what == "off" then
+      poke({ "eq", "--off" })
+    elseif what == "flat" then
+      poke({ "eq", "--preset", "Flat" })
+    elseif string.sub(what, 1, 7) == "preset:" then
+      poke({ "eq", "--preset", string.sub(what, 8) })
+    elseif string.sub(what, 1, 5) == "band:" then
+      local n, g = what:match("^band:(%d+):(.-)$")
+      if n and g ~= "" then
+        poke({ "eq", "--band", n .. ":" .. g })
+      end
+    end
   elseif event == "tui" then
     local template = noctalia.getConfig("terminal")
     if type(template) ~= "string" or template == "" then

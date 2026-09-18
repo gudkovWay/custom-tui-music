@@ -1,6 +1,6 @@
 id = "q/tmus"
 name = "Музыка"
-version = "0.3.0"
+version = "0.4.0"
 plugin_api = 24
 author = "q"
 license = "MIT"
@@ -35,7 +35,7 @@ height = 760
 # латиница приходит одним аккордом в верхнем регистре (сглаживает хост).
 capture_keys = [
   "Left", "Right", "Up", "Down", "Return", "Escape", "Space", "slash",
-  "period", "comma", "minus", "apostrophe", "BackSpace",
+  "period", "comma", "minus", "apostrophe", "BackSpace", "less", "greater",
   "ctrl+j", "ctrl+k", "ctrl+Cyrillic_o", "ctrl+Cyrillic_el",
   "XF86AudioNext", "XF86AudioPrev",
   "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",

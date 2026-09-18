@@ -28,6 +28,7 @@ local VIEWS = {
   { id = "library", title = "Library", glyph = "library" },
   { id = "queue", title = "Queue", glyph = "playlist" },
   { id = "clients", title = "Clients", glyph = "server" },
+  { id = "eq", title = "Equalizer", glyph = "sliders" },
 }
 local VIEW_IDS = {}
 for i, v in ipairs(VIEWS) do
@@ -85,6 +86,23 @@ local inputMode = false
 
 local REPEAT_CYCLE = { none = "track", track = "queue", queue = "none" }
 local REPEAT_LABEL = { none = "Repeat off", track = "Repeat track", queue = "Repeat queue" }
+-- Компактная подпись у кнопки repeat: глифы различают только
+-- none/не-none, режим track и queue смотрятся одинаково — чип снимает
+-- неоднозначность. При none не рисуется, чтобы не шуметь.
+local REPEAT_SHORT = { none = "off", track = "×1", queue = "∞" }
+-- Имена пресетов зашиты зеркально tmus-core::eq_presets(): CLI-флаг
+-- `--preset` принимает только точное имя, а синхронный запрос списка
+-- панель сделать не может. При расхождении демоны отвергнут имя —
+-- чинить вместе с ядром.
+local EQ_PRESET_NAMES = {
+  "Flat", "Bass Boost", "Vocal Boost", "Pop", "Rock", "Hip-Hop", "Jazz",
+  "Classical", "Electronic", "Acoustic", "Deep Bass", "Bright", "Crisp",
+  "Live", "Headphones", "Small Speakers", "Laptop", "Car", "Earbuds",
+  "Podcast",
+}
+-- Подписи полос 1:1 с EQ_FREQUENCIES_HZ (32 Гц … 16 кГц).
+local EQ_FREQ_LABELS = { "32 Hz", "64 Hz", "125 Hz", "250 Hz", "500 Hz", "1 kHz", "2 kHz", "4 kHz", "8 kHz", "16 kHz" }
+local EQ_GAIN_LIMIT = 15
 local SEARCH_KINDS = {
   { id = "all", title = "All" },
   { id = "track", title = "Tracks" },
@@ -114,6 +132,7 @@ local INSERT_ESCAPE_MS = 250
 local searchKind = "all"
 local lastSearchSerial = nil
 local doSearch -- defined below; used by chips and submitSearch
+local rows -- defined below; used by rateSelected (cursor row lookup)
 
 local function poke(event, payload)
   local argv = { "noctalia", "msg", "plugin", SERVICE, "all", event }
@@ -121,6 +140,40 @@ local function poke(event, payload)
     table.insert(argv, payload)
   end
   noctalia.runAsync(argv)
+end
+
+-- Следующий/предыдущий пресет относительно текущего по кругу; сам
+-- демону не поверяем — применит CLI и вернёт состояние.
+local function cyclePreset(step)
+  local eq = snapshot.equalizer
+  if type(eq) ~= "table" then
+    return
+  end
+  local current = tostring(eq.preset or "")
+  local at = 1
+  for i, name in ipairs(EQ_PRESET_NAMES) do
+    if name == current then
+      at = i
+      break
+    end
+  end
+  local idx = ((at - 1 + step) % #EQ_PRESET_NAMES) + 1
+  poke("eq", "preset:" .. EQ_PRESET_NAMES[idx])
+end
+
+-- Мини-бар полосы: 15 позиций от центра (8-я), усиление ±15 дБ → до
+-- 7 шагов в сторону знака. Символы те же, что в прогрессах панели.
+local function eqBar(gain)
+  local center = 8
+  local cells = {}
+  for i = 1, 15 do
+    cells[i] = "·"
+  end
+  local steps = math.floor(math.abs(gain) / EQ_GAIN_LIMIT * 7 + 0.5)
+  for i = 1, steps do
+    cells[center + (gain >= 0 and i or -i)] = "█"
+  end
+  return table.concat(cells)
 end
 
 local function clock(seconds)
@@ -174,6 +227,47 @@ local function idOf(row)
     return tostring(id or "")
   end
   return tostring(id.provider or "") .. ":" .. tostring(id.id or "")
+end
+
+-- Оценка трека из snapshot.ratings (map "provider:id" →
+-- "liked"/"disliked"); nil — оценки нет.
+local function ratingOf(s, idstr)
+  local r = type(s) == "table" and s.ratings or nil
+  if type(r) ~= "table" then
+    return nil
+  end
+  return r[idstr]
+end
+
+-- Дизлайкнутые по умолчанию спрятаны; ctrl+d показывает их снова.
+local showHidden = false
+
+local function hiddenByRating(s, idstr)
+  if showHidden then
+    return false
+  end
+  return ratingOf(s, idstr) == "disliked"
+end
+
+-- Оценка трека под курсором; на home (Now-Playing) — текущего трека.
+-- Повторное f/d на той же оценке снимает её: шлём "none". Панель
+-- сверяется со своим snapshot: актуальность гарантирует событие
+-- rating_changed, обновляющее snapshot.ratings раньше клавиши.
+local function rateSelected(want)
+  local idstr
+  if view == "home" then
+    idstr = tostring(snapshot.trackId or "")
+  else
+    local row = rows()[cursor]
+    if row and row.kind == "track" and row.id then
+      idstr = row.id
+    end
+  end
+  if idstr == nil or idstr == "" then
+    return
+  end
+  local send = (ratingOf(snapshot, idstr) == want) and "none" or want
+  poke("rate", send .. ":" .. idstr)
 end
 
 local function trackTitle(t)
@@ -275,7 +369,8 @@ local function currentTrack(s)
       radius = 2,
     }))
   end
-  table.insert(rows, ui.row({ key = "ct-controls", gap = 8, align = "center" }, {
+  local loopMode = tostring(s.loop or "none")
+  local controls = {
     ui.button({
       key = "prev",
       glyph = "player-skip-back",
@@ -314,14 +409,24 @@ local function currentTrack(s)
     }),
     ui.button({
       key = "repeat",
-      glyph = (s.loop or "none") == "none" and "repeat" or "repeat-once",
+      -- Три различимых состояния: track — «repeat-once», queue — «repeat»,
+      -- оба с подсветкой primary; none — тусклый «repeat».
+      glyph = loopMode == "track" and "repeat-once" or "repeat",
       controlSize = "sm",
-      variant = (s.loop or "none") ~= "none" and "primary" or "ghost",
+      variant = loopMode ~= "none" and "primary" or "ghost",
       onClick = function()
         poke("repeat", REPEAT_CYCLE[tostring(s.loop or "none")] or "none")
       end,
     }),
-  }))
+  }
+  if loopMode ~= "none" then
+    table.insert(controls, ui.label(REPEAT_SHORT[loopMode] or loopMode, {
+      key = "ct-repeat-short",
+      size = 11,
+      color = COLORS.muted,
+    }))
+  end
+  table.insert(rows, ui.row({ key = "ct-controls", gap = 8, align = "center" }, controls))
   return card(rows, { key = "current-card" })
 end
 
@@ -351,6 +456,8 @@ local function trackRow(i, t, opts)
   local o = opts or {}
   local active = i == cursor
   local current = o.current
+  -- Маркер рейтинга перед названием: ♥ лайк, × дизлайк; нет — ничего.
+  local marker = o.rating == "liked" and "♥ " or (o.rating == "disliked" and "× " or "")
   local children = {
     ui.box({ key = "mark" .. i, width = 28 }, {
       lbl(current and "▶" or (o.index or tostring(i)), {
@@ -359,7 +466,7 @@ local function trackRow(i, t, opts)
       }),
     }),
     artNode(o.art, 32),
-    lbl(shorten(o.title, 52), {
+    lbl(shorten(marker .. o.title, 52), {
       key = "title" .. i,
       grow = 1,
       color = current and COLORS.accent or (active and COLORS.text or COLORS.muted),
@@ -393,11 +500,13 @@ local function resultRow(r)
   local artists = type(r.artists) == "table" and table.concat(r.artists, ", ") or ""
   local row = {
     kind = kind,
+    id = idOf(r),
     title = tostring(r.title or r.name or ""),
     subtitle = artists ~= "" and artists or tostring(r.album or ""),
     art = tostring(r.art_path or ""),
   }
   if kind == "track" then
+    row.rating = ratingOf(snapshot, row.id)
     row.event = "play"
     row.payload = idOf(r)
   elseif kind == "playlist" then
@@ -420,16 +529,20 @@ local function searchRows(s)
     if (want == "all" or want == kind) and GROUP_TITLES[kind] then
       local row = resultRow(r)
       row.kind = kind
-      table.insert(out, row)
-      if #out >= 200 then
-        break
+      -- Фильтр дизлайков касается только треков-результатов.
+      local hidden = row.kind == "track" and hiddenByRating(s, row.id or "")
+      if not hidden then
+        table.insert(out, row)
+        if #out >= 200 then
+          break
+        end
       end
     end
   end
   return out
 end
 
-local function rows()
+function rows()
   local s = snapshot
   local out = {}
 
@@ -453,15 +566,20 @@ local function rows()
         if i > 200 then
           break
         end
-        table.insert(out, {
-          kind = "track",
-          title = trackTitle(t),
-          subtitle = tostring(t.album or ""),
-          art = tostring(t.art_path or ""),
-          event = "playlist-at",
-          payload = tostring(i - 1) .. "|" .. playlistId,
-          time = durationLabel(t.duration),
-        })
+        local idstr = idOf(t)
+        if not hiddenByRating(s, idstr) then
+          table.insert(out, {
+            kind = "track",
+            id = idstr,
+            rating = ratingOf(s, idstr),
+            title = trackTitle(t),
+            subtitle = tostring(t.album or ""),
+            art = tostring(t.art_path or ""),
+            event = "playlist-at",
+            payload = tostring(i - 1) .. "|" .. playlistId,
+            time = durationLabel(t.duration),
+          })
+        end
       end
     end
   elseif view == "queue" then
@@ -470,16 +588,21 @@ local function rows()
       if i > 200 then
         break
       end
-      table.insert(out, {
-        kind = "track",
-        title = tostring(t.title or ""),
-        subtitle = type(t.artists) == "table" and table.concat(t.artists, ", ") or "",
-        art = tostring(t.art_path or ""),
-        event = "play",
-        payload = idOf(t),
-        time = durationLabel(t.duration),
-        current = index ~= nil and i == index + 1 or false,
-      })
+      local idstr = idOf(t)
+      if not hiddenByRating(s, idstr) then
+        table.insert(out, {
+          kind = "track",
+          id = idstr,
+          rating = ratingOf(s, idstr),
+          title = tostring(t.title or ""),
+          subtitle = type(t.artists) == "table" and table.concat(t.artists, ", ") or "",
+          art = tostring(t.art_path or ""),
+          event = "play",
+          payload = idstr,
+          time = durationLabel(t.duration),
+          current = index ~= nil and i == index + 1 or false,
+        })
+      end
     end
   elseif view == "search" then
     return searchRows(s)
@@ -501,6 +624,28 @@ local function rows()
         payload = p.id,
         active = tostring(s.source or "all") == p.id,
       })
+    end
+  elseif view == "eq" then
+    -- Старый демон (без equalizer в PlayerState) не даёт строк —
+    -- вью покажет заглушку «eq недоступен».
+    local eq = s.equalizer
+    if type(eq) == "table" then
+      table.insert(out, {
+        kind = "eq-power",
+        title = eq.enabled == true and "On" or "Off",
+        event = "eq",
+        payload = eq.enabled == true and "off" or "on",
+      })
+      table.insert(out, { kind = "eq-preset", title = tostring(eq.preset or "") })
+      local bands = type(eq.bands) == "table" and eq.bands or {}
+      for i, g in ipairs(bands) do
+        table.insert(out, {
+          kind = "eq-band",
+          index = i,
+          gain = tonumber(g) or 0,
+          freq = EQ_FREQ_LABELS[i] or tostring(i),
+        })
+      end
     end
   end
 
@@ -563,6 +708,15 @@ local function activate(row)
     return
   end
   selected = row
+  if row.kind == "eq-preset" then
+    -- Имя берём из живого snapshot: между рендером строки и нажатием
+    -- пресет мог смениться (h/l листает соседний).
+    local eq = snapshot.equalizer
+    if type(eq) == "table" then
+      poke("eq", "preset:" .. tostring(eq.preset or ""))
+    end
+    return
+  end
   if row.open then
     openPlaylist(row)
   elseif row.event then
@@ -720,6 +874,7 @@ local function listChildren(slice, first)
         art = row.art,
         time = row.time,
         current = row.current,
+        rating = row.rating,
         index = row.kind == "client" and "·" or tostring(i),
         event = row.event,
         payload = row.payload,
@@ -745,6 +900,8 @@ local function homeWorkspace(s)
   if (s.loop or "none") ~= "none" then
     table.insert(marks, REPEAT_LABEL[tostring(s.loop)] or tostring(s.loop))
   end
+  -- Громкость приезжает по лёгкому ключу "tmus.now", так что чип живой.
+  table.insert(marks, "vol " .. math.floor(tonumber(s.volume) or 0) .. "%")
   local children = {
     ui.row({ key = "np-hero", gap = 20, align = "center" }, {
       artNode(s.artPath, 200),
@@ -761,7 +918,7 @@ local function homeWorkspace(s)
       }),
     }),
   }
-  local controls = ui.row({ key = "np-controls", gap = 10, align = "center" }, {
+  local npButtons = {
     ui.button({
       key = "prev",
       glyph = "player-skip-back",
@@ -800,14 +957,24 @@ local function homeWorkspace(s)
     }),
     ui.button({
       key = "repeat",
-      glyph = (s.loop or "none") == "none" and "repeat" or "repeat-once",
+      -- Три различимых состояния, как в карточке current: track —
+      -- «repeat-once», queue — «repeat», оба primary; none — ghost.
+      glyph = (tostring(s.loop or "none")) == "track" and "repeat-once" or "repeat",
       controlSize = "md",
-      variant = (s.loop or "none") ~= "none" and "primary" or "ghost",
+      variant = (tostring(s.loop or "none")) ~= "none" and "primary" or "ghost",
       onClick = function()
         poke("repeat", REPEAT_CYCLE[tostring(s.loop or "none")] or "none")
       end,
     }),
-  })
+  }
+  if tostring(s.loop or "none") ~= "none" then
+    table.insert(npButtons, ui.label(REPEAT_SHORT[tostring(s.loop or "none")] or tostring(s.loop), {
+      key = "np-repeat-short",
+      size = 11,
+      color = COLORS.muted,
+    }))
+  end
+  local controls = ui.row({ key = "np-controls", gap = 10, align = "center" }, npButtons)
   if dur > 0 then
     table.insert(children, ui.progress({
       key = "np-progress",
@@ -1010,6 +1177,37 @@ local function clientsContext(s)
   return ui.column({ key = "clients-context", gap = GAP, flexGrow = 3 }, children)
 end
 
+-- Строки вью eq: курсорная — подсветка selected, как в списках.
+local function eqWorkspace(s)
+  local eq = s.equalizer
+  if type(eq) ~= "table" then
+    return card({ lbl("eq недоступен", { key = "eq-na", color = COLORS.muted }) }, { key = "eq-card" })
+  end
+  local lines = {}
+  for i, row in ipairs(rows()) do
+    local text
+    if row.kind == "eq-power" then
+      text = "[" .. row.title .. "]"
+    elseif row.kind == "eq-preset" then
+      text = "[Preset " .. row.title .. "]"
+    else
+      text = string.format("%-7s %+5.1f  %s", row.freq, row.gain, eqBar(row.gain))
+    end
+    local active = cursor == i
+    table.insert(lines, ui.row({
+      key = "eq-line-" .. i,
+      gap = 8,
+      paddingH = 10,
+      paddingV = 4,
+      radius = 6,
+      fill = active and COLORS.selected or COLORS.surface,
+    }, {
+      lbl(text, { key = "eq-text-" .. i, grow = 1, color = active and COLORS.text or COLORS.muted }),
+    }))
+  end
+  return ui.column({ key = "eq-lines", gap = 4 }, lines)
+end
+
 local function chipNode(kind, title)
   local active = searchKind == kind
   return ui.button({
@@ -1144,6 +1342,20 @@ function draw()
       ui.column({ key = "ws-body", gap = GAP, flexGrow = 1 }, body),
     })
     context = queueContext(s)
+  elseif view == "eq" then
+    -- Не через stateNode: linked-демон без поля equalizer дал бы
+    -- «Nothing found»; заглушку eq рисует сам eqWorkspace.
+    local state = stateNode(s, rows())
+    local body = {}
+    if state and not s.linked then
+      table.insert(body, state)
+    else
+      table.insert(body, eqWorkspace(s))
+    end
+    workspace = ui.column({ key = "ws", gap = GAP, flexGrow = 7 }, {
+      lbl("Equalizer", { key = "ws-title", size = 18, color = COLORS.text }),
+      ui.column({ key = "ws-body", gap = GAP, flexGrow = 1 }, body),
+    })
   else
     local state = stateNode(s, items)
     local body = {}
@@ -1178,8 +1390,11 @@ function draw()
   })
 
   local footer = lbl(
-    "ctrl+j/k views · 1–5 views · j/k move · Return open · Space play/pause · h/l back/deep · "
-      .. "/ search (i insert · jj/Esc normal) · n/p track · r repeat · s shuffle · o terminal · g ends",
+    view == "eq"
+      and "j/k move · h/l adjust · Return toggle · 0 flat · 1-6 views"
+      or "ctrl+j/k views · 1–6 views · j/k move · Return open · Space play/pause · h/l back/deep · "
+        .. "/ search (i insert · jj/Esc normal) · n/p track · r repeat · s shuffle · < /> vol · "
+        .. "f/d rate · ctrl+d hidden · o terminal · g ends",
     { key = "footer", size = 11, color = COLORS.muted }
   )
 
@@ -1199,6 +1414,19 @@ end
 -- или выход из него): зажатые h/l в видах, где они ничего не делают,
 -- не должны дёргать draw() каждые ~33 мс (аудит 18.09).
 local function handleViewKeys(key)
+  if view == "eq" then
+    -- h/l в eq не меняют вид: на полосе — ±1 дБ (кламп ±15, панель
+    -- шлёт абсолютное значение), на Preset — соседний пресет, на
+    -- Power — ничего. Перерисовку делает round-trip состояния.
+    local row = rows()[cursor]
+    if row and row.kind == "eq-band" then
+      local gain = math.max(-EQ_GAIN_LIMIT, math.min(EQ_GAIN_LIMIT, row.gain + (key == "l" and 1 or -1)))
+      poke("eq", string.format("band:%d:%g", row.index, gain))
+    elseif row and row.kind == "eq-preset" then
+      cyclePreset(key == "l" and 1 or -1)
+    end
+    return false
+  end
   if key == "l" then
     if view == "library" then
       local row = rows()[cursor]
@@ -1270,6 +1498,12 @@ local function runHeld()
     return false
   elseif action == "prev" then
     poke("prev")
+    return false
+  elseif action == "vol-down" then
+    poke("vol-down")
+    return false
+  elseif action == "vol-up" then
+    poke("vol-up")
     return false
   end
   return false
@@ -1437,7 +1671,7 @@ function onKey(chord, pressed)
   elseif chord == "Return" then
     activate(rows()[cursor])
   elseif chord == "Space" then
-    if view == "playlist" then
+    if view == "playlist" or view == "eq" then
       activate(rows()[cursor])
     else
       poke("toggle")
@@ -1455,6 +1689,15 @@ function onKey(chord, pressed)
   elseif key == "k" then
     move(-1)
     startHold(chord, "up")
+  elseif key == "less" then
+    -- Громкость с автоповтором, как у j/k: service обслуживает
+    -- vol-down/vol-up шагом ±5. Кейсим угловой скобки — «less»/«greater»
+    -- (голые «<»/«>» хост capture_keys не принимает).
+    poke("vol-down")
+    startHold(chord, "vol-down")
+  elseif key == "greater" then
+    poke("vol-up")
+    startHold(chord, "vol-up")
   elseif key == "h" or key == "l" or chord == "Left" or chord == "Right" then
     if chord == "Left" then
       key = "h"
@@ -1463,8 +1706,12 @@ function onKey(chord, pressed)
     end
     handleViewKeys(key)
     startHold(chord, key)
-  elseif chord == "1" or chord == "2" or chord == "3" or chord == "4" or chord == "5" then
+  elseif chord == "1" or chord == "2" or chord == "3" or chord == "4" or chord == "5" or chord == "6" then
     setView(VIEWS[tonumber(chord)].id)
+  elseif key == "0" and view == "eq" then
+    -- Flat не трогает enabled: выключенный эквалайзер с обнулёнными
+    -- полосами — ровно то, что ожидает «0».
+    poke("eq", "flat")
   elseif key == "g" then
     local count = #rows()
     cursor = cursor == 1 and count or 1
@@ -1472,6 +1719,17 @@ function onKey(chord, pressed)
     poke("repeat", REPEAT_CYCLE[tostring(snapshot.loop or "none")] or "none")
   elseif key == "s" then
     poke("shuffle", "toggle")
+  elseif key == "f" then
+    -- Оценка строки курсора (или текущего трека на home); повторное
+    -- нажатие снимает оценку — см. rateSelected.
+    rateSelected("liked")
+  elseif key == "d" then
+    rateSelected("disliked")
+  elseif chord == "ctrl+d" then
+    -- Тогл показа дизлайкнутых: фильтрует rows() локально, демона
+    -- не дёргает. Ловится только здесь (не в insert-режиме поиска),
+    -- как и все остальные бинды.
+    showHidden = not showHidden
   elseif key == "o" then
     poke("tui")
     panel.close()
@@ -1532,6 +1790,7 @@ noctalia.state.watch("tmus.now", function(now)
   snapshot.status = now.status
   snapshot.position = now.position
   snapshot.duration = now.duration
+  snapshot.volume = now.volume
   draw()
 end)
 refresh(noctalia.state.get(KEY))
