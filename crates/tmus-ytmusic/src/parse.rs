@@ -98,11 +98,48 @@ pub(crate) fn playlists(page: &Value) -> Vec<Playlist> {
 /// Тип страницы берётся из ответа, а не угадывается: один и тот же
 /// `musicTwoRowItemRenderer` описывает и плейлист, и альбом, и артиста.
 pub(crate) fn search_results(page: &Value) -> Vec<SearchResult> {
-    let mut results: Vec<SearchResult> = tracks(page)
-        .into_iter()
-        .map(SearchResult::Track)
-        .collect();
+    let mut results: Vec<SearchResult> = Vec::new();
 
+    // Под фильтром поиска сервис отдаёт артистов/плейлисты/альбомы
+    // `musicResponsiveListItemRenderer`-списком, а не каруселью: замер
+    // 18.09.2026 по `youtubei/v1/search` — artists 2 записи, playlists 20,
+    // `musicTwoRowItemRenderer` ноль. Поэтому одного twoRow-разбора ниже
+    // недостаточно. Responsive-элемент описывает и трек тоже, поэтому вид
+    // определяем по pageType browse-эндпоинта и ветвимся один раз до
+    // трекового разбора — иначе запись уходила бы в результат и как Track,
+    // и как Playlist.
+    for item in renderers(page, "musicResponsiveListItemRenderer") {
+        let page_type = responsive_page_type(item);
+        let is_browse = page_type.as_deref().is_some_and(|page| {
+            page.contains("ARTIST") || page.contains("ALBUM") || page.contains("PLAYLIST")
+        });
+        if is_browse {
+            let Some(row) = responsive_row(item) else {
+                continue;
+            };
+            let page_type = page_type.as_deref().unwrap_or_default();
+            if page_type.contains("ARTIST") {
+                if !row.browse_id.is_empty() {
+                    results.push(SearchResult::Artist {
+                        provider: PROVIDER,
+                        id: row.browse_id,
+                        name: row.title,
+                    });
+                }
+            } else if page_type.contains("ALBUM") {
+                if let Some(album) = album_of(row) {
+                    results.push(SearchResult::Playlist(album));
+                }
+            } else if let Some(playlist) = playlist_of(row) {
+                results.push(SearchResult::Playlist(playlist));
+            }
+        } else if let Some(track) = track_from_responsive(item) {
+            results.push(SearchResult::Track(track));
+        }
+    }
+
+    // Нефильтрованный поиск и библиотека продолжают приходить каруселью
+    // `musicTwoRowItemRenderer` — этот разбор сохранён.
     for item in renderers(page, "musicTwoRowItemRenderer") {
         let Some(row) = two_row(item) else {
             continue;
@@ -499,6 +536,50 @@ fn two_row(item: &Value) -> Option<TwoRow> {
     })
 }
 
+/// pageType browse-эндпоинта responsive-записи. Единственный надёжный
+/// признак вида: под фильтром и артист, и плейлист приходят одним и тем же
+/// `musicResponsiveListItemRenderer`, различие только здесь.
+fn responsive_page_type(item: &Value) -> Option<String> {
+    item.pointer(
+        "/navigationEndpoint/browseEndpoint/browseEndpointContextSupportedConfigs\
+         /browseEndpointContextMusicConfig/pageType",
+    )
+    .and_then(Value::as_str)
+    .map(str::to_owned)
+}
+
+/// Responsive-запись (артист/плейлист/альбом) в виде `TwoRow`: имя — в
+/// первой колонке, подпись — во второй, остальное совпадает с twoRow
+/// поэлементно. Переиспользует `playlist_of`/`album_of`, чтобы не плодить
+/// вторую конвенцию сборки модели.
+fn responsive_row(item: &Value) -> Option<TwoRow> {
+    let columns = flex_columns(item);
+    let title = columns.first().map(|column| runs_text(column)).unwrap_or_default();
+    if title.is_empty() {
+        return None;
+    }
+
+    Some(TwoRow {
+        subtitle: columns.get(1).map(|column| runs_text(column)).filter(|text| !text.is_empty()),
+        title,
+        art_url: largest_thumbnail(item),
+        browse_id: item
+            .pointer("/navigationEndpoint/browseEndpoint/browseId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        page_type: responsive_page_type(item),
+        audio_playlist_id: item
+            .pointer(
+                "/thumbnailOverlay/musicItemThumbnailOverlayRenderer/content\
+                 /musicPlayButtonRenderer/playNavigationEndpoint\
+                 /watchPlaylistEndpoint/playlistId",
+            )
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
 fn is_playlist(row: &TwoRow) -> bool {
     match row.page_type.as_deref() {
         Some(page) => page.contains("PLAYLIST"),
@@ -684,5 +765,83 @@ mod tests {
         assert_eq!(playlist_browse_id("LM"), "VLLM");
         assert_eq!(playlist_id_from_browse("VLPLabc123"), Some("PLabc123"));
         assert_eq!(playlist_id_from_browse("MPREb_album"), None);
+    }
+
+    /// Урезанная копия реального responsive-элемента артиста из ответа
+    /// `search` под фильтром: pageType в browse-эндпоинте, имя в первой
+    /// flex-колонке.
+    fn responsive_artist_renderer() -> Value {
+        json!({
+            "musicResponsiveListItemRenderer": {
+                "flexColumns": [
+                    { "musicResponsiveListItemFlexColumnRenderer": { "text": {
+                        "runs": [{ "text": "Aphex Twin" }]
+                    } } },
+                    { "musicResponsiveListItemFlexColumnRenderer": { "text": {
+                        "runs": [{ "text": "Artist" }, { "text": " • " }, { "text": "576M monthly audience" }]
+                    } } }
+                ],
+                "navigationEndpoint": { "browseEndpoint": {
+                    "browseId": "UCWmnkYUzoOiOztmPBhIlZjg",
+                    "browseEndpointContextSupportedConfigs": {
+                        "browseEndpointContextMusicConfig": { "pageType": "MUSIC_PAGE_TYPE_ARTIST" }
+                    }
+                } }
+            }
+        })
+    }
+
+    #[test]
+    fn responsive_list_item_becomes_artist() {
+        // Регресс: под фильтром artists сервис отдаёт responsive-список
+        // (twoRow — ноль), и поиск раньше возвращал пустой результат.
+        let found = search_results(&responsive_artist_renderer());
+
+        assert_eq!(found.len(), 1);
+        match found.into_iter().next().expect("разобран") {
+            SearchResult::Artist { provider, id, name } => {
+                assert_eq!(provider, ProviderId::YTMUSIC);
+                assert_eq!(id, "UCWmnkYUzoOiOztmPBhIlZjg");
+                assert_eq!(name, "Aphex Twin");
+            }
+            other => panic!("ожидался артист, получено: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn responsive_playlist_and_track_are_not_double_counted() {
+        // Плейлист и трек приходят одним и тем же responsive-элементом:
+        // ветвление по pageType обязано отдать каждый ровно один раз.
+        let playlist = json!({
+            "musicResponsiveListItemRenderer": {
+                "flexColumns": [
+                    { "musicResponsiveListItemFlexColumnRenderer": { "text": {
+                        "runs": [{ "text": "Микс" }]
+                    } } },
+                    { "musicResponsiveListItemFlexColumnRenderer": { "text": {
+                        "runs": [{ "text": "Playlist" }, { "text": " • " }, { "text": "42 songs" }]
+                    } } }
+                ],
+                "navigationEndpoint": { "browseEndpoint": {
+                    "browseId": "VLPLoQ9abc123",
+                    "browseEndpointContextSupportedConfigs": {
+                        "browseEndpointContextMusicConfig": { "pageType": "MUSIC_PAGE_TYPE_PLAYLIST" }
+                    }
+                } }
+            }
+        });
+        let page = json!({ "contents": [playlist, song_renderer()] });
+
+        let found = search_results(&page);
+        let playlists = found
+            .iter()
+            .filter(|result| matches!(result, SearchResult::Playlist(_)))
+            .count();
+        let tracks = found
+            .iter()
+            .filter(|result| matches!(result, SearchResult::Track(_)))
+            .count();
+        assert_eq!(playlists, 1, "плейлист ровно один: {found:?}");
+        assert_eq!(tracks, 1, "трек ровно один: {found:?}");
     }
 }
