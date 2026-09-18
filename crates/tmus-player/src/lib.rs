@@ -51,7 +51,14 @@ struct Inner {
     /// забирает номер, и команда с неактуальным номером отменяется.
     /// Без него 8 параллельных `tmus next` = 8 одновременных yt-dlp,
     /// 676 МБ RSS и 52.8 CPU-с за 25 с (~2.1 ядра).
-    play_gen: std::sync::atomic::AtomicU64,
+    ///
+    /// watch, а не атомик с Notify: отмена ждёт ИЗМЕНЕНИЯ номера, а у
+    /// Notify событие без памяти — команда, сдвинувшая номер до
+    /// регистрации официанта, не разбудила бы его, и устаревший yt-dlp
+    /// молча доживал бы свои ~4 с, держа семафор резолвов. Пара
+    /// sender/receiver: у `Sender` нет чтения текущего значения.
+    play_gen: tokio::sync::watch::Sender<u64>,
+    play_gen_rx: tokio::sync::watch::Receiver<u64>,
     /// Сериализатор запусков yt-dlp: один резолв — 0.9 CPU-с и 335 МБ,
     /// поэтому параллелить их бессмысленно, ждущие проверяют gen и выходят.
     resolve_gate: tokio::sync::Semaphore,
@@ -98,6 +105,7 @@ impl Player {
     ) -> Result<Self, PlayerError> {
         let (mpv, events) = Mpv::spawn(mpv_binary, paths, volume).await?;
         mpv.observe().await?;
+        let (play_gen, play_gen_rx) = tokio::sync::watch::channel(0u64);
         let player = Self {
             inner: Arc::new(Inner {
                 registry,
@@ -110,7 +118,8 @@ impl Player {
                 volume: Mutex::new(volume),
                 status: Mutex::new(PlaybackStatus::Stopped),
                 preloaded: Mutex::new(None),
-                play_gen: std::sync::atomic::AtomicU64::new(0),
+                play_gen,
+                play_gen_rx,
                 resolve_gate: tokio::sync::Semaphore::new(1),
                 preload_task: tokio::sync::Mutex::new(None),
                 changed: tokio::sync::Notify::new(),
@@ -124,57 +133,27 @@ impl Player {
     /// Зарезолвить трек и играть его. Существующий `StreamSource`
     /// (из предзагрузки) переиспользуется, если он ещё не истёк.
     pub async fn resolve_and_play(&self, track_id: &TrackId) -> Result<(), PlayerError> {
-        let my_gen = self
-            .inner
-            .play_gen
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
+        let my_gen = self.next_generation();
         // Новая команда отменяет живую предзагрузку: иначе она закончится
         // ещё одним yt-dlp для трека, который уже не будет следующим.
         if let Some(handle) = self.inner.preload_task.lock().await.take() {
             handle.abort();
         }
 
-        let source = {
-            let mut preloaded = self.inner.preloaded.lock().await;
-            match preloaded.as_ref() {
-                Some((id, _)) if id == track_id => {
-                    // Слот расходуется при первом использовании: take, а не
-                    // клон — иначе источник зависал бы до смены трека.
-                    preloaded.take().map(|(_, s)| s)
-                }
-                _ => None,
-            }
-        };
-
-        let source = match source {
+        let source = match self.take_preloaded(track_id).await {
             // Годная предзагрузка — играем сразу, без сети.
-            Some(source) if !source.is_expired(SystemTime::now()) => source,
-            // У googlevideo-ссылок `expire=` около 6 часов: трек, добавленный
-            // в очередь давно, иначе отдал бы 403 при проигрывании.
-            // Один permit: yt-dlp — 0.9 CPU-с и 335 МБ, параллелить некому.
-            _ => {
-                let permit = self
-                    .inner
-                    .resolve_gate
-                    .acquire()
-                    .await
-                    .expect("семафор резолва живёт столько же, сколько плеер");
-                if self.inner.play_gen.load(std::sync::atomic::Ordering::SeqCst) != my_gen {
-                    // Пока ждали очереди, человек ушёл дальше — yt-dlp вообще
-                    // не запускаем, это и есть устранение шторма процессов.
-                    return Ok(());
-                }
-                let source = self.resolve(track_id).await?;
-                drop(permit);
-                source
-            }
+            Some(source) if !source.is_expired(SystemTime::now()) => Some(source),
+            _ => self.resolve_fresh(track_id, my_gen).await?,
+        };
+        let Some(source) = source else {
+            // Вытеснены более новой командой: её трек и будет играть.
+            return Ok(());
         };
 
         // Последняя проверка перед mpv.load: устаревшая команда не должна
         // перебить свежий трек. Status/position/duration тоже выставляем
         // только здесь — раньше они портили бы состояние живой команды.
-        if self.inner.play_gen.load(std::sync::atomic::Ordering::SeqCst) != my_gen {
+        if self.generation() != my_gen {
             return Ok(());
         }
         *self.inner.status.lock().await = PlaybackStatus::Playing;
@@ -212,13 +191,13 @@ impl Player {
         // законным путём при переходе, а текущий трек не её виновник.
         if let Some(next_id) = next {
             let this = self.clone();
-            let base_gen = self.inner.play_gen.load(std::sync::atomic::Ordering::SeqCst);
+            let base_gen = self.generation();
             let handle = tokio::spawn(async move {
                 // Задержка, затем двойной gen-чек: серия скипов отменяет
                 // задачу до запуска yt-dlp; досидевшие до permit — те, кто
                 // ещё актуален на момент взятия семафора.
                 tokio::time::sleep(PRELOAD_DELAY).await;
-                if this.inner.play_gen.load(std::sync::atomic::Ordering::SeqCst) != base_gen {
+                if this.generation() != base_gen {
                     return;
                 }
                 let permit = this
@@ -227,23 +206,144 @@ impl Player {
                     .acquire()
                     .await
                     .expect("семафор резолва живёт столько же, сколько плеер");
-                if this.inner.play_gen.load(std::sync::atomic::Ordering::SeqCst) != base_gen {
+                if this.generation() != base_gen {
                     return;
                 }
                 let result = this.resolve(&next_id).await;
                 drop(permit);
-                // Кладём результат только если команда всё ещё свежая:
-                // иначе перезатрём предзагрузку уже сыгранного трека.
-                if this.inner.play_gen.load(std::sync::atomic::Ordering::SeqCst) == base_gen {
-                    match result {
-                        Ok(source) => *this.inner.preloaded.lock().await = Some((next_id, source)),
-                        Err(e) => tracing::debug!(track = %next_id, error = %e, "предзагрузка следующего трека не удалась"),
-                    }
+                // Результат кладём БЕЗ проверки gen: слот адресован по id
+                // трека, и вытеснившая команда заберёт его сама — второй
+                // проверкой слота в `resolve_fresh`, уже после семафора.
+                // Прежняя проверка выбрасывала готовый источник ровно
+                // тогда, когда он нужнее всего: в момент скипа gen уже
+                // сдвинут, а слот «следующего» — это и есть цель скипа.
+                match result {
+                    Ok(source) => *this.inner.preloaded.lock().await = Some((next_id, source)),
+                    Err(e) => tracing::debug!(track = %next_id, error = %e, "предзагрузка следующего трека не удалась"),
                 }
             });
             *self.inner.preload_task.lock().await = Some(handle);
         }
         Ok(())
+    }
+
+    /// Текущий номер поколения команд воспроизведения.
+    fn generation(&self) -> u64 {
+        *self.inner.play_gen_rx.borrow()
+    }
+
+    /// Взять следующий номер поколения: каждая команда воспроизведения
+    /// начинается с этого, устаревшие по номеру молча уходят.
+    ///
+    /// Инкремент и захват номера — одна операция под замком канала:
+    /// две concurrent-команды обязаны получить РАЗНЫЕ номера, иначе
+    /// старшая из них проходила бы проверки свежести чужим номером.
+    fn next_generation(&self) -> u64 {
+        let mut mine = 0;
+        self.inner.play_gen.send_modify(|g| {
+            *g += 1;
+            mine = *g;
+        });
+        mine
+    }
+
+    /// Подождать, пока поколение `my_gen` не станет устаревшим.
+    ///
+    /// Гонки нет по построению: `changed()` сверяет замеченную отметку
+    /// с текущим значением канала, а не полагается на момент
+    /// регистрации официанта.
+    async fn superseded(&self, my_gen: u64) {
+        let mut rx = self.inner.play_gen.subscribe();
+        if *rx.borrow() != my_gen {
+            return;
+        }
+        let _ = rx.changed().await;
+    }
+
+    /// Забрать слот предзагрузки, если он про этот трек.
+    ///
+    /// Слот расходуется при первом использовании: take, а не клон —
+    /// иначе источник зависал бы до смены трека.
+    async fn take_preloaded(
+        &self,
+        track_id: &TrackId,
+    ) -> Option<tmus_core::model::StreamSource> {
+        let mut preloaded = self.inner.preloaded.lock().await;
+        match preloaded.as_ref() {
+            Some((id, _)) if id == track_id => preloaded.take().map(|(_, s)| s),
+            _ => None,
+        }
+    }
+
+    /// Свежий источник: очередь на семафор резолвов, затем yt-dlp.
+    ///
+    /// `Ok(None)` — команду вытеснила более новая: вызывающий тихо
+    /// уходит, не трогая mpv и состояние.
+    ///
+    /// Оба ожидания отменяются вытеснением, а не дожидаются конца:
+    /// дроп будущего резолва убивает yt-dlp (`kill_on_drop`), и семафор
+    /// освобождается сразу. До этой правки брошенный резолв доживал
+    /// свои ~4 с, держа семафор, — скип вставал в очередь позади него,
+    /// и два быстрых нажатия звучали как «сначала грузится первый,
+    /// потом второй»: цепочка ~8 с вместо ~4 с от последнего нажатия.
+    async fn resolve_fresh(
+        &self,
+        track_id: &TrackId,
+        my_gen: u64,
+    ) -> Result<Option<tmus_core::model::StreamSource>, PlayerError> {
+        let _permit = tokio::select! {
+            biased;
+            _ = self.superseded(my_gen) => return Ok(None),
+            permit = self.inner.resolve_gate.acquire() => {
+                permit.expect("семафор резолва живёт столько же, сколько плеер")
+            }
+        };
+        if self.generation() != my_gen {
+            // Пока ждали очереди, человек ушёл дальше — yt-dlp вообще
+            // не запускаем, это и есть устранение шторма процессов.
+            return Ok(None);
+        }
+        // Предзагрузка могла закончиться, пока мы ждали семафор: её
+        // результат лежит в слоте и адресован этому же треку — берём
+        // без второго yt-dlp.
+        if let Some(source) = self.take_preloaded(track_id).await {
+            if !source.is_expired(SystemTime::now()) {
+                return Ok(Some(source));
+            }
+        }
+        // У googlevideo-ссылок `expire=` около 6 часов: трек, добавленный
+        // в очередь давно, иначе отдал бы 403 при проигрывании.
+        // Один permit: yt-dlp — 0.9 CPU-с и 335 МБ, параллелить некому.
+        let source = match tokio::select! {
+            biased;
+            _ = self.superseded(my_gen) => return Ok(None),
+            source = self.resolve(track_id) => source,
+        } {
+            Ok(source) => source,
+            Err(e) => {
+                self.transition_failed().await;
+                return Err(e);
+            }
+        };
+        Ok(Some(source))
+    }
+
+    /// Свести окно перехода при неудачном резолве.
+    ///
+    /// `advancing` взводит конец трека, а снимает — успешная загрузка.
+    /// Если победившая команда (ручной скип, вытеснивший естественный
+    /// переход) резолвится с ошибкой, флаг остался бы взведённым:
+    /// mpv-idle дальше игнорируется, и бар залипает в «играет» над
+    /// тишиной. Здесь флаг гасится, а по-настоящему пустой mpv честно
+    /// отмечается остановкой.
+    async fn transition_failed(&self) {
+        self.inner
+            .advancing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        if self.inner.mpv.idle_active().await.unwrap_or(true) {
+            *self.inner.status.lock().await = PlaybackStatus::Stopped;
+        }
+        self.inner.changed.notify_one();
     }
 
     /// Текущее состояние для control-протокола.
