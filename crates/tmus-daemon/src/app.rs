@@ -374,15 +374,15 @@ impl App {
 
     /// Шаг по очереди. Отдельно от `Cmd::Next`, потому что то же нужно
     /// по концу трека — и логика перехода обязана быть одна.
+    ///
+    /// Скип серие-поглощающий: `Player::skip` двигает очередь сразу и
+    /// запускает трек после короткого покоя, поэтому `Next`/`Prev`
+    /// отвечают `Ack` мгновенно, а не после резолва (~4 с на
+    /// незакэшированном треке — закрывая давний пункт TODO). Ошибки
+    /// запуска видны событием `StateChanged` и журналом демона.
     async fn step(&self, forward: bool) -> anyhow::Result<()> {
-        let next = self
-            .player
-            .with_queue(|q| {
-                if forward { q.next().cloned() } else { q.prev().cloned() }
-            })
-            .await;
-        match next {
-            Some(track) => self.play_track(&track.id).await,
+        match self.player.skip(forward).await {
+            Some(_) => Ok(()),
             None => {
                 self.player.mpv().stop().await?;
                 self.emit_state().await;

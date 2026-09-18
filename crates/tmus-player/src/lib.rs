@@ -44,8 +44,15 @@ struct Inner {
     /// на ней, поэтому держим свою копию для `state()`.
     volume: Mutex<f64>,
     status: Mutex<PlaybackStatus>,
+    /// Трек, КОТОРЫЙ ЗАПРОШЕН, но ещё не загружен в mpv. `current`
+    /// обновляется только после `mpv.load`, и без этого поля бар
+    /// показывал бы старый трек все секунды резолва — человек нажал
+    /// Space, а виджет делает вид, что ничего не было. `state()`
+    /// отдаёт pending приоритетнее current; позиция/длительность на
+    /// время переключения скрываются (они от старого файла).
+    pending: Mutex<Option<TrackId>>,
     /// Зарезолвленный следующий трек. Держится до момента его
-    /// проигрывания и никогда не переживает смену текущего трека.
+    /// проигрывания и никогда не переживает смены текущего трека.
     preloaded: Mutex<Option<(TrackId, tmus_core::model::StreamSource)>>,
     /// Счётчик команд воспроизведения: каждая новая `resolve_and_play`
     /// забирает номер, и команда с неактуальным номером отменяется.
@@ -62,9 +69,13 @@ struct Inner {
     /// Сериализатор запусков yt-dlp: один резолв — 0.9 CPU-с и 335 МБ,
     /// поэтому параллелить их бессмысленно, ждущие проверяют gen и выходят.
     resolve_gate: tokio::sync::Semaphore,
-    /// Хендл живой предзагрузки: при новой команде её надо прервать
-    /// до того, как она запустит ещё один yt-dlp.
-    preload_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Хендл живой предзагрузки с её целью: прерывать надо только чужую.
+    /// Своя (тот же трек) доживёт и положит результат в слот — убив её,
+    /// settle скипа запускал бы второй yt-dlp на тот же трек.
+    preload_task: tokio::sync::Mutex<Option<(TrackId, tokio::task::JoinHandle<()>)>>,
+    /// Отложенный запуск после серии скипов: очередь двигается сразу,
+    /// а yt-dlp/loadfile — только после SETTLE покоя (см. `skip`).
+    skip_settle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Пинг «состояние изменилось по событию mpv». Демон обязан узнать
     /// о смене трека и о приехавшей длительности сразу, а не следующим
     /// тиком опроса: замерено, бар до секунды рисовал `--:--` и
@@ -81,6 +92,13 @@ struct Inner {
     /// вспышкой «■ остановлено» в баре.
     advancing: std::sync::atomic::AtomicBool,
 }
+
+/// Пауза покоя после последнего скипа перед запуском трека. Автоповтор
+/// клавиатуры шлёт нажатия каждые ~33–40 мс: за это время серия должна
+/// успеть перевзвести отложенный запуск. Одиночный скип платит те же
+/// 120 мс — незаметно на фоне сетевого резолва; естественный конец
+/// трека (`on_track_end`) задержки не платит вовсе.
+const SKIP_SETTLE: std::time::Duration = std::time::Duration::from_millis(120);
 
 /// Задержка перед предзагрузкой следующего трека: серия быстрых скипов
 /// должна успевать отменить задачу ДО того, как она потянет yt-dlp.
@@ -117,11 +135,13 @@ impl Player {
                 paused: Mutex::new(false),
                 volume: Mutex::new(volume),
                 status: Mutex::new(PlaybackStatus::Stopped),
+                pending: Mutex::new(None),
                 preloaded: Mutex::new(None),
                 play_gen,
                 play_gen_rx,
                 resolve_gate: tokio::sync::Semaphore::new(1),
                 preload_task: tokio::sync::Mutex::new(None),
+                skip_settle: tokio::sync::Mutex::new(None),
                 changed: tokio::sync::Notify::new(),
                 advancing: std::sync::atomic::AtomicBool::new(false),
             }),
@@ -134,11 +154,24 @@ impl Player {
     /// (из предзагрузки) переиспользуется, если он ещё не истёк.
     pub async fn resolve_and_play(&self, track_id: &TrackId) -> Result<(), PlayerError> {
         let my_gen = self.next_generation();
-        // Новая команда отменяет живую предзагрузку: иначе она закончится
-        // ещё одним yt-dlp для трека, который уже не будет следующим.
-        if let Some(handle) = self.inner.preload_task.lock().await.take() {
+        // Новая команда гасит отложенный запуск серии скипов: явный
+        // выбор важнее накопленных нажатий.
+        if let Some(handle) = self.inner.skip_settle.lock().await.take() {
             handle.abort();
         }
+        // Чужая предзагрузка отменяется (её трек уже не следующий), своя
+        // (этот же трек) доживает и положит результат в слот — иначе
+        // запуск убивал бы собственный резолв и стартовал второй.
+        if let Some((preloading, handle)) = self.inner.preload_task.lock().await.take() {
+            if &preloading != track_id {
+                handle.abort();
+            }
+        }
+        // Трек объявляется ДО резолва: бар, TUI и MPRIS обязаны
+        // переключить название немедленно, а не после секунд резолва —
+        // иначе человек не видит, что нажатие вообще принято.
+        *self.inner.pending.lock().await = Some(track_id.clone());
+        self.inner.changed.notify_one();
 
         let source = match self.take_preloaded(track_id).await {
             // Годная предзагрузка — играем сразу, без сети.
@@ -178,6 +211,15 @@ impl Player {
             track_id: track_id.clone(),
             source,
         });
+        // Запрос исполнен: показываемый трек снова считается текущим.
+        // Гвардия обязательна — между резолвом и загрузкой могла прийти
+        // более новая команда и положить в pending свой трек.
+        {
+            let mut pending = self.inner.pending.lock().await;
+            if pending.as_ref() == Some(track_id) {
+                *pending = None;
+            }
+        }
         // Трек поехал: переход закончен, а состояние изменилось —
         // будим вахтёра демона, чтобы бар узнал о смене трека сразу,
         // а не следующим тиком опроса.
@@ -191,6 +233,7 @@ impl Player {
         // законным путём при переходе, а текущий трек не её виновник.
         if let Some(next_id) = next {
             let this = self.clone();
+            let preload_target = next_id.clone();
             let base_gen = self.generation();
             let handle = tokio::spawn(async move {
                 // Задержка, затем двойной gen-чек: серия скипов отменяет
@@ -209,7 +252,7 @@ impl Player {
                 if this.generation() != base_gen {
                     return;
                 }
-                let result = this.resolve(&next_id).await;
+                let result = this.resolve(&preload_target).await;
                 drop(permit);
                 // Результат кладём БЕЗ проверки gen: слот адресован по id
                 // трека, и вытеснившая команда заберёт его сама — второй
@@ -218,11 +261,11 @@ impl Player {
                 // тогда, когда он нужнее всего: в момент скипа gen уже
                 // сдвинут, а слот «следующего» — это и есть цель скипа.
                 match result {
-                    Ok(source) => *this.inner.preloaded.lock().await = Some((next_id, source)),
-                    Err(e) => tracing::debug!(track = %next_id, error = %e, "предзагрузка следующего трека не удалась"),
+                    Ok(source) => *this.inner.preloaded.lock().await = Some((preload_target, source)),
+                    Err(e) => tracing::debug!(track = %preload_target, error = %e, "предзагрузка следующего трека не удалась"),
                 }
             });
-            *self.inner.preload_task.lock().await = Some(handle);
+            *self.inner.preload_task.lock().await = Some((next_id, handle));
         }
         Ok(())
     }
@@ -321,7 +364,7 @@ impl Player {
         } {
             Ok(source) => source,
             Err(e) => {
-                self.transition_failed().await;
+                self.transition_failed(track_id).await;
                 return Err(e);
             }
         };
@@ -334,12 +377,19 @@ impl Player {
     /// Если победившая команда (ручной скип, вытеснивший естественный
     /// переход) резолвится с ошибкой, флаг остался бы взведённым:
     /// mpv-idle дальше игнорируется, и бар залипает в «играет» над
-    /// тишиной. Здесь флаг гасится, а по-настоящему пустой mpv честно
-    /// отмечается остановкой.
-    async fn transition_failed(&self) {
+    /// тишиной. Здесь флаг гасится, объявленный трек снимается (если
+    /// это всё ещё наш), а по-настоящему пустой mpv честно отмечается
+    /// остановкой.
+    async fn transition_failed(&self, track_id: &TrackId) {
         self.inner
             .advancing
             .store(false, std::sync::atomic::Ordering::SeqCst);
+        {
+            let mut pending = self.inner.pending.lock().await;
+            if pending.as_ref() == Some(track_id) {
+                *pending = None;
+            }
+        }
         if self.inner.mpv.idle_active().await.unwrap_or(true) {
             *self.inner.status.lock().await = PlaybackStatus::Stopped;
         }
@@ -347,22 +397,34 @@ impl Player {
     }
 
     /// Текущее состояние для control-протокола.
+    ///
+    /// Показываемый трек: заявленный (`pending`) важнее играемого
+    /// (`current`) — секунды резолва бар обязан показывать ВЫБРАННЫЙ
+    /// трек, а не прежний. Позиция и длительность на время
+    /// переключения скрываются: они относятся к старому файлу, и
+    /// «новое название со старым таймкодом» читалось бы как баг.
     pub async fn state(&self) -> PlayerState {
         let queue = self.inner.queue.lock().await;
         let current = self.inner.current.lock().await;
-        let index = current
-            .as_ref()
-            .and_then(|c| queue.find_index(&c.track_id));
+        let pending = self.inner.pending.lock().await.clone();
+        let shown = pending.as_ref().or(current.as_ref().map(|c| &c.track_id));
+        let index = shown.and_then(|id| queue.find_index(id));
         let track = index.and_then(|i| queue.track_at(i)).cloned();
         let offline = current
             .as_ref()
             .map(|c| c.source.is_local())
             .unwrap_or(false);
+        let switching = pending.is_some() && pending != current.as_ref().map(|c| c.track_id.clone());
+        let (position, duration) = if switching {
+            (None, None)
+        } else {
+            (*self.inner.position.lock().await, *self.inner.duration.lock().await)
+        };
         PlayerState {
             status: *self.inner.status.lock().await,
             track,
-            position: *self.inner.position.lock().await,
-            duration: *self.inner.duration.lock().await,
+            position,
+            duration,
             volume: *self.inner.volume.lock().await,
             loop_mode: queue.loop_mode(),
             shuffle: queue.shuffle(),
@@ -370,6 +432,41 @@ impl Player {
             queue_len: queue.len(),
             offline,
         }
+    }
+
+    /// Шаг по очереди с поглощением серии: очередь двигается сразу,
+    /// запуск трека — после SETTLE покоя.
+    ///
+    /// Автоповтор зажатой медиа-клавиши шлёт скипы каждые ~33–40 мс, и
+    /// без settle каждый скип по закэшированному треку успевал полностью
+    /// загрузиться и заиграть: серия нажатий прокручивалась аудио, а
+    /// скип по незакэшированному — ставить хвост команды в очередь к
+    /// семафору. Отложенный запуск перевзводится каждым скипом серии;
+    /// явная команда (`resolve_and_play`) гасит его — выбор человека
+    /// важнее накопленных нажатий.
+    ///
+    /// `None` — очередь кончилась: терминальное состояние, вызывающий
+    /// останавливает mpv без задержки.
+    pub async fn skip(&self, forward: bool) -> Option<TrackId> {
+        let id = {
+            let mut queue = self.inner.queue.lock().await;
+            if forward { queue.next().cloned() } else { queue.prev().cloned() }
+        }
+        .map(|t| t.id)?;
+
+        if let Some(handle) = self.inner.skip_settle.lock().await.take() {
+            handle.abort();
+        }
+        let this = self.clone();
+        let target = id.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(SKIP_SETTLE).await;
+            if let Err(e) = this.resolve_and_play(&target).await {
+                tracing::warn!(track = %target, error = %e, "скип не удался");
+            }
+        });
+        *self.inner.skip_settle.lock().await = Some(handle);
+        Some(id)
     }
 
     /// Громкость: обновить свою копию и mpv.
