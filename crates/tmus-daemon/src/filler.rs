@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use tmus_core::model::TrackId;
@@ -37,9 +37,19 @@ const PREFETCH_DEPTH: usize = 3;
 pub async fn run_cache_filler(app: Arc<App>) {
     let mut ticker = tokio::time::interval(Duration::from_secs(5));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ticks: u64 = 0;
     loop {
         ticker.tick().await;
+        ticks += 1;
 
+        // Автозачекпойнт WAL срабатывает редко, и файл растёт без нужды;
+        // раз в минуту усекаем его принудительно. Ошибка не должна
+        // ломать цикл докачки.
+        if ticks % 12 == 0 {
+            if let Err(err) = app.with_cache(|c| c.checkpoint_wal()) {
+                tracing::warn!(%err, "WAL-чекпойнт не удался");
+            }
+        }
 
         let wanted = {
             let state = app.player.state().await;
@@ -94,8 +104,62 @@ fn should_emit(last: Instant, now: Instant, done: bool) -> bool {
     done || now.duration_since(last) >= PROGRESS_INTERVAL
 }
 
+/// Актуален ли трек для докачки: текущий или в окне префетча.
+fn still_wanted(id: &TrackId, current: Option<&TrackId>, ahead: &[TrackId]) -> bool {
+    current == Some(id) || ahead.iter().any(|a| a == id)
+}
 
+/// Снимок окна докачки: текущий трек и хвост очереди. Один хелпер для
+/// всех проверок актуальности — филлер и прогрев обязаны сверяться с
+/// одним и тем же окном (глубина = [`PREFETCH_DEPTH`]).
+async fn relevance_snapshot(app: &Arc<App>) -> (Option<TrackId>, Vec<TrackId>) {
+    let state = app.player.state().await;
+    let current = state.track.map(|t| t.id);
+    let ahead = app
+        .player
+        .with_queue(|q| q.peek_ahead(PREFETCH_DEPTH).into_iter().map(|t| t.id).collect::<Vec<_>>())
+        .await;
+    (current, ahead)
+}
 
+#[cfg(test)]
+mod relevance_tests {
+    use tmus_core::model::{ProviderId, TrackId};
+
+    use super::still_wanted;
+
+    fn id(s: &str) -> TrackId {
+        TrackId::new(ProviderId::YTMUSIC, s)
+    }
+
+    #[test]
+    fn current_track_is_wanted() {
+        let cur = id("cur");
+        assert!(still_wanted(&cur, Some(&cur), &[]));
+    }
+
+    #[test]
+    fn track_two_ahead_is_wanted() {
+        // Позиция +2 в окне префетча: именно такие треки раньше отменялись
+        // сверкой только с текущим и следующим.
+        let ahead = vec![id("next"), id("next2"), id("next3")];
+        let target = id("next2");
+        assert!(still_wanted(&target, Some(&id("cur")), &ahead));
+    }
+
+    #[test]
+    fn unrelated_track_is_not_wanted() {
+        let ahead = vec![id("next"), id("next2")];
+        let stranger = id("stranger");
+        assert!(!still_wanted(&stranger, Some(&id("cur")), &ahead));
+    }
+
+    #[test]
+    fn empty_player_is_not_wanted() {
+        let target = id("cur");
+        assert!(!still_wanted(&target, None, &[]));
+    }
+}
 
 /// Скачать трек в офлайн-кэш через тот же резолв, что и воспроизведение.
 ///
@@ -141,19 +205,17 @@ async fn fetch_into_cache(app: &Arc<App>, id: &TrackId) -> anyhow::Result<()> {
         // Человек ушёл с трека — докачивать до конца бессмысленно: это лишние
         // трафик, диск и CPU на события. Проверяем актуальность не чаще раза
         // в секунду, чтобы не дёргать state()/with_queue на каждом chunk'е.
+        // Глубина сверки совпадает с глубиной префетча: сверка только с
+        // текущим и следующим отменяла треки на +2/+3 сразу после первого
+        // RELEVANCE_INTERVAL, а рестарт тика качал их заново — по yt-dlp
+        // (~0.9 CPU-с, пик 335 МБ) и трафику на каждый круг.
         if now.duration_since(last_relevance) >= RELEVANCE_INTERVAL {
             last_relevance = now;
-            let still_wanted = {
-                let state = app.player.state().await;
-                let current = state.track.as_ref().map(|t| &t.id) == Some(id);
-                let next = app
-                    .player
-                    .with_queue(|q| q.peek_next().map(|t| t.id.clone()))
-                    .await
-                    .as_ref() == Some(id);
-                current || next
+            let wanted = {
+                let (current, ahead) = relevance_snapshot(app).await;
+                still_wanted(id, current.as_ref(), &ahead)
             };
-            if !still_wanted {
+            if !wanted {
                 drop(file);
                 if let Err(err) = tokio::fs::remove_file(&partial).await {
                     tracing::debug!(%err, "не удалось удалить .part отменённой докачки");
@@ -186,10 +248,18 @@ async fn fetch_into_cache(app: &Arc<App>, id: &TrackId) -> anyhow::Result<()> {
 /// докачка очереди. Зависший chunk хуже ошибки: 120 с — на трек целиком,
 /// а не на один chunk; connect_timeout рано отсеивает мёртвые сети. В
 /// innertube.rs оба таймаута уже стоят по той же причине.
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
+        .build()
+        // Из-за одних таймаутов билдер не падает; паника здесь сигнализирует
+        // о сломанном TLS-бэкенде, а не о состоянии сети.
+        .expect("reqwest client")
+});
 
 async fn reqwest_get(url: &str, user_agent: Option<&str>) -> anyhow::Result<reqwest::Response> {
-    let client = reqwest::Client::builder().build()?;
-    let mut request = client.get(url);
+    let mut request = HTTP_CLIENT.get(url);
     if let Some(ua) = user_agent {
         request = request.header(reqwest::header::USER_AGENT, ua);
     }

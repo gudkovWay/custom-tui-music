@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS audio (
     PRIMARY KEY (provider, id)
 );
 
+
 -- gc ходит именно так: незакреплённые, самые старые первыми.
 CREATE INDEX IF NOT EXISTS audio_lru ON audio (pinned, accessed_at);
 ";
@@ -167,6 +168,10 @@ impl Cache {
         // учёт файлов, восстановимое повторным запросом/сканом, поэтому
         // fsync на каждый скип трека не оправдан.
         conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(|source| CoreError::Database { path: db.clone(), source })?;
+        // Автозачекпойнт каждые 256 страниц (~1 МиБ): без него WAL растёт
+        // до ~4.4 МиБ при базе 700 КиБ и в покое не усекается.
+        conn.pragma_update(None, "wal_autocheckpoint", 256)
             .map_err(|source| CoreError::Database { path: db.clone(), source })?;
         // В базу ходят фоновый филлер и путь воспроизведения; без
         // ожидания конкуренция вылезает человеку ошибкой SQLITE_BUSY
@@ -286,6 +291,7 @@ impl Cache {
                     ])
                     .map_err(|e| self.db_error(e))?;
             }
+
         }
         tx.commit().map_err(|e| self.db_error(e))?;
         Ok(())
@@ -309,6 +315,7 @@ impl Cache {
             .map_err(|e| self.db_error(e))?;
         collect(rows, |e| self.db_error(e))
     }
+
 
     /// Куда класть скачанный файл.
     ///
@@ -568,6 +575,15 @@ impl Cache {
             .map_err(|e| self.db_error(e))
     }
 
+    /// Принудительно усечь WAL: автозачекпойнт срабатывает редко,
+    /// а пустой демон не должен держать файл вчетверо больше базы.
+    pub fn checkpoint_wal(&self) -> Result<()> {
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .map_err(|e| self.db_error(e))?;
+        Ok(())
+    }
+
     fn db_error(&self, source: rusqlite::Error) -> CoreError {
         CoreError::Database {
             path: self.paths.database(),
@@ -792,6 +808,7 @@ mod tests {
             .expect("put");
         assert_eq!(cache.playlist_tracks(&playlist).expect("get"), shorter);
     }
+
 
     #[test]
     fn playlists_can_be_filtered_by_provider() {
