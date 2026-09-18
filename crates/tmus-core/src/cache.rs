@@ -81,6 +81,13 @@ CREATE TABLE IF NOT EXISTS audio (
     PRIMARY KEY (provider, id)
 );
 
+-- Метка свежести состава плейлиста: читать из кэша, пока не протухла.
+CREATE TABLE IF NOT EXISTS playlist_sync (
+    provider    TEXT    NOT NULL,
+    playlist    TEXT    NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (provider, playlist)
+);
 
 -- gc ходит именно так: незакреплённые, самые старые первыми.
 CREATE INDEX IF NOT EXISTS audio_lru ON audio (pinned, accessed_at);
@@ -292,6 +299,17 @@ impl Cache {
                     .map_err(|e| self.db_error(e))?;
             }
 
+            // Метка свежести состава: без неё кэш состава никогда не
+            // читается на счастливом пути, и каждый заход в плейлист
+            // идёт в сеть.
+            tx.execute(
+                "INSERT INTO playlist_sync (provider, playlist, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (provider, playlist) DO UPDATE SET
+                     updated_at = excluded.updated_at",
+                params![playlist.provider.as_str(), playlist.id.as_str(), updated_at],
+            )
+            .map_err(|e| self.db_error(e))?;
         }
         tx.commit().map_err(|e| self.db_error(e))?;
         Ok(())
@@ -316,6 +334,29 @@ impl Cache {
         collect(rows, |e| self.db_error(e))
     }
 
+    /// Состав плейлиста, если метка свежести моложе max_age. None —
+    /// протухло или плейлист никогда не синкался: тогда вызывающий идёт
+    /// в сеть.
+    pub fn playlist_tracks_if_fresh(
+        &self,
+        id: &PlaylistId,
+        max_age_secs: i64,
+    ) -> Result<Option<Vec<Track>>> {
+        let fresh: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT updated_at FROM playlist_sync WHERE provider = ?1 AND playlist = ?2",
+                params![id.provider.as_str(), id.id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| self.db_error(e))?;
+        let Some(updated_at) = fresh else { return Ok(None) };
+        if now_secs() - updated_at >= max_age_secs {
+            return Ok(None);
+        }
+        self.playlist_tracks(id).map(Some)
+    }
 
     /// Куда класть скачанный файл.
     ///
@@ -809,6 +850,42 @@ mod tests {
         assert_eq!(cache.playlist_tracks(&playlist).expect("get"), shorter);
     }
 
+    #[test]
+    fn playlist_tracks_freshness_window() {
+        let (_dir, cache) = bench(u64::MAX);
+        let playlist = PlaylistId::new(ProviderId::YTMUSIC, "LM");
+        let tracks: Vec<Track> = (0..3)
+            .map(|i| track(ProviderId::YTMUSIC, &format!("t{i}"), &format!("Трек {i}")))
+            .collect();
+
+        // Никогда не синкался — в кэше метки нет, даже если состав
+        // по какой-то причине на месте: идём в сеть.
+        assert_eq!(cache.playlist_tracks_if_fresh(&playlist, 600).expect("get"), None);
+
+        cache
+            .put_playlist_tracks(&playlist, &tracks)
+            .expect("put");
+        // Свежая метка — читаем из кэша.
+        assert_eq!(
+            cache.playlist_tracks_if_fresh(&playlist, 600).expect("get"),
+            Some(tracks.clone())
+        );
+
+        // Метку состарили — окно вышло, идём в сеть.
+        cache
+            .conn
+            .execute(
+                "UPDATE playlist_sync SET updated_at = ?3
+                 WHERE provider = ?1 AND playlist = ?2",
+                params![
+                    playlist.provider.as_str(),
+                    playlist.id.as_str(),
+                    now_secs() - 601
+                ],
+            )
+            .expect("age");
+        assert_eq!(cache.playlist_tracks_if_fresh(&playlist, 600).expect("get"), None);
+    }
 
     #[test]
     fn playlists_can_be_filtered_by_provider() {

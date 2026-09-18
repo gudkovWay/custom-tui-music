@@ -56,6 +56,10 @@ pub struct App {
     /// из подсистемы обходил бы обе очистки — замерено, оставались
     /// осиротевшие mpv по ~100 МБ и мёртвый файл сокета.
     shutdown: tokio::sync::Notify,
+    /// Момент последней попытки перечитать cookies, по провайдеру.
+    /// Без кулдауна ливень auth-ошибок превращается в ливень чтений
+    /// профиля браузера.
+    pub(crate) auth_retry: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
 
 impl App {
@@ -80,9 +84,12 @@ impl App {
             events,
             catalog_source: std::sync::Mutex::new(catalog_source),
             shutdown: tokio::sync::Notify::new(),
+            auth_retry: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
+
         arc
     }
+
 
 
 
@@ -150,8 +157,17 @@ impl App {
                 Ok(Payload::Ack(Ack::default()))
             }
             Cmd::Toggle => {
-                let paused = matches!(self.player.state().await.status, PlaybackStatus::Playing);
-                self.player.mpv().pause(paused).await?;
+                // Медиа-клавиша play/pause обязана что-то делать в любом
+                // статусе: на Stopped в пустом mpv пауза — тихий нооп.
+                let state = self.player.state().await;
+                match state.status {
+                    PlaybackStatus::Playing => self.player.mpv().pause(true).await?,
+                    PlaybackStatus::Stopped => match state.track {
+                        Some(track) => self.play_track(&track.id).await?,
+                        None => return Ok(Payload::Ack(Ack::default())),
+                    },
+                    PlaybackStatus::Paused => self.player.mpv().pause(false).await?,
+                }
                 self.emit_state().await;
                 Ok(Payload::Ack(Ack::default()))
             }

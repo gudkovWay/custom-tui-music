@@ -1,11 +1,20 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tmus_core::model::{Playlist, PlaylistId, SearchKind, SearchResult, Track};
 use tmus_core::protocol::{CatalogSource, Event, ProviderView};
 
 use crate::app::App;
 
+/// Сколько состав плейлиста считается свежим без похода в сеть. TUI
+/// дёргает состав на каждый шаг курсора по библиотеке, и без окна
+/// свежести каждый заход — секунды ожидания InnerTube.
+const PLAYLIST_TTL_SECS: i64 = 600;
 
+/// Кулдаун попыток перечитать cookies браузера: одна на провайдера,
+/// чтобы ливень auth-ошибок не превратился в ливень перечитываний
+/// профиля.
+const REAUTH_COOLDOWN: Duration = Duration::from_secs(300);
 
 impl App {
     pub(crate) fn providers(&self) -> Vec<ProviderView> {
@@ -51,6 +60,9 @@ impl App {
                 Err(err) => {
                     tracing::warn!(provider = %target.id(), %err, "поиск не удался");
                     self.report_auth(target, &err);
+                    if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
+                        self.try_reauth(target).await;
+                    }
                 }
             }
         }
@@ -66,6 +78,9 @@ impl App {
                 Err(err) => {
                     tracing::warn!(provider = %target.id(), %err, "библиотека не прочиталась");
                     self.report_auth(target, &err);
+                    if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
+                        self.try_reauth(target).await;
+                    }
                 }
             }
         }
@@ -84,14 +99,24 @@ impl App {
             .registry
             .get(id.provider)
             .ok_or_else(|| anyhow::anyhow!("провайдер {} не подключён", id.provider))?;
+        // Свежий кэш отвечает мгновенно: состав нужен на каждый шаг
+        // курсора, и сеть там не пережить.
+        if let Some(tracks) = self.with_cache(|c| c.playlist_tracks_if_fresh(id, PLAYLIST_TTL_SECS))? {
+            return Ok(tracks);
+        }
         match provider.catalog().playlist_tracks(id).await {
             Ok(tracks) => {
+                // put_playlist_tracks теперь ещё и ставит метку
+                // свежести — следующий заход попадёт в TTL-ветку выше.
                 self.with_cache(|c| c.put_playlist_tracks(id, &tracks))?;
                 Ok(tracks)
             }
             Err(err) => {
                 tracing::warn!(playlist = %id, %err, "плейлист не прочитался, беру из кэша");
                 self.report_auth(provider, &err);
+                if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
+                    self.try_reauth(provider).await;
+                }
                 Ok(self.with_cache(|c| c.playlist_tracks(id))?)
             }
         }
@@ -105,6 +130,9 @@ impl App {
                 Err(err) => {
                     tracing::warn!(provider = %target.id(), %err, "лайки не прочитались");
                     self.report_auth(target, &err);
+                    if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
+                        self.try_reauth(target).await;
+                    }
                 }
             }
         }
@@ -139,6 +167,33 @@ impl App {
         }
     }
 
+    /// Раз в `REAUTH_COOLDOWN` на провайдера: перечитать cookies
+    /// браузера и проверить сессию. Человек мог перезалогиниться ещё до
+    /// того, как демон заметил протухание — молчать об этом значило бы
+    /// требовать рестарт демона.
+    async fn try_reauth(&self, provider: &Arc<dyn tmus_provider::Provider>) {
+        let id = provider.id().as_str().to_owned();
+        // Кулдаун под замком: вторая параллельная auth-ошибка того же
+        // провайдера не должна вторгаться в профиль браузера следом.
+        {
+            let mut retries = self.auth_retry.lock().expect("замок auth_retry");
+            if retries.get(&id).is_some_and(|at| at.elapsed() < REAUTH_COOLDOWN) {
+                return;
+            }
+            retries.insert(id.clone(), Instant::now());
+        }
+        // refresh ходит в сеть до 30 с; клиент ждёт ответ, поэтому дольше
+        // 10 с ждать бессмысленно — отдаём управление, а не блокируемся.
+        match tokio::time::timeout(Duration::from_secs(10), provider.account().refresh()).await {
+            Ok(Ok(auth)) => self.emit(Event::AuthChanged { provider: id, auth }),
+            Ok(Err(err)) => {
+                tracing::debug!(provider = %id, %err, "перечитывание сессии не удалось");
+            }
+            Err(_) => {
+                tracing::debug!(provider = %id, "перечитывание сессии превысило 10 с");
+            }
+        }
+    }
 }
 
 pub fn resolve_catalog_source(
