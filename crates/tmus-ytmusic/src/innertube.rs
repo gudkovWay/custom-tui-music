@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-use tmus_core::model::{ProviderId, SearchKind};
+use tmus_core::model::{ProviderId, Rating, SearchKind};
 use tmus_provider::{ProviderError, Result};
 
 use crate::auth::{ORIGIN, YtmAuth};
@@ -27,6 +27,20 @@ const CLIENT_NAME: &str = "WEB_REMIX";
 const CLIENT_VERSION: &str = "1.20240401.01.00";
 const HL: &str = "en";
 const GL: &str = "US";
+
+/// Клиент VISIONOS для прямого player-резолва (станза сверена с
+/// yt-dlp 2026.09): не требует JS-плеера и PO-токена, отдаёт прямые
+/// googlevideo-ссылки по обычной cookie-сессии. Известное ограничение:
+/// клиент не отдаёт «made for kids» — такие треки это штатный случай
+/// фолбэка на yt-dlp в [`crate::YtMusic::resolve`].
+const FAST_CLIENT_NAME: &str = "VISIONOS";
+const FAST_CLIENT_VERSION: &str = "1.02";
+/// UA VISIONOS-клиента: googlevideo сверяет User-Agent с тем, от кого
+/// ссылка выпущена, поэтому он же уходит в `StreamSource::Remote`.
+pub(crate) const FAST_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) \
+                               AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
+/// Числовой идентификатор клиента VISIONOS для `X-YouTube-Client-Name`.
+const FAST_CLIENT_NUM: &str = "101";
 
 /// Десктопный Chrome: на «пустой» User-Agent сервис отвечает иначе.
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
@@ -94,9 +108,34 @@ impl InnerTube {
         self.post("next", body).await
     }
 
+    /// Ответ `player` для прямого резолва потока: клиент VISIONOS
+    /// отдаёт googlevideo-ссылки без JS-плеера и PO-токена. Cookies —
+    /// обязательны: анонимный запрос на официальном треке отбивается
+    /// бот-гейтом (замер 17.09.2026, общий для всех клиентов).
+    pub async fn player(&self, video_id: &str) -> Result<Value> {
+        self.post_client(
+            "player",
+            player_body(video_id),
+            visionos_client(),
+            Some(FAST_CLIENT_NUM),
+        )
+        .await
+    }
+
     pub async fn suggest(&self, query: &str) -> Result<Value> {
         self.post("music/get_search_suggestions", json!({ "input": query }))
             .await
+    }
+
+    /// Поставить оценку видео у YouTube Music.
+    ///
+    /// `like/like`, `like/dislike` и `like/removelike` — один и тот же
+    /// эндпоинт-семейство: тело одно (`target.videoId`), различие только
+    /// в имени эндпоинта. Плейлист `LM` (список лайкнутого) здесь не
+    /// трогается — это отдельная задача редактирования плейлистов.
+    pub async fn like(&self, video_id: &str, rating: Rating) -> Result<()> {
+        self.post(like_endpoint(rating), like_body(video_id)).await?;
+        Ok(())
     }
 
     /// Страница `browse` со всеми продолжениями, но не глубже [`MAX_PAGES`].
@@ -139,6 +178,21 @@ impl InnerTube {
     /// `Origin`/`X-Origin`/`X-Goog-AuthUser` сервис требует для запросов с
     /// подписью — без них он отвечает отказом, хотя подпись верна.
     async fn post(&self, endpoint: &str, body: Value) -> Result<Value> {
+        self.post_client(endpoint, body, web_remix_client(), None)
+            .await
+    }
+
+    /// Тот же запрос на другом клиенте InnerTube. Существующие вызовы
+    /// (`browse`/`search`/`like`) ходят от `WEB_REMIX`; player-резолв —
+    /// от VISIONOS, потому что тот отдаёт прямые ссылки без JS-плеера
+    /// и PO-токена.
+    async fn post_client(
+        &self,
+        endpoint: &str,
+        body: Value,
+        client: Value,
+        client_num: Option<&str>,
+    ) -> Result<Value> {
         let url = format!("{BASE}{endpoint}?prettyPrint=false");
         let mut request = self
             .http
@@ -146,8 +200,11 @@ impl InnerTube {
             .header("Origin", ORIGIN)
             .header("X-Origin", ORIGIN)
             .header("X-Goog-AuthUser", "0")
-            .json(&with_context(body));
+            .json(&with_context(body, client));
 
+        if let Some(num) = client_num {
+            request = request.header("X-YouTube-Client-Name", num);
+        }
         if let Some(cookie) = self.auth.cookie_header() {
             request = request.header("Cookie", cookie);
         }
@@ -199,20 +256,122 @@ impl InnerTube {
     }
 }
 
+/// Имя эндпоинта оценки для [`Rating`]: like/dislike/removelike.
+fn like_endpoint(rating: Rating) -> &'static str {
+    match rating {
+        Rating::None => "like/removelike",
+        Rating::Liked => "like/like",
+        Rating::Disliked => "like/dislike",
+    }
+}
+
+/// Тело запроса оценки: единственное поле — идентификатор видео.
+fn like_body(video_id: &str) -> Value {
+    json!({ "target": { "videoId": video_id } })
+}
+
 /// Тело запроса: контекст клиента плюс поля конкретного эндпоинта.
-fn with_context(fields: Value) -> Value {
-    let mut body = json!({
-        "context": { "client": {
-            "clientName": CLIENT_NAME,
-            "clientVersion": CLIENT_VERSION,
-            "hl": HL,
-            "gl": GL
-        } }
-    });
+fn with_context(fields: Value, client: Value) -> Value {
+    let mut body = json!({ "context": { "client": client } });
     if let (Some(map), Value::Object(fields)) = (body.as_object_mut(), fields) {
         map.extend(fields);
     }
     body
+}
+
+/// Станца клиента `WEB_REMIX`. `hl=en` запинен намеренно: разбор
+/// опирается на английские служебные строки («12 songs», «1.2M views»),
+/// а локализованные он бы не узнал.
+fn web_remix_client() -> Value {
+    json!({
+        "clientName": CLIENT_NAME,
+        "clientVersion": CLIENT_VERSION,
+        "hl": HL,
+        "gl": GL
+    })
+}
+
+/// Станца клиента VISIONOS для player-резолва (сверена с yt-dlp 2026.09).
+fn visionos_client() -> Value {
+    json!({
+        "clientName": FAST_CLIENT_NAME,
+        "clientVersion": FAST_CLIENT_VERSION,
+        "deviceMake": "Apple",
+        "deviceModel": "RealityDevice17,1",
+        "osName": "visionOS",
+        "osVersion": "26.5.23O471",
+        "hl": HL,
+        "gl": GL
+    })
+}
+
+/// Тело player-запроса. `contentCheckOk`/`racyCheckOk` снимают
+/// промежуточные подтверждения возраста/контента, на которые клиенту
+/// нечем ответить.
+fn player_body(video_id: &str) -> Value {
+    json!({
+        "videoId": video_id,
+        "contentCheckOk": true,
+        "racyCheckOk": true
+    })
+}
+
+/// Играбельность по ответу player: сервис сам решает, отдаёт ли он
+/// поток этому клиенту.
+pub(crate) fn playable(value: &Value) -> bool {
+    value["playabilityStatus"]["status"].as_str() == Some("OK")
+}
+
+/// Выбор аудио-формата из ответа player.
+///
+/// Приоритет фиксированный: itag 140 (m4a, совместим со всем), затем
+/// 251 (opus, наш основной формат), затем просто максимальный битрейт
+/// среди аудио — сервис мог убрать привычные itag'и, но играть должно
+/// всё равно. Видео-форматы отсекаются по `mimeType`: в
+/// `adaptiveFormats` они лежат вперемешку с аудио.
+pub(crate) fn pick_audio_format(value: &Value) -> Option<(String, u64, u64)> {
+    let formats = value["streamingData"]["adaptiveFormats"].as_array()?;
+    let mut best: Option<(String, u64, u64)> = None;
+    let by_itag = |itag: u64| {
+        formats.iter().find_map(|f| {
+            let mime = f["mimeType"].as_str()?;
+            if !mime.contains("audio/") || f["itag"].as_u64() != Some(itag) {
+                return None;
+            }
+            Some((
+                f["url"].as_str()?.to_owned(),
+                itag,
+                f["bitrate"].as_u64().unwrap_or_default(),
+            ))
+        })
+    };
+    if let Some(found) = by_itag(140).or_else(|| by_itag(251)) {
+        return Some(found);
+    }
+    for f in formats {
+        if !f["mimeType"].as_str().is_some_and(|m| m.contains("audio/")) {
+            continue;
+        }
+        let candidate = (
+            f["url"].as_str()?.to_owned(),
+            f["itag"].as_u64().unwrap_or_default(),
+            f["bitrate"].as_u64().unwrap_or_default(),
+        );
+        if best.as_ref().is_none_or(|(_, _, b)| candidate.2 > *b) {
+            best = Some(candidate);
+        }
+    }
+    best
+}
+
+/// Срок жизни googlevideo-ссылки из её параметра `expire=` (unix-секунды).
+///
+/// Параметра нет — `None`: незнакомый URL считается короткоживущим,
+/// и `StreamSource::Remote` с `expires_at: None` кэшироваться не будет.
+pub(crate) fn expire_from_url(url: &str) -> Option<SystemTime> {
+    let start = url.split(&['?', '&']).find_map(|q| q.strip_prefix("expire="))?;
+    let ts: u64 = start.parse().ok()?;
+    Some(UNIX_EPOCH + Duration::from_secs(ts))
 }
 
 /// Параметры фильтра поиска WEB_REMIX.
@@ -264,4 +423,107 @@ fn snippet(body: &str) -> String {
     }
     let head: String = trimmed.chars().take(SNIPPET_CHARS).collect();
     format!("{head}…")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rating_maps_to_like_endpoints() {
+        // Три имени эндпоинта — часть контракта InnerTube: тело у всех
+        // одно, различие только в пути. Проверяем и путь, и собранный
+        // URL, каким его строит `post`.
+        assert_eq!(like_endpoint(Rating::Liked), "like/like");
+        assert_eq!(like_endpoint(Rating::Disliked), "like/dislike");
+        assert_eq!(like_endpoint(Rating::None), "like/removelike");
+
+        let url = format!("{}{}?prettyPrint=false", BASE, like_endpoint(Rating::Liked));
+        assert_eq!(url, "https://music.youtube.com/youtubei/v1/like/like?prettyPrint=false");
+    }
+
+    #[test]
+    fn like_body_targets_video_id() {
+        // Тело должно быть ровно target.videoId: лишние поля InnerTube
+        // у оценок игнорирует, а отсутствие target — валит.
+        let body = like_body("dQw4w9WgXcQ");
+        assert_eq!(
+            body,
+            json!({ "target": { "videoId": "dQw4w9WgXcQ" } })
+        );
+    }
+
+    /// Компактный фейк ответа player: OK, два аудио-формата и один
+    /// видео. Пропорции полей — как в живом ответе, значения — свои.
+    fn player_ok_json() -> Value {
+        json!({
+            "playabilityStatus": { "status": "OK" },
+            "streamingData": { "adaptiveFormats": [
+                { "itag": 18, "mimeType": "video/mp4; codecs=\"avc1.42001E\"",
+                  "bitrate": 500_000, "url": "https://gv/video18" },
+                { "itag": 251, "mimeType": "audio/webm; codecs=\"opus\"",
+                  "bitrate": 129_000, "url": "https://gv/audio251?expire=1893456000" },
+                { "itag": 140, "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+                  "bitrate": 130_000, "url": "https://gv/audio140?expire=1893456000" }
+            ]}
+        })
+    }
+
+    #[test]
+    fn playable_only_on_ok_status() {
+        assert!(playable(&player_ok_json()));
+        // Бот-гейт и прочие отказы приходят статусом в теле с HTTP 200.
+        let error = json!({ "playabilityStatus": { "status": "PLAYABILITY_ERROR" } });
+        assert!(!playable(&error));
+    }
+
+    #[test]
+    fn audio_format_prefers_itag_140_then_251() {
+        let (_, itag, _) = pick_audio_format(&player_ok_json()).expect("аудио есть");
+        assert_eq!(itag, 140, "m4a приоритетнее opus");
+
+        // Без 140 берётся 251.
+        let mut no_140 = player_ok_json();
+        no_140["streamingData"]["adaptiveFormats"]
+            .as_array_mut()
+            .expect("массив")
+            .retain(|f| f["itag"] != 140);
+        let (url, itag, bitrate) = pick_audio_format(&no_140).expect("аудио есть");
+        assert_eq!(itag, 251);
+        assert_eq!(bitrate, 129_000);
+        assert!(url.contains("audio251"));
+    }
+
+    #[test]
+    fn audio_format_falls_back_to_max_bitrate_and_skips_video() {
+        // Привычных itag'ов нет — берётся максимальный аудио-битрейт,
+        // видео-формат игнорируется даже при большем bitrate.
+        let value = json!({
+            "playabilityStatus": { "status": "OK" },
+            "streamingData": { "adaptiveFormats": [
+                { "itag": 18, "mimeType": "video/mp4", "bitrate": 900_000,
+                  "url": "https://gv/video18" },
+                { "itag": 250, "mimeType": "audio/webm", "bitrate": 61_000,
+                  "url": "https://gv/audio250" },
+                { "itag": 249, "mimeType": "audio/webm", "bitrate": 48_000,
+                  "url": "https://gv/audio249" }
+            ]}
+        });
+        let (url, itag, _) = pick_audio_format(&value).expect("аудио есть");
+        assert_eq!(itag, 250);
+        assert!(url.contains("audio250"));
+
+        // Аудио нет вовсе (или adaptiveFormats пуст) — None.
+        let empty = json!({ "streamingData": { "adaptiveFormats": [] } });
+        assert_eq!(pick_audio_format(&empty), None);
+        assert_eq!(pick_audio_format(&json!({})), None);
+    }
+
+    #[test]
+    fn expire_parsed_from_url_and_absent_is_none() {
+        let at = expire_from_url("https://gv/audio140?expire=1893456000&itag=140")
+            .expect("expire есть");
+        assert_eq!(at, UNIX_EPOCH + Duration::from_secs(1_893_456_000));
+        assert_eq!(expire_from_url("https://gv/audio140"), None);
+    }
 }

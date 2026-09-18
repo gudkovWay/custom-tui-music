@@ -26,8 +26,8 @@ use tmus_core::CoreError;
 use tmus_core::config::Config;
 use tmus_core::cookies::CookieSource;
 use tmus_core::model::{
-    AuthStatus, Playlist, PlaylistId, ProviderId, SearchKind, SearchResult, StreamSource, Track,
-    TrackId,
+    AuthStatus, Playlist, PlaylistId, ProviderId, Rating, SearchKind, SearchResult, StreamSource,
+    Track, TrackId,
 };
 use tmus_provider::ytdlp::{YtDlp, YtDlpRequest};
 use tmus_provider::{Account, Catalog, Provider, ProviderError, Resolver, Result};
@@ -60,6 +60,10 @@ pub struct YtMusic {
     /// Формат из конфига (`audio_format`): он же уходит в yt-dlp при
     /// резолве, поэтому хранится здесь, а не читается на каждый трек.
     format: String,
+    /// Прямой player-резолв (`fast_resolve` секции
+    /// `[providers.ytmusic]`). Выключен по умолчанию: клиент VISIONOS
+    /// неофициален и не проходит апдейты yt-dlp, а фолбэк страхует.
+    fast_resolve: bool,
     /// Сессия для yt-dlp. Cookies у InnerTube берёт [`YtmAuth`] — из того
     /// же источника, но своим jar'ом; источнику здесь принадлежит
     /// последнее слово, потому что его перечитывает `refresh`.
@@ -85,7 +89,38 @@ impl YtMusic {
             tube,
             yt_dlp: YtDlp::new(config.yt_dlp.clone()),
             format: config.audio_format.clone(),
+            fast_resolve: config.provider("ytmusic").fast_resolve,
             cookies,
+        })
+    }
+
+    /// Прямой источник через player-запрос VISIONOS. Ошибка здесь —
+    /// любой негатив (сеть, не OK, нет аудио-формата): вызывающий
+    /// (`Resolver::resolve`) логирует её в debug и уходит в yt-dlp.
+    async fn fast_source(&self, video_id: &str) -> Result<StreamSource> {
+        let page = self.tube.player(video_id).await?;
+        if !innertube::playable(&page) {
+            return Err(ProviderError::Format {
+                provider: self.id,
+                reason: "player ответил не OK".into(),
+            });
+        }
+        let Some((url, itag, _bitrate)) = innertube::pick_audio_format(&page) else {
+            return Err(ProviderError::Format {
+                provider: self.id,
+                reason: "в ответе player нет аудио-формата".into(),
+            });
+        };
+        let expires_at = innertube::expire_from_url(&url);
+        tracing::debug!(provider = "ytmusic", video_id, itag, "fast_resolve: ссылка получена");
+        Ok(StreamSource::Remote {
+            url,
+            // Googlevideo отдаёт 403 чужому User-Agent — отдаём тот же,
+            // каким ссылку выпрашивали.
+            user_agent: Some(innertube::FAST_USER_AGENT.to_owned()),
+            // Ссылка без `expire=` считается короткоживущей (`None`):
+            // кэшировать её нельзя, `StreamSource` сам это разрулит.
+            expires_at,
         })
     }
 }
@@ -177,6 +212,15 @@ impl Catalog for YtMusic {
         self.playlist_tracks(&PlaylistId::new(self.id, LIKED_PLAYLIST))
             .await
     }
+
+    async fn rate(&self, track: &TrackId, rating: Rating) -> Result<()> {
+        // Чужой трек — не наша оценка: провайдер отвечает только за свои
+        // идентификаторы, тот же приём, что в `playlist_tracks`.
+        if track.provider != self.id {
+            return Err(ProviderError::NoSuchTrack(track.clone()));
+        }
+        self.tube.like(&track.id, rating).await
+    }
 }
 
 #[async_trait]
@@ -192,6 +236,22 @@ impl Resolver for YtMusic {
         // `TrackId` — это только идентификатор видео, а yt-dlp нужен URL:
         // собираем страницу трека, она у yt-dlp же и разрешается.
         let page_url = format!("https://music.youtube.com/watch?v={}", track.id);
+
+        // Быстрый путь: player-запрос VISIONOS отдаёт прямую ссылку без
+        // yt-dlp (замер: yt-dlp ~4 с и ~335 МБ на процесс). Любой негатив
+        // — не ошибка для вызывающего, а повод вернуться к yt-dlp, поэтому
+        // причина только в debug-лог. «Made for kids» VISIONOS не отдаёт —
+        // штатный случай фолбэка, см. `innertube`.
+        if self.fast_resolve {
+            match self.fast_source(&track.id).await {
+                Ok(source) => return Ok(source),
+                Err(reason) => tracing::debug!(
+                    provider = "ytmusic",
+                    video_id = %track.id,
+                    "fast_resolve не сработал, фолбэк на yt-dlp: {reason}"
+                ),
+            }
+        }
 
         let media = self
             .yt_dlp

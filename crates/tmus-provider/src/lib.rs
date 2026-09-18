@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tmus_core::model::{
-    AuthStatus, Playlist, PlaylistId, ProviderId, SearchKind, SearchResult, StreamSource, Track,
-    TrackId,
+    AuthStatus, Playlist, PlaylistId, ProviderId, Rating, SearchKind, SearchResult, StreamSource,
+    Track, TrackId,
 };
 
 pub mod ytdlp;
@@ -99,6 +99,20 @@ pub trait Catalog: Send + Sync {
     /// Лайкнутое. У YouTube Music это плейлист `LM`, у других — своё;
     /// вызывающего это не касается.
     async fn liked(&self) -> Result<Vec<Track>>;
+
+    /// Поставить оценку треку у провайдера.
+    ///
+    /// Дефолт обязателен: реестр мультипровайдерный, и провайдер без
+    /// сетевых оценок (SoundCloud появится позже) не должен быть
+    /// обязан ничего выдумывать. Ошибка [`ProviderError::Unsupported`]
+    /// — не сбой: вызывающий обязан трактовать её как «поставить
+    /// оценку здесь нельзя», а не падать.
+    async fn rate(&self, _id: &TrackId, _rating: Rating) -> Result<()> {
+        Err(ProviderError::Unsupported {
+            provider: self.provider(),
+            what: "оценки",
+        })
+    }
 }
 
 /// Резолвер: `TrackId` → откуда играть.
@@ -249,6 +263,19 @@ mod tests {
         fn resolver(&self) -> &dyn Resolver {
             self
         }
+    }
+
+    #[test]
+    fn default_rate_is_unsupported() {
+        // Провайдер без переопределения `rate` (будущий SoundCloud)
+        // обязан отвечать Unsupported, а не падать где-то в сети.
+        let stub = Stub(ProviderId::SOUNDCLOUD);
+        let track = TrackId::new(ProviderId::SOUNDCLOUD, "abc");
+        let error = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(stub.rate(&track, Rating::Liked))
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::Unsupported { provider, .. } if provider == ProviderId::SOUNDCLOUD));
     }
 
     #[test]
