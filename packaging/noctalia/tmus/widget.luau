@@ -5,8 +5,7 @@ local PANEL = "q/tmus:library"
 local SERVICE = "q/tmus:watch"
 
 local TITLE_WIDTH = math.max(0, tonumber(noctalia.getConfig("title_width")) or 28)
-local ART = 22
-local PROGRESS_W = 96
+local ART = 18
 
 local snapshot = {}
 
@@ -47,12 +46,25 @@ local function shorten(text, limit)
   return string.sub(text, 1, cut - 1) .. "…"
 end
 
+local function stateName(s)
+  if not s.linked then
+    return "disconnected"
+  end
+  if s.status == "playing" then
+    return "playing"
+  end
+  if s.status == "paused" then
+    return "paused"
+  end
+  return "stopped"
+end
+
 local function label(s)
   if not s.linked then
-    return "нет демона"
+    return "tmusd offline"
   end
   if (s.title or "") == "" then
-    return ""
+    return stateName(s)
   end
   local text = s.title
   if (s.artist or "") ~= "" then
@@ -61,15 +73,60 @@ local function label(s)
   return shorten(text, TITLE_WIDTH)
 end
 
+local function tooltip(s)
+  local rows = {}
+  if not s.linked then
+    table.insert(rows, { key = "state", value = "disconnected" })
+    table.insert(rows, { key = "error", value = (s.error or "") ~= "" and s.error or "tmusd is not running" })
+    table.insert(rows, { key = "hint", value = "systemctl --user start tmusd" })
+    return rows
+  end
+  table.insert(rows, { key = "state", value = stateName(s) })
+  if (s.error or "") ~= "" then
+    table.insert(rows, { key = "error", value = s.error })
+  end
+  if (s.title or "") ~= "" then
+    table.insert(rows, { key = "track", value = s.title })
+    if (s.artist or "") ~= "" then
+      table.insert(rows, { key = "artist", value = s.artist })
+    end
+    if (s.album or "") ~= "" then
+      table.insert(rows, { key = "album", value = s.album })
+    end
+    local dur = tonumber(s.duration) or 0
+    if dur > 0 then
+      table.insert(rows, { key = "time", value = clock(s.position) .. " / " .. clock(dur) })
+    else
+      table.insert(rows, { key = "time", value = clock(s.position) })
+    end
+    if (s.provider or "") ~= "" then
+      table.insert(rows, { key = "source", value = s.provider .. (s.offline and " · cached" or "") })
+    end
+  end
+  if (tonumber(s.queueLen) or 0) > 0 then
+    local index = tonumber(s.queueIndex)
+    local place = index ~= nil and tostring(index + 1) .. "/" .. tostring(s.queueLen)
+      or tostring(s.queueLen)
+    table.insert(rows, { key = "queue", value = place })
+  end
+  table.insert(rows, { key = "client", value = tostring(s.source or "all") })
+  table.insert(rows, { key = "volume", value = string.format("%d%%", math.floor(tonumber(s.volume) or 0)) })
+  local mods = {}
+  if s.shuffle then
+    table.insert(mods, "shuffled")
+  end
+  if (s.loop or "none") ~= "none" then
+    table.insert(mods, "repeat: " .. tostring(s.loop))
+  end
+  if #mods > 0 then
+    table.insert(rows, { key = "mode", value = table.concat(mods, " · ") })
+  end
+  return rows
+end
+
 local function glyphFor(s)
   if not s.linked then
     return "plug-off", "error"
-  end
-  if (s.error or "") ~= "" then
-    return "music-off", "error"
-  end
-  if s.status == "playing" then
-    return nil
   end
   if s.status == "paused" then
     return "player-pause", "secondary"
@@ -77,60 +134,9 @@ local function glyphFor(s)
   return "music", "on_surface_variant"
 end
 
-local function tooltip(s)
-  local rows = {}
-  if not s.linked then
-    table.insert(rows, { key = "демон", value = (s.error or "") ~= "" and s.error or "не запущен" })
-    table.insert(rows, { key = "запустить", value = "systemctl --user start tmusd" })
-    return rows
-  end
-  if (s.error or "") ~= "" then
-    table.insert(rows, { key = "ошибка", value = s.error })
-  end
-  if (s.title or "") ~= "" then
-    table.insert(rows, { key = "трек", value = s.title })
-    if (s.artist or "") ~= "" then
-      table.insert(rows, { key = "артист", value = s.artist })
-    end
-    if (s.album or "") ~= "" then
-      table.insert(rows, { key = "альбом", value = s.album })
-    end
-    local dur = tonumber(s.duration) or 0
-    if dur > 0 then
-      table.insert(rows, { key = "время", value = clock(s.position) .. " / " .. clock(dur) })
-    else
-      table.insert(rows, { key = "время", value = clock(s.position) })
-    end
-  else
-    table.insert(rows, { key = "трек", value = "ничего не играет" })
-  end
-  if (s.provider or "") ~= "" then
-    table.insert(rows, { key = "источник", value = s.provider .. (s.offline and " · из кэша" or "") })
-  end
-  if (tonumber(s.queueLen) or 0) > 0 then
-    local index = tonumber(s.queueIndex)
-    local place = index ~= nil and tostring(index + 1) .. "/" .. tostring(s.queueLen)
-      or tostring(s.queueLen)
-    table.insert(rows, { key = "очередь", value = place })
-  end
-  table.insert(rows, { key = "клиент", value = tostring(s.source or "all") })
-  table.insert(rows, { key = "громкость", value = string.format("%d%%", math.floor(tonumber(s.volume) or 0)) })
-  local mods = {}
-  if s.shuffle then
-    table.insert(mods, "перемешано")
-  end
-  if (s.loop or "none") ~= "none" then
-    table.insert(mods, "повтор: " .. tostring(s.loop))
-  end
-  if #mods > 0 then
-    table.insert(rows, { key = "режим", value = table.concat(mods, " · ") })
-  end
-  return rows
-end
-
 local function artNode(s)
-  local art = tostring(s.artUrl or "")
-  if art ~= "" and s.status ~= "stopped" then
+  local art = tostring(s.artPath or "")
+  if art ~= "" and s.status ~= "stopped" and s.linked then
     return ui.image({
       key = "art",
       path = art,
@@ -142,38 +148,16 @@ local function artNode(s)
     })
   end
   local glyph, color = glyphFor(s)
-  return ui.glyph({ key = "glyph", name = glyph or "player-play", color = color or "primary" })
-end
-
-local function progressNode(s)
-  local dur = tonumber(s.duration) or 0
-  if dur <= 0 or s.status == "stopped" then
-    return nil
-  end
-  local pos = tonumber(s.position) or 0
-  return ui.progress({
-    key = "progress",
-    progress = math.max(0, math.min(1, pos / dur)),
-    width = PROGRESS_W,
-    height = 2,
-    radius = 1,
-  })
+  return ui.glyph({ key = "glyph", name = glyph or "music", color = color or "on_surface_variant" })
 end
 
 local function draw()
   local s = snapshot
-  local children = { artNode(s) }
-
   local text = label(s)
+  local children = { artNode(s) }
   if text ~= "" then
     table.insert(children, ui.label({ key = "title", text = text, color = "on_surface" }))
   end
-
-  local progress = progressNode(s)
-  if progress then
-    table.insert(children, progress)
-  end
-
   barWidget.render(ui.row({ gap = 6, align = "center" }, children))
   barWidget.setTooltip(tooltip(s))
 end
@@ -188,11 +172,11 @@ function onClick()
 end
 
 function onMiddleClick()
-  poke("toggle")
+  poke("next")
 end
 
 function onRightClick()
-  poke("next")
+  poke("toggle")
 end
 
 function onScroll(axis, steps)

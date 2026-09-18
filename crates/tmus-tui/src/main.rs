@@ -9,8 +9,8 @@ mod ui;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use clap::{Parser, Subcommand};
-use tmus_core::model::{LoopMode, PlaylistId, ProviderId, TrackId};
+use clap::{Parser, Subcommand, ValueEnum};
+use tmus_core::model::{LoopMode, PlaylistId, ProviderId, SearchKind, TrackId};
 use tmus_core::protocol::{Cmd, Payload};
 use tmus_core::Paths;
 
@@ -74,8 +74,13 @@ enum CliCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Поиск; `--kind` выбирает, что искать.
     Search {
         query: String,
+        /// `all` — треки, артисты и плейлисты тремя запросами одним
+        /// списком; без флага ищем треки, как раньше.
+        #[arg(long, value_enum, default_value_t = SearchKindArg::Tracks)]
+        kind: SearchKindArg,
         #[arg(long)]
         provider: Option<String>,
         #[arg(long)]
@@ -103,6 +108,31 @@ enum CacheCmd {
     Pin { track_id: String },
     Unpin { track_id: String },
     Gc,
+}
+
+/// `--kind` команды `search`. Отдельный тип, а не свободная строка:
+/// набор значений задаёт clap, поэтому опечатка падает до похода в
+/// демон, а не превращается в пустой результат.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SearchKindArg {
+    /// Треки, артисты и плейлисты: три запроса, один список.
+    All,
+    Tracks,
+    Artists,
+    Playlists,
+}
+
+impl SearchKindArg {
+    /// Виды протокола, которые надо спросить, в порядке склейки.
+    #[must_use]
+    fn kinds(self) -> &'static [SearchKind] {
+        match self {
+            Self::All => &[SearchKind::Tracks, SearchKind::Artists, SearchKind::Playlists],
+            Self::Tracks => &[SearchKind::Tracks],
+            Self::Artists => &[SearchKind::Artists],
+            Self::Playlists => &[SearchKind::Playlists],
+        }
+    }
 }
 
 #[tokio::main]
@@ -169,18 +199,9 @@ async fn main() -> Result<()> {
             }
         },
         CliCmd::Queue { json } => return print_payload(client.call(Cmd::Queue).await?, json),
-        CliCmd::Search { query, provider, json } => {
+        CliCmd::Search { query, kind, provider, json } => {
             let provider = resolve_provider(&mut client, provider.as_deref()).await?;
-            return print_payload(
-                client
-                    .call(Cmd::Search {
-                        query,
-                        kind: tmus_core::model::SearchKind::Tracks,
-                        provider,
-                    })
-                    .await?,
-                json,
-            );
+            return run_search(&mut client, &query, kind, provider, json).await;
         }
         CliCmd::PlayPlaylist { playlist_id, start } => Cmd::PlayPlaylist {
             playlist: parse_playlist_id(&playlist_id)?,
@@ -370,6 +391,43 @@ async fn resolve_provider(
     }
 }
 
+/// Один вид — один запрос, ответ демона печатаем как есть: форма payload
+/// не должна зависеть от того, задан `--kind` явно или нет. `all` —
+/// столько запросов, сколько видов, с тем же провайдером и запросом;
+/// склейка здесь, а не в демоне: демон ищет строго в рамках вида, и
+/// расширять протокол ради сахара незачем.
+async fn run_search(
+    client: &mut client::Client,
+    query: &str,
+    kind: SearchKindArg,
+    provider: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let kinds = kind.kinds();
+    if let [only] = kinds {
+        let payload = client
+            .call(Cmd::Search { query: query.to_owned(), kind: *only, provider })
+            .await?;
+        return print_payload(payload, json);
+    }
+
+    let mut results = Vec::new();
+    for search_kind in kinds {
+        let cmd = Cmd::Search {
+            query: query.to_owned(),
+            kind: *search_kind,
+            provider: provider.clone(),
+        };
+        match client.call(cmd).await? {
+            Payload::Results(mut part) => results.append(&mut part),
+            // Молча ронять часть выдачи нельзя: список выглядел бы
+            // полным, не будучи им.
+            other => bail!("поиск {search_kind:?} вернул не результаты: {other:?}"),
+        }
+    }
+    print_payload(Payload::Results(results), json)
+}
+
 fn parse_loop(s: &str) -> Result<LoopMode> {
     match s {
         "none" => Ok(LoopMode::None),
@@ -470,6 +528,26 @@ mod tests {
         assert_eq!(parse_shuffle("off").expect("ok"), Some(false));
         assert_eq!(parse_shuffle("toggle").expect("ok"), None);
         assert!(parse_shuffle("maybe").is_err());
+    }
+
+    /// Контракт `--kind`: три вида плюс `all`, по умолчанию — треки.
+    #[test]
+    fn search_kind_flag_tokens_and_default() {
+        let kind = |args: &[&str]| match Cli::try_parse_from(args).expect("valid").cmd {
+            Some(CliCmd::Search { kind, .. }) => kind,
+            _ => panic!("ожидалась подкоманда search"),
+        };
+
+        assert!(matches!(kind(&["tmus", "search", "test"]), SearchKindArg::Tracks));
+        assert!(matches!(kind(&["tmus", "search", "test", "--kind", "tracks"]), SearchKindArg::Tracks));
+        assert!(matches!(kind(&["tmus", "search", "test", "--kind", "artists"]), SearchKindArg::Artists));
+        assert!(matches!(kind(&["tmus", "search", "test", "--kind", "playlists"]), SearchKindArg::Playlists));
+        // `all` — те же три вида, спрошенные именно в этом порядке.
+        assert!(matches!(kind(&["tmus", "search", "test", "--kind", "all"]), SearchKindArg::All));
+        let all: &[SearchKind] = &[SearchKind::Tracks, SearchKind::Artists, SearchKind::Playlists];
+        assert_eq!(SearchKindArg::All.kinds(), all);
+        // `albums` есть в модели, но не в контракте команды.
+        assert!(Cli::try_parse_from(["tmus", "search", "test", "--kind", "albums"]).is_err());
     }
 
     #[test]

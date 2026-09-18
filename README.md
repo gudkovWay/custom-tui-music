@@ -59,7 +59,8 @@ tmus                       # TUI
 tmus toggle | next | prev  # для медиа-клавиш Hyprland
 tmus seek +15 | seek 90    # относительно или абсолютно
 tmus vol +5  | vol 40
-tmus status | library | liked | queue | providers | search <запрос>
+tmus status | library | liked | queue | providers
+tmus search <запрос> [--kind all|tracks|artists|playlists]  # по умолчанию tracks
 tmus play <provider>:<id>  # напр. tmus play ytmusic:dQw4w9WgXcQ
 tmus cache stats | pin <id> | unpin <id> | gc
 tmus events                # поток событий JSON (им пользуется плагин noctalia)
@@ -118,10 +119,11 @@ Discord RPC требует своего приложения: `discord.com/devel
 `org.mpris.MediaPlayer2.tmus` и иконку `org.kde.StatusNotifierItem`,
 которые она читает штатно.
 
-Виджет в баре, панель и спектр — отдельный плагин
-`~/.config/hypr/noctalia-plugins/tmus/`. Спектр берётся у самой noctalia
-(её захват PipeWire отдаётся плагинам через `onAudioSpectrum`), поэтому
-`cava` не нужен.
+Виджет в баре, панель и спектр — отслеживаемый пакет
+`packaging/noctalia/tmus`: он устанавливает плагин в локальный каталог
+плагинов noctalia. В одной бар-капсуле соседствуют виджет
+`q/tmus:tmus-widget` и встроенный в noctalia `audio_visualizer`; спектр
+рисует сама noctalia, поэтому `cava` не нужен.
 
 ## Замеренные грабли
 

@@ -106,8 +106,11 @@ pub enum Payload {
     Ack(Ack),
     State(PlayerState),
     Queue(QueueView),
-    Tracks(Vec<Track>),
+    // `Results` обязан идти раньше `Tracks`: элементы поиска несут тег
+    // `kind`, поэтому `Vec<SearchResult>` в untagged-enum иначе
+    // ошибочно декодируется как `Vec<Track>`.
     Results(Vec<SearchResult>),
+    Tracks(Vec<Track>),
     Playlists(Vec<crate::model::Playlist>),
     Providers(Vec<ProviderView>),
     Cache(CacheStats),
@@ -296,5 +299,39 @@ mod tests {
             duration: Some(Duration::from_secs(300)),
         });
         assert!(!event.contains('\n'), "framing is newline-delimited: {event}");
+    }
+
+    fn track(id: &str) -> Track {
+        Track {
+            id: TrackId { provider: crate::model::ProviderId::YTMUSIC, id: id.into() },
+            title: format!("track {id}"),
+            artists: vec!["artist".into()],
+            album: None,
+            duration: None,
+            art_url: None,
+            page_url: None,
+        }
+    }
+
+    #[test]
+    fn tagged_search_results_stay_results_and_plain_tracks_stay_tracks() {
+        let results = Payload::Results(vec![SearchResult::Track(track("a")), SearchResult::Track(track("b"))]);
+        let wire = line(&results);
+        match serde_json::from_str::<Payload>(&wire).expect("parse results") {
+            Payload::Results(items) => {
+                assert_eq!(items.len(), 2);
+                assert!(items.iter().all(|r| matches!(r, SearchResult::Track(_))),
+                    "tagged search array must decode as Results, not Tracks");
+            }
+            other => panic!("search results degraded to {other:?}"),
+        }
+
+        let tracks = Payload::Tracks(vec![track("c")]);
+        let wire = line(&tracks);
+        match serde_json::from_str::<Payload>(&wire).expect("parse tracks") {
+            Payload::Tracks(items) => assert_eq!(items.len(), 1, "plain track array must stay Tracks"),
+            other => panic!("plain tracks degraded to {other:?}"),
+        }
+        assert_eq!(line(&Payload::Tracks(vec![track("c")])), wire, "wire shape is unchanged");
     }
 }

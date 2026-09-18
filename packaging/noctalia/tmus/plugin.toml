@@ -1,6 +1,6 @@
 id = "q/tmus"
 name = "Музыка"
-version = "0.2.0"
+version = "0.3.0"
 plugin_api = 18
 author = "q"
 license = "MIT"
@@ -26,8 +26,8 @@ middle = "none"
 [[panel]]
 id = "library"
 entry = "panel.luau"
-width = 900
-height = 700
+width = 1180
+height = 760
 capture_keys = [
   "Left", "Right", "Up", "Down", "Return", "Escape", "Space", "slash",
   "G", "H", "J", "K", "L", "N", "O", "P", "R", "S",
