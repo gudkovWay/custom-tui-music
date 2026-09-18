@@ -125,6 +125,12 @@ ON CONFLICT (provider, id) DO UPDATE SET
     ext         = excluded.ext,
     accessed_at = excluded.accessed_at";
 
+/// Порог устаревания LRU-метки: `lookup_audio` обновляет `accessed_at`
+/// только если существующая старше этого числа секунд. Вытеснение LRU
+/// сортирует по секундам и минутной гранулярности не портится, а запись
+/// на каждый скип — fsync на каждый скип.
+const ACCESS_TOUCH_INTERVAL_SECS: i64 = 60;
+
 /// Метаданные и учёт офлайн-файлов.
 pub struct Cache {
     conn: Connection,
@@ -155,6 +161,17 @@ impl Cache {
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|source| CoreError::Database { path: db.clone(), source })?;
         conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|source| CoreError::Database { path: db.clone(), source })?;
+        // В WAL `synchronous=NORMAL` стоит потерю последних коммитов
+        // только при падении ОС; содержимое здесь — кэш метаданных и
+        // учёт файлов, восстановимое повторным запросом/сканом, поэтому
+        // fsync на каждый скип трека не оправдан.
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(|source| CoreError::Database { path: db.clone(), source })?;
+        // В базу ходят фоновый филлер и путь воспроизведения; без
+        // ожидания конкуренция вылезает человеку ошибкой SQLITE_BUSY
+        // вместо пятисекундной паузы.
+        conn.busy_timeout(Duration::from_secs(5))
             .map_err(|source| CoreError::Database { path: db.clone(), source })?;
         conn.execute_batch(SCHEMA)
             .map_err(|source| CoreError::Database { path: db, source })?;
@@ -316,18 +333,22 @@ impl Cache {
     /// и вызывающему, и учёту лимита.
     ///
     /// Попадание обновляет `accessed_at` — на этом держится LRU в
-    /// [`Cache::gc`].
+    /// [`Cache::gc`]. Метка пишется не на каждое попадание, а когда
+    /// существующая старше порога: вытеснение сортирует по секундам и
+    /// минутной гранулярности не портится, а запись на каждый скип —
+    /// fsync на каждый скип (сделан после замера потока коммитов при
+    /// быстрых переключениях треков).
     pub fn lookup_audio(&self, id: &TrackId) -> Result<Option<PathBuf>> {
-        let found: Option<String> = self
+        let found: Option<(String, i64)> = self
             .conn
             .query_row(
-                "SELECT path FROM audio WHERE provider = ?1 AND id = ?2",
+                "SELECT path, accessed_at FROM audio WHERE provider = ?1 AND id = ?2",
                 params![id.provider.as_str(), id.id.as_str()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|e| self.db_error(e))?;
-        let Some(found) = found else {
+        let Some((found, accessed_at)) = found else {
             return Ok(None);
         };
 
@@ -337,12 +358,14 @@ impl Cache {
             return Ok(None);
         }
 
-        self.conn
-            .execute(
-                "UPDATE audio SET accessed_at = ?3 WHERE provider = ?1 AND id = ?2",
-                params![id.provider.as_str(), id.id.as_str(), now_secs()],
-            )
-            .map_err(|e| self.db_error(e))?;
+        if now_secs() - accessed_at >= ACCESS_TOUCH_INTERVAL_SECS {
+            self.conn
+                .execute(
+                    "UPDATE audio SET accessed_at = ?3 WHERE provider = ?1 AND id = ?2",
+                    params![id.provider.as_str(), id.id.as_str(), now_secs()],
+                )
+                .map_err(|e| self.db_error(e))?;
+        }
         Ok(Some(path))
     }
 
@@ -837,6 +860,42 @@ mod tests {
 
         assert!(old_path.exists());
         assert!(!fresh_path.exists());
+    }
+
+    #[test]
+    fn lookup_touches_accessed_at_only_after_the_threshold() {
+        let (_dir, cache) = bench(u64::MAX);
+        let id = TrackId::new(ProviderId::YTMUSIC, "throttle");
+        put_audio(&cache, &id, 16);
+        let now = now_secs();
+        set_accessed_at(&cache, &id, now);
+
+        // Метка свежая (порог не вышел) — повторное попадание её не
+        // трогает, то есть не порождает коммит на каждый скип.
+        cache.lookup_audio(&id).expect("hit fresh");
+        let touched: i64 = cache
+            .conn
+            .query_row(
+                "SELECT accessed_at FROM audio WHERE provider = ?1 AND id = ?2",
+                params![id.provider.as_str(), id.id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("read");
+        assert_eq!(touched, now);
+
+        // Запись с искусственно старой меткой обновляется до текущего
+        // времени — LRU продолжает работать.
+        set_accessed_at(&cache, &id, now - ACCESS_TOUCH_INTERVAL_SECS);
+        cache.lookup_audio(&id).expect("hit stale");
+        let refreshed: i64 = cache
+            .conn
+            .query_row(
+                "SELECT accessed_at FROM audio WHERE provider = ?1 AND id = ?2",
+                params![id.provider.as_str(), id.id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("read");
+        assert!(refreshed >= now);
     }
 
     #[test]
