@@ -64,6 +64,9 @@ tmus search <запрос> [--kind all|tracks|artists|playlists]  # по умо�
 tmus play <provider>:<id>  # напр. tmus play ytmusic:dQw4w9WgXcQ
 tmus cache stats | pin <id> | unpin <id> | gc
 tmus ping                  # RTT демона (диагностика: жив / тупит / мёртв)
+tmus eq                   # состояние эквалайзера; --on/--off/--preset X/--band N:G/--json
+tmus rate <p>:<id> like|dislike|none   # лайк/дизлайк трека (дизлайк играющего скипает)
+tmus ratings              # локальные рейтинги (маркеры и скрытие — в панели/TUI: f/d, ctrl+d)
 tmus cache warm <playlist> # докачать плейлист в офлайн-кэш в фоне
 tmus events                # поток событий JSON (им пользуется плагин noctalia)
 ```
@@ -98,7 +101,18 @@ profile = "chromium:/path/to/profile"
 
 [providers.ytmusic]
 enabled = true
-```
+# Прямой резолв через InnerTube player (клиент VISIONOS, без yt-dlp,
+# цель <1 с против ~5 с). Выключен: живой обкатки на аккаунте ещё не
+# было; любой негатив молча падает в штатный yt-dlp-путь.
+fast_resolve = false
+
+[equalizer]
+# 10 полос ISO (32..16000 Гц), усиления −15..+15 дБ. Пресеты — как в
+# `tmus eq --preset`; изменив полосы руками, получаешь preset = "Custom".
+# Персистится в queue.json вместе с громкостью — рестарт демона не
+# сбрасывает ни то, ни другое.
+enabled = false
+preset = "Flat"
 
 Discord RPC требует своего приложения: `discord.com/developers/applications`
 → `New Application` → имя (его увидят друзья как «Listening to …») →
