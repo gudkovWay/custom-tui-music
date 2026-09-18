@@ -13,7 +13,7 @@
 //! требует правок ни в одной подсистеме.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use tmus_core::cache::Cache;
 use tmus_core::config::Config;
@@ -341,12 +341,12 @@ impl App {
         }
 
         self.player.resolve_and_play(id).await?;
-        let state = self.player.state().await;
-        self.emit(Event::TrackChanged {
-            track: state.track.clone(),
-            queue_index: state.queue_index,
-        });
-        self.emit(Event::StateChanged { state });
+        // События о смене трека не шлём отсюда: плеер уже дал сигнал
+        // вахтёру, а тот — единственный, кто сравнивает состояние с
+        // прошлым. Дубль здесь давал на один скип два `TrackChanged` и
+        // два `StateChanged` (замерено в потоке `tmus events`), то есть
+        // двойную перерисовку бара, причём первый кадр — без
+        // длительности, которую mpv сообщает позже.
         Ok(())
     }
 
@@ -610,6 +610,24 @@ mod catalog_source_tests {
     }
 }
 
+#[cfg(test)]
+mod progress_throttle_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{should_emit, PROGRESS_INTERVAL};
+
+    #[test]
+    fn interval_boundary_and_final_frame() {
+        let t0 = Instant::now();
+        // Раньше интервала — молчим.
+        assert!(!should_emit(t0, t0 + PROGRESS_INTERVAL - Duration::from_millis(1), false));
+        // Ровно интервал — пора.
+        assert!(should_emit(t0, t0 + PROGRESS_INTERVAL, false));
+        // Завершающий кадр уходит всегда, даже раньше интервала.
+        assert!(should_emit(t0, t0, true));
+    }
+}
+
 /// Вернуть системе страницы, освобождённые аллокатором.
 ///
 /// glibc держит освобождённую память в аренах и сам её не отдаёт, если
@@ -633,26 +651,33 @@ fn release_memory() {
 
 /// Вахтер состояния: рассылает позицию и замечает смену трека.
 ///
-/// Почему опросом, а не подпиской на события mpv: `Player` забирает
-/// приёмник событий себе в конструкторе и сам ведёт переходы по очереди
-/// — второго читателя у `mpsc` быть не может. Диффа раз в секунду хватает:
-/// mpv присылает `time-pos` десятки раз в секунду, и пересылать каждое
-/// значило бы будить всех подписчиков зря, а смену трека бар и Discord
-/// переживут с задержкой до секунды.
+/// Почему не подписка на события mpv: `Player` забирает приёмник себе в
+/// конструкторе и сам ведёт переходы по очереди — второго читателя у
+/// `mpsc` быть не может. Поэтому вахтёр просыпается по двум причинам:
+/// раз в секунду (позиция) и по сигналу `Player::changed`, который
+/// плеер даёт на смену трека, паузу, приехавшую длительность и падение
+/// mpv. Чистый секундный опрос давал замеренный рассинк бара: до
+/// секунды `--:--` вместо длительности и двойная перерисовка на скип.
 ///
 /// Здесь же единственное место, где состояние сравнивается с прошлым:
 /// подписчик получает `TrackChanged` ровно один раз на трек, а не на
-/// каждый тик.
+/// каждый тик — поэтому команды сами событий смены трека не шлют.
 pub async fn run_state_watcher(app: Arc<App>) {
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut last_track: Option<TrackId> = None;
     let mut last_status = PlaybackStatus::Stopped;
+    let mut last_duration: Option<Duration> = None;
     let mut last_queue = (0usize, None);
 
     loop {
-        ticker.tick().await;
+        // Тик нужен позиции, сигнал — всему остальному: первый из двух
+        // и будит цикл.
+        let ticked = tokio::select! {
+            _ = ticker.tick() => true,
+            () = app.player.changed() => false,
+        };
         let state = app.player.state().await;
 
         let track = state.track.as_ref().map(|t| t.id.clone());
@@ -663,10 +688,13 @@ pub async fn run_state_watcher(app: Arc<App>) {
                 queue_index: state.queue_index,
             });
             app.emit(Event::StateChanged { state: state.clone() });
-        } else if state.status != last_status {
+        } else if state.status != last_status || state.duration != last_duration {
+            // Длительность приезжает от mpv позже загрузки, и без её
+            // рассылки бар до следующей смены трека рисовал бы `--:--`.
             app.emit(Event::StateChanged { state: state.clone() });
         }
         last_status = state.status;
+        last_duration = state.duration;
 
         let queue = (state.queue_len, state.queue_index);
         if queue != last_queue {
@@ -674,7 +702,7 @@ pub async fn run_state_watcher(app: Arc<App>) {
             app.emit(Event::QueueChanged { len: queue.0, index: queue.1 });
         }
 
-        if !matches!(state.status, PlaybackStatus::Playing) {
+        if !ticked || !matches!(state.status, PlaybackStatus::Playing) {
             continue;
         }
         if let Some(position) = state.position {
@@ -721,6 +749,22 @@ pub async fn run_cache_filler(app: Arc<App>) {
     }
 }
 
+// Троттлинг прогресса: на chunk'ах по 8 КиБ событие шины уходило на каждый
+// chunk — замерено 490 ev/s (183 события за 0.37 с на файле 3 МБ), а буфер
+// шины всего 256, подписчики уходят в Lagged. Шкала быстрее 2 Гц всё равно
+// никому не видна.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
+
+// Проверка актуальности трека стоит обращений к state()/with_queue, поэтому
+// не на каждый chunk, а не чаще раза в секунду.
+const RELEVANCE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Пора ли слать прогресс: либо прошло не меньше интервала, либо это
+/// завершающий кадр — он обязан уйти всегда, иначе потребитель не увидит 100%.
+fn should_emit(last: Instant, now: Instant, done: bool) -> bool {
+    done || now.duration_since(last) >= PROGRESS_INTERVAL
+}
+
 /// Скачать трек в офлайн-кэш через тот же резолв, что и воспроизведение.
 ///
 /// URL не кэшируется никогда: у googlevideo он живёт около шести часов
@@ -749,13 +793,46 @@ async fn fetch_into_cache(app: &Arc<App>, id: &TrackId) -> anyhow::Result<()> {
     let mut file = tokio::fs::File::create(&partial).await?;
     let mut written: u64 = 0;
     let total = request.content_length();
+    let mut last_emit = Instant::now() - PROGRESS_INTERVAL;
+    let mut last_relevance = Instant::now();
     while let Some(chunk) = request.chunk().await? {
         use tokio::io::AsyncWriteExt as _;
         file.write_all(&chunk).await?;
         written += chunk.len() as u64;
-        app.emit(Event::CacheProgress { track: id.clone(), bytes: written, total });
+
+        let now = Instant::now();
+        if should_emit(last_emit, now, false) {
+            last_emit = now;
+            app.emit(Event::CacheProgress { track: id.clone(), bytes: written, total });
+        }
+
+        // Человек ушёл с трека — докачивать до конца бессмысленно: это лишние
+        // трафик, диск и CPU на события. Проверяем актуальность не чаще раза
+        // в секунду, чтобы не дёргать state()/with_queue на каждом chunk'е.
+        if now.duration_since(last_relevance) >= RELEVANCE_INTERVAL {
+            last_relevance = now;
+            let still_wanted = {
+                let state = app.player.state().await;
+                let current = state.track.as_ref().map(|t| &t.id) == Some(id);
+                let next = app
+                    .player
+                    .with_queue(|q| q.peek_next().map(|t| t.id.clone()))
+                    .await
+                    .as_ref() == Some(id);
+                current || next
+            };
+            if !still_wanted {
+                drop(file);
+                if let Err(err) = tokio::fs::remove_file(&partial).await {
+                    tracing::debug!(%err, "не удалось удалить .part отменённой докачки");
+                }
+                tracing::debug!("докачка отменена: трек больше не текущий и не следующий");
+                return Ok(());
+            }
+        }
     }
     use tokio::io::AsyncWriteExt as _;
+    app.emit(Event::CacheProgress { track: id.clone(), bytes: written, total });
     file.flush().await?;
     drop(file);
     tokio::fs::rename(&partial, &target).await?;
