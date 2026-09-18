@@ -13,18 +13,19 @@
 //! требует правок ни в одной подсистеме.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
 
 use tmus_core::cache::Cache;
 use tmus_core::config::Config;
 use tmus_core::model::{
-    PlaybackStatus, Playlist, PlaylistId, SearchKind, SearchResult, Track, TrackId,
+    PlaybackStatus, PlaylistId, Track, TrackId,
 };
 use tmus_core::paths::Paths;
-use tmus_core::protocol::{Ack, CatalogSource, Cmd, Event, Payload, ProviderView, QueueView};
+use tmus_core::protocol::{Ack, CatalogSource, Cmd, Event, Payload, QueueView};
 use tmus_player::Player;
 use tmus_provider::Registry;
 use tokio::sync::broadcast;
+
+use crate::catalog::resolve_catalog_source;
 
 /// Сколько событий держится в шине для отстающего подписчика.
 ///
@@ -35,8 +36,10 @@ use tokio::sync::broadcast;
 const EVENT_BUFFER: usize = 256;
 
 pub struct App {
-    player: Player,
-    registry: Registry,
+    // доступ модулей filler/watcher после сплита
+    pub(crate) player: Player,
+    // доступ каталожных модулей после сплита
+    pub(crate) registry: Registry,
     /// `rusqlite::Connection` не `Sync` (внутри `RefCell`), поэтому
     /// без замка `Arc<App>` нельзя отдать в `tokio::spawn` — а его
     /// ждут все четыре подсистемы. Замок берётся на один вызов и
@@ -68,7 +71,7 @@ impl App {
         let connected: Vec<String> =
             registry.iter().map(|provider| provider.id().as_str().to_owned()).collect();
         let catalog_source = resolve_catalog_source(saved.as_ref(), connected);
-        Arc::new(Self {
+        let arc = Arc::new(Self {
             player,
             registry,
             cache,
@@ -77,8 +80,11 @@ impl App {
             events,
             catalog_source: std::sync::Mutex::new(catalog_source),
             shutdown: tokio::sync::Notify::new(),
-        })
+        });
+        arc
     }
+
+
 
     pub fn player(&self) -> &Player {
         &self.player
@@ -414,219 +420,8 @@ impl App {
         }
         Ok(out)
     }
-
-    fn providers(&self) -> Vec<ProviderView> {
-        self.registry
-            .iter()
-            .map(|provider| {
-                let account = provider.account();
-                ProviderView {
-                    id: provider.id().as_str().to_owned(),
-                    name: account.display_name().to_owned(),
-                    auth: account.auth(),
-                }
-            })
-            .collect()
-    }
-
-    /// Провайдеры под запрос: назван один — только он, не назван — все.
-    fn targets(&self, provider: Option<&str>) -> anyhow::Result<Vec<&Arc<dyn tmus_provider::Provider>>> {
-        match provider {
-            Some(name) => {
-                let one = self
-                    .registry
-                    .get_by_str(name)
-                    .ok_or_else(|| anyhow::anyhow!("провайдер {name} не подключён"))?;
-                Ok(vec![one])
-            }
-            None => Ok(self.registry.iter().collect()),
-        }
-    }
-
-    async fn search(
-        &self,
-        query: &str,
-        kind: SearchKind,
-        provider: Option<&str>,
-    ) -> anyhow::Result<Vec<SearchResult>> {
-        let mut out = Vec::new();
-        for target in self.targets(provider)? {
-            // Один упавший провайдер не должен обнулять поиск по
-            // остальным: агрегирующий поиск тем и полезен.
-            match target.catalog().search(query, kind).await {
-                Ok(found) => out.extend(found),
-                Err(err) => {
-                    tracing::warn!(provider = %target.id(), %err, "поиск не удался");
-                    self.report_auth(target, &err);
-                }
-            }
-        }
-        self.remember(&out)?;
-        Ok(out)
-    }
-
-    async fn library(&self, provider: Option<&str>) -> anyhow::Result<Vec<Playlist>> {
-        let mut out = Vec::new();
-        for target in self.targets(provider)? {
-            match target.catalog().playlists().await {
-                Ok(found) => out.extend(found),
-                Err(err) => {
-                    tracing::warn!(provider = %target.id(), %err, "библиотека не прочиталась");
-                    self.report_auth(target, &err);
-                }
-            }
-        }
-        if out.is_empty() {
-            // Сеть могла отвалиться целиком — тогда показываем то, что
-            // уже знаем. Это половина смысла офлайн-кэша.
-            out = self.with_cache(|c| c.playlists(provider))?;
-        } else {
-            self.with_cache(|c| c.put_playlists(&out))?;
-        }
-        Ok(out)
-    }
-
-    async fn playlist_tracks(&self, id: &PlaylistId) -> anyhow::Result<Vec<Track>> {
-        let provider = self
-            .registry
-            .get(id.provider)
-            .ok_or_else(|| anyhow::anyhow!("провайдер {} не подключён", id.provider))?;
-        match provider.catalog().playlist_tracks(id).await {
-            Ok(tracks) => {
-                self.with_cache(|c| c.put_playlist_tracks(id, &tracks))?;
-                Ok(tracks)
-            }
-            Err(err) => {
-                tracing::warn!(playlist = %id, %err, "плейлист не прочитался, беру из кэша");
-                self.report_auth(provider, &err);
-                Ok(self.with_cache(|c| c.playlist_tracks(id))?)
-            }
-        }
-    }
-
-    async fn liked(&self, provider: Option<&str>) -> anyhow::Result<Vec<Track>> {
-        let mut out = Vec::new();
-        for target in self.targets(provider)? {
-            match target.catalog().liked().await {
-                Ok(found) => out.extend(found),
-                Err(err) => {
-                    tracing::warn!(provider = %target.id(), %err, "лайки не прочитались");
-                    self.report_auth(target, &err);
-                }
-            }
-        }
-        if !out.is_empty() {
-            self.with_cache(|c| c.put_tracks(&out))?;
-        }
-        Ok(out)
-    }
-
-    fn remember(&self, results: &[SearchResult]) -> anyhow::Result<()> {
-        let tracks: Vec<Track> = results
-            .iter()
-            .filter_map(|r| match r {
-                SearchResult::Track(track) => Some(track.clone()),
-                _ => None,
-            })
-            .collect();
-        if !tracks.is_empty() {
-            self.with_cache(|c| c.put_tracks(&tracks))?;
-        }
-        Ok(())
-    }
-
-    /// Отвалившаяся авторизация обязана дойти до бара событием, а не
-    /// всплыть позже невнятным «bot check» при попытке что-то включить.
-    fn report_auth(&self, provider: &Arc<dyn tmus_provider::Provider>, err: &tmus_provider::ProviderError) {
-        if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
-            self.emit(Event::AuthChanged {
-                provider: provider.id().as_str().to_owned(),
-                auth: provider.account().auth(),
-            });
-        }
-    }
 }
 
-pub fn resolve_catalog_source(
-    saved: Option<&CatalogSource>,
-    connected: Vec<String>,
-) -> CatalogSource {
-    match saved {
-        Some(source)
-            if source
-                .provider
-                .as_deref()
-                .is_none_or(|provider| connected.iter().any(|known| known == provider)) =>
-        {
-            source.clone()
-        }
-        _ => CatalogSource { provider: connected.into_iter().next() },
-    }
-}
-
-#[cfg(test)]
-mod catalog_source_tests {
-    use tmus_core::protocol::CatalogSource;
-
-    use super::resolve_catalog_source;
-
-    #[test]
-    fn saved_provider_is_kept() {
-        let saved = CatalogSource { provider: Some("soundcloud".into()) };
-        assert_eq!(
-            resolve_catalog_source(Some(&saved), vec!["ytmusic".into(), "soundcloud".into()]),
-            saved
-        );
-    }
-
-    #[test]
-    fn invalid_saved_provider_falls_back_to_first_connected() {
-        let saved = CatalogSource { provider: Some("spotify".into()) };
-        assert_eq!(
-            resolve_catalog_source(Some(&saved), vec!["ytmusic".into(), "soundcloud".into()]),
-            CatalogSource { provider: Some("ytmusic".into()) }
-        );
-    }
-
-    #[test]
-    fn saved_all_is_kept() {
-        let saved = CatalogSource { provider: None };
-        assert_eq!(
-            resolve_catalog_source(Some(&saved), vec!["ytmusic".into()]),
-            CatalogSource { provider: None }
-        );
-    }
-
-    #[test]
-    fn no_saved_source_selects_first_connected_or_all() {
-        assert_eq!(
-            resolve_catalog_source(None, Vec::new()),
-            CatalogSource { provider: None }
-        );
-        assert_eq!(
-            resolve_catalog_source(None, vec!["soundcloud".into()]),
-            CatalogSource { provider: Some("soundcloud".into()) }
-        );
-    }
-}
-
-#[cfg(test)]
-mod progress_throttle_tests {
-    use std::time::{Duration, Instant};
-
-    use super::{should_emit, PROGRESS_INTERVAL};
-
-    #[test]
-    fn interval_boundary_and_final_frame() {
-        let t0 = Instant::now();
-        // Раньше интервала — молчим.
-        assert!(!should_emit(t0, t0 + PROGRESS_INTERVAL - Duration::from_millis(1), false));
-        // Ровно интервал — пора.
-        assert!(should_emit(t0, t0 + PROGRESS_INTERVAL, false));
-        // Завершающий кадр уходит всегда, даже раньше интервала.
-        assert!(should_emit(t0, t0, true));
-    }
-}
 
 /// Вернуть системе страницы, освобождённые аллокатором.
 ///
@@ -640,7 +435,7 @@ mod progress_throttle_tests {
 ///
 /// Функция специфична для glibc; на других аллокаторах она просто
 /// ничего не сделает и вернёт 0.
-fn release_memory() {
+pub(crate) fn release_memory() {
     // SAFETY: malloc_trim не принимает указателей и не имеет
     // предусловий; аргумент — сколько байт оставить в запасе на вершине
     // кучи, 0 значит «вернуть всё, что можно».
@@ -648,230 +443,3 @@ fn release_memory() {
         libc::malloc_trim(0);
     }
 }
-
-/// Вахтер состояния: рассылает позицию и замечает смену трека.
-///
-/// Почему не подписка на события mpv: `Player` забирает приёмник себе в
-/// конструкторе и сам ведёт переходы по очереди — второго читателя у
-/// `mpsc` быть не может. Поэтому вахтёр просыпается по двум причинам:
-/// раз в секунду (позиция) и по сигналу `Player::changed`, который
-/// плеер даёт на смену трека, паузу, приехавшую длительность и падение
-/// mpv. Чистый секундный опрос давал замеренный рассинк бара: до
-/// секунды `--:--` вместо длительности и двойная перерисовка на скип.
-///
-/// Здесь же единственное место, где состояние сравнивается с прошлым:
-/// подписчик получает `TrackChanged` ровно один раз на трек, а не на
-/// каждый тик — поэтому команды сами событий смены трека не шлют.
-pub async fn run_state_watcher(app: Arc<App>) {
-    let mut ticker = tokio::time::interval(Duration::from_secs(1));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    let mut last_track: Option<TrackId> = None;
-    let mut last_status = PlaybackStatus::Stopped;
-    let mut last_duration: Option<Duration> = None;
-    let mut last_queue = (0usize, None);
-
-    loop {
-        // Тик нужен позиции, сигнал — всему остальному: первый из двух
-        // и будит цикл.
-        let ticked = tokio::select! {
-            _ = ticker.tick() => true,
-            () = app.player.changed() => false,
-        };
-        let state = app.player.state().await;
-
-        let track = state.track.as_ref().map(|t| t.id.clone());
-        if track != last_track {
-            last_track = track;
-            app.emit(Event::TrackChanged {
-                track: state.track.clone(),
-                queue_index: state.queue_index,
-            });
-            app.emit(Event::StateChanged { state: state.clone() });
-        } else if state.status != last_status || state.duration != last_duration {
-            // Длительность приезжает от mpv позже загрузки, и без её
-            // рассылки бар до следующей смены трека рисовал бы `--:--`.
-            app.emit(Event::StateChanged { state: state.clone() });
-        }
-        last_status = state.status;
-        last_duration = state.duration;
-
-        let queue = (state.queue_len, state.queue_index);
-        if queue != last_queue {
-            last_queue = queue;
-            app.emit(Event::QueueChanged { len: queue.0, index: queue.1 });
-        }
-
-        if !ticked || !matches!(state.status, PlaybackStatus::Playing) {
-            continue;
-        }
-        if let Some(position) = state.position {
-            app.emit(Event::Position { position, duration: state.duration });
-        }
-    }
-}
-
-/// Сколько треков вперёд докачивает фоновый филлер. Глубина 3, а не 1:
-/// скип-серия и пара треков вперёд не должны натыкаться на ~5-секундный
-/// yt-dlp (замер 18.09: закэшированный старт — 8 мс). Дальше трёх —
-/// лишний трафик на дальний прогноз при смене настроения слушателя.
-const PREFETCH_DEPTH: usize = 3;
-/// Фоновая докачка в офлайн-кэш.
-///
-/// Хозяин заказал офлайн явно, и «скачать по требованию» его не закрывает:
-/// нужен трек, который уже слушали. Поэтому играемый трек кладётся на
-/// диск, а следующий в очереди докачивается заранее.
-pub async fn run_cache_filler(app: Arc<App>) {
-    let mut ticker = tokio::time::interval(Duration::from_secs(5));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        ticker.tick().await;
-
-        let wanted = {
-            let state = app.player.state().await;
-            let current = state.track.map(|t| t.id);
-            // Глубина 3, а не 1: скип-серия и просто пара треков вперёд
-            // не должны натыкаться на ~5-секундный yt-dlp (замер:
-            // закэшированный старт 8 мс). Дальше трёх — лишний трафик
-            // на дальний прогноз при смене настроения слушателя.
-            let ahead = app
-                .player
-                .with_queue(|q| q.peek_ahead(PREFETCH_DEPTH).into_iter().map(|t| t.id).collect::<Vec<_>>())
-                .await;
-            let mut wanted: Vec<TrackId> = Vec::with_capacity(1 + ahead.len());
-            wanted.extend(current);
-            wanted.extend(ahead);
-            wanted
-        };
-
-        for id in wanted {
-            match app.with_cache(|c| c.lookup_audio(&id)) {
-                Ok(Some(_)) => continue,
-                Ok(None) => {}
-                Err(err) => {
-                    tracing::warn!(%err, "кэш не опрашивается");
-                    continue;
-                }
-            }
-            if let Err(err) = fetch_into_cache(&app, &id).await {
-                tracing::warn!(track = %id, %err, "докачка не удалась");
-            }
-        }
-
-        if let Err(err) = app.with_cache(|c| c.gc()) {
-            tracing::warn!(%err, "вытеснение кэша не удалось");
-        }
-    }
-}
-
-// Троттлинг прогресса: на chunk'ах по 8 КиБ событие шины уходило на каждый
-// chunk — замерено 490 ev/s (183 события за 0.37 с на файле 3 МБ), а буфер
-// шины всего 256, подписчики уходят в Lagged. Шкала быстрее 2 Гц всё равно
-// никому не видна.
-const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
-
-// Проверка актуальности трека стоит обращений к state()/with_queue, поэтому
-// не на каждый chunk, а не чаще раза в секунду.
-const RELEVANCE_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Пора ли слать прогресс: либо прошло не меньше интервала, либо это
-/// завершающий кадр — он обязан уйти всегда, иначе потребитель не увидит 100%.
-fn should_emit(last: Instant, now: Instant, done: bool) -> bool {
-    done || now.duration_since(last) >= PROGRESS_INTERVAL
-}
-
-/// Скачать трек в офлайн-кэш через тот же резолв, что и воспроизведение.
-///
-/// URL не кэшируется никогда: у googlevideo он живёт около шести часов
-/// (`expire=`). Кэшируется файл.
-async fn fetch_into_cache(app: &Arc<App>, id: &TrackId) -> anyhow::Result<()> {
-    let resolver = app.registry.resolver_for(id)?;
-    let source = resolver.resolve(id).await?;
-    let tmus_core::model::StreamSource::Remote { url, user_agent, expires_at } = &source else {
-        // Уже локальный — значит кэш опередил нас, докачивать нечего.
-        return Ok(());
-    };
-    if source.is_expired(SystemTime::now()) {
-        anyhow::bail!("резолв истёк до начала загрузки");
-    }
-
-    let ext = "webm";
-    let target = app.with_cache(|c| c.audio_path(id, ext));
-    if let Some(parent) = target.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-
-    // Пишем в соседний файл и переименовываем: оборванная загрузка не
-    // должна попасть в кэш как готовый трек — она игралась бы обрезанной.
-    let partial = target.with_extension(format!("{ext}.part"));
-    let mut request = reqwest_get(url, user_agent.as_deref()).await?;
-    let mut file = tokio::fs::File::create(&partial).await?;
-    let mut written: u64 = 0;
-    let total = request.content_length();
-    let mut last_emit = Instant::now() - PROGRESS_INTERVAL;
-    let mut last_relevance = Instant::now();
-    while let Some(chunk) = request.chunk().await? {
-        use tokio::io::AsyncWriteExt as _;
-        file.write_all(&chunk).await?;
-        written += chunk.len() as u64;
-
-        let now = Instant::now();
-        if should_emit(last_emit, now, false) {
-            last_emit = now;
-            app.emit(Event::CacheProgress { track: id.clone(), bytes: written, total });
-        }
-
-        // Человек ушёл с трека — докачивать до конца бессмысленно: это лишние
-        // трафик, диск и CPU на события. Проверяем актуальность не чаще раза
-        // в секунду, чтобы не дёргать state()/with_queue на каждом chunk'е.
-        if now.duration_since(last_relevance) >= RELEVANCE_INTERVAL {
-            last_relevance = now;
-            let still_wanted = {
-                let state = app.player.state().await;
-                let current = state.track.as_ref().map(|t| &t.id) == Some(id);
-                let next = app
-                    .player
-                    .with_queue(|q| q.peek_next().map(|t| t.id.clone()))
-                    .await
-                    .as_ref() == Some(id);
-                current || next
-            };
-            if !still_wanted {
-                drop(file);
-                if let Err(err) = tokio::fs::remove_file(&partial).await {
-                    tracing::debug!(%err, "не удалось удалить .part отменённой докачки");
-                }
-                tracing::debug!("докачка отменена: трек больше не текущий и не следующий");
-                return Ok(());
-            }
-        }
-    }
-    use tokio::io::AsyncWriteExt as _;
-    app.emit(Event::CacheProgress { track: id.clone(), bytes: written, total });
-    file.flush().await?;
-    drop(file);
-    tokio::fs::rename(&partial, &target).await?;
-
-    app.with_cache(|c| c.register_audio(id, &target, ext))?;
-    let _ = expires_at;
-    Ok(())
-}
-
-/// Загрузка с ровно одним заголовком.
-///
-/// Передаём только `User-Agent`, как и в mpv: остальные заголовки
-/// yt-dlp содержат запятые, и mpv их разрезает, отчего googlevideo
-/// отвечает `400`. Здесь разрезать нечему, но набор заголовков держим
-/// одинаковым — иначе кэш и воспроизведение расходились бы в том, что
-/// именно сервер считает валидным запросом.
-async fn reqwest_get(url: &str, user_agent: Option<&str>) -> anyhow::Result<reqwest::Response> {
-    let client = reqwest::Client::builder().build()?;
-    let mut request = client.get(url);
-    if let Some(ua) = user_agent {
-        request = request.header(reqwest::header::USER_AGENT, ua);
-    }
-    let response = request.send().await?.error_for_status()?;
-    Ok(response)
-}
-
-

@@ -11,10 +11,13 @@
 
 mod app;
 mod cache_layer;
+mod catalog;
 mod control;
+mod filler;
 mod mpris;
 mod rpc;
 mod tray;
+mod watcher;
 
 use std::sync::Arc;
 
@@ -67,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("ни один провайдер не подключён — доступен только офлайн-кэш");
     }
 
+
     let player = Player::new(
         registry.clone(),
         config.mpv.clone(),
@@ -78,15 +82,16 @@ async fn main() -> anyhow::Result<()> {
 
     let app = App::new(player.clone(), registry, cache, config, paths);
 
+
     let mut tasks = tokio::task::JoinSet::new();
 
     // Переходы по очереди ведёт сам `Player` (он забрал приёмник событий
     // mpv в своём конструкторе), поэтому демону нужен не второй цикл, а
     // вахтер: он замечает смену трека опросом и рассылает её
     // подписчикам.
-    tasks.spawn(app::run_state_watcher(app.clone()));
+    tasks.spawn(watcher::run_state_watcher(app.clone()));
     if app.config().cache.prefetch_next {
-        tasks.spawn(app::run_cache_filler(app.clone()));
+        tasks.spawn(filler::run_cache_filler(app.clone()));
     }
 
     // Control-socket — единственная обязательная подсистема: без него
