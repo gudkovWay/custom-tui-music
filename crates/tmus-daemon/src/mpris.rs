@@ -114,6 +114,46 @@ fn build_metadata(track: &Track) -> HashMap<String, Value<'static>> {
     md
 }
 
+// --- свойства из снимка состояния ---
+
+/// Чистые вычисления отдельных свойств из снимка — один источник и для
+/// геттеров, и для пакета `PropertiesChanged`, иначе сигнал и ответ на
+/// запрос свойства рано или поздно разойдутся.
+fn can_go_next_of(state: &PlayerState) -> bool {
+    state.queue_index.is_some_and(|i| i + 1 < state.queue_len)
+}
+
+fn can_go_previous_of(state: &PlayerState) -> bool {
+    state.queue_index.unwrap_or(0) > 0
+}
+
+/// Полный набор свойств для одного `PropertiesChanged` на интерфейсе
+/// `org.mpris.MediaPlayer2.Player`. Замер `dbus-monitor` до коалесинга:
+/// 40 сигналов (4 раунда × 10 свойств) на один `tmus next` — каждое
+/// будило бар noctalia и заставляло перечитывать свойства. Теперь весь
+/// набор уходит одним сообщением; клиент по-прежнему видит те же имена
+/// и может фильтровать по ним, как делает noctalia.
+fn state_properties(state: &PlayerState) -> HashMap<&'static str, Value<'static>> {
+    let mut props: HashMap<&'static str, Value<'static>> = HashMap::new();
+    props.insert("PlaybackStatus", Value::from(state.status.as_mpris().to_owned()));
+    props.insert("LoopStatus", Value::from(state.loop_mode.as_mpris().to_owned()));
+    props.insert("Shuffle", Value::from(state.shuffle));
+    props.insert("Volume", Value::from(volume_to_mpris(state.volume)));
+    props.insert(
+        "Metadata",
+        match state.track.as_ref() {
+            Some(track) => Value::from(build_metadata(track)),
+            None => Value::from(HashMap::<String, Value<'static>>::new()),
+        },
+    );
+    props.insert("CanPlay", Value::from(state.track.is_some()));
+    props.insert("CanPause", Value::from(state.track.is_some()));
+    props.insert("CanSeek", Value::from(state.track.is_some()));
+    props.insert("CanGoNext", Value::from(can_go_next_of(state)));
+    props.insert("CanGoPrevious", Value::from(can_go_previous_of(state)));
+    props
+}
+
 // --- разделяемый кэш состояния ---
 
 /// Кэш снимка состояния для геттеров свойств.
@@ -127,9 +167,18 @@ struct StateCache {
 }
 
 impl StateCache {
-    /// Синхронный снимок. `RwLock` здесь `std`-ый нарочно: геттеры
-    /// свойств у zbus синхронные, и держать замок через `await` нельзя.
-    /// Время удержания — копирование одного снимка, `await` внутри нет.
+    /// Прочитать нужное поле под замком, без копирования снимка.
+    ///
+    /// Оболочка опрашивает `Position` покадрово, и полный `clone()`
+    /// снимка на каждый геттер — это трек, вектор артистов и все
+    /// строки заново: замерено 0.40 % CPU демона в потоке zbus на
+    /// покое. Замыкание синхронное, `await` внутрь не протащить.
+    fn with<R>(&self, f: impl FnOnce(&PlayerState) -> R) -> R {
+        f(&self.state.read().expect("кэш состояния отравлен"))
+    }
+
+    /// Полная копия — только там, где нужен весь снимок сразу
+    /// (пакет `PropertiesChanged`, правка позиции в цикле событий).
     fn snapshot(&self) -> PlayerState {
         self.state.read().expect("кэш состояния отравлен").clone()
     }
@@ -235,8 +284,9 @@ impl PlayerIface {
     /// `track` — путь текущего трека: если клиент получил устаревший
     /// снимок, позицию применять нельзя (позиция другого трека).
     async fn set_position(&self, track: ObjectPath<'_>, position: i64) -> zbus::fdo::Result<()> {
-        let state = self.cache.snapshot();
-        if track == track_object_path(state.track.as_ref()) {
+        let matches_current =
+            self.cache.with(|s| track == track_object_path(s.track.as_ref()));
+        if matches_current {
             let position = u64::try_from(position.max(0)).unwrap_or(0);
             self.cmd(Cmd::Seek { position: Duration::from_micros(position) })
                 .await?;
@@ -254,12 +304,12 @@ impl PlayerIface {
 
     #[zbus(property)]
     fn playback_status(&self) -> zbus::fdo::Result<String> {
-        Ok(self.cache.snapshot().status.as_mpris().to_owned())
+        Ok(self.cache.with(|s| s.status.as_mpris().to_owned()))
     }
 
     #[zbus(property)]
     fn loop_status(&self) -> zbus::fdo::Result<String> {
-        Ok(self.cache.snapshot().loop_mode.as_mpris().to_owned())
+        Ok(self.cache.with(|s| s.loop_mode.as_mpris().to_owned()))
     }
 
     /// Неизвестное значение игнорируем, а не ошибаемся: оболочки иногда
@@ -275,7 +325,7 @@ impl PlayerIface {
 
     #[zbus(property)]
     fn shuffle(&self) -> zbus::fdo::Result<bool> {
-        Ok(self.cache.snapshot().shuffle)
+        Ok(self.cache.with(|s| s.shuffle))
     }
 
     #[zbus(property)]
@@ -285,7 +335,7 @@ impl PlayerIface {
 
     #[zbus(property)]
     fn volume(&self) -> zbus::fdo::Result<f64> {
-        Ok(volume_to_mpris(self.cache.snapshot().volume))
+        Ok(self.cache.with(|s| volume_to_mpris(s.volume)))
     }
 
     /// Пересчёт 0..100 ↔ 0.0..1.0 обязателен в обе стороны: без него
@@ -319,37 +369,33 @@ impl PlayerIface {
     /// сам. Раз в секунду будить всю шину Position-событием — зря.
     #[zbus(property(emits_changed_signal = "false"))]
     fn position(&self) -> zbus::fdo::Result<i64> {
-        Ok(self
-            .cache
-            .snapshot()
-            .position
-            .map_or(0, length_micros))
+        // Самый горячий геттер: оболочка спрашивает позицию покадрово.
+        Ok(self.cache.with(|s| s.position.map_or(0, length_micros)))
     }
 
     #[zbus(property)]
     fn can_play(&self) -> zbus::fdo::Result<bool> {
-        Ok(self.cache.snapshot().track.is_some())
+        Ok(self.cache.with(|s| s.track.is_some()))
     }
 
     #[zbus(property)]
     fn can_pause(&self) -> zbus::fdo::Result<bool> {
-        Ok(self.cache.snapshot().track.is_some())
+        Ok(self.cache.with(|s| s.track.is_some()))
     }
 
     #[zbus(property)]
     fn can_seek(&self) -> zbus::fdo::Result<bool> {
-        Ok(self.cache.snapshot().track.is_some())
+        Ok(self.cache.with(|s| s.track.is_some()))
     }
 
     #[zbus(property)]
     fn can_go_next(&self) -> zbus::fdo::Result<bool> {
-        let s = self.cache.snapshot();
-        Ok(s.queue_index.is_some_and(|i| i + 1 < s.queue_len))
+        Ok(self.cache.with(can_go_next_of))
     }
 
     #[zbus(property)]
     fn can_go_previous(&self) -> zbus::fdo::Result<bool> {
-        Ok(self.cache.snapshot().queue_index.unwrap_or(0) > 0)
+        Ok(self.cache.with(can_go_previous_of))
     }
 
     #[zbus(property)]
@@ -359,12 +405,10 @@ impl PlayerIface {
 
     #[zbus(property)]
     fn metadata(&self) -> zbus::fdo::Result<HashMap<String, Value<'static>>> {
-        let state = self.cache.snapshot();
-        let md = match state.track.as_ref() {
+        Ok(self.cache.with(|s| match s.track.as_ref() {
             Some(track) => build_metadata(track),
             None => HashMap::new(),
-        };
-        Ok(md)
+        }))
     }
 
     /// Единственный сигнал: при смене трека прогресс в панели
@@ -394,23 +438,25 @@ fn mpris_error(err: anyhow::Error) -> zbus::fdo::Error {
 
 // --- цикл событий ---
 
-/// Набор свойств, меняющихся вместе с состоянием. Вызовы идут в один
-/// `PropertiesChanged` на каждое свойство — по одному на шину, зато
-/// клиент может фильтровать по именам, как это делает noctalia.
+/// Один `PropertiesChanged` с полным набором свойств вместо десяти
+/// отдельных сигналов: замер `dbus-monitor` дал 40 сигналов (4 раунда ×
+/// 10 свойств) на один `tmus next`, и каждое будило клиента (bar
+/// noctalia) на перечитывание. Имена в карте — ровно имена геттеров
+/// интерфейса, поэтому фильтрация по свойствам у клиентов продолжает
+/// работать. `Position` в наборе нет: по спецификации он без
+/// уведомлений, клиенты опрашивают его сами.
 async fn notify_state_changed(player_ref: &zbus::object_server::InterfaceRef<PlayerIface>) -> zbus::Result<()> {
-    let emitter = player_ref.signal_emitter();
-    let iface = player_ref.get().await;
-    iface.playback_status_changed(emitter).await?;
-    iface.loop_status_changed(emitter).await?;
-    iface.shuffle_changed(emitter).await?;
-    iface.volume_changed(emitter).await?;
-    iface.metadata_changed(emitter).await?;
-    iface.can_play_changed(emitter).await?;
-    iface.can_pause_changed(emitter).await?;
-    iface.can_seek_changed(emitter).await?;
-    iface.can_go_next_changed(emitter).await?;
-    iface.can_go_previous_changed(emitter).await?;
-    Ok(())
+    let state = {
+        let iface = player_ref.get().await;
+        iface.cache.snapshot()
+    };
+    zbus::fdo::Properties::properties_changed(
+        player_ref.signal_emitter(),
+        zbus::names::InterfaceName::try_from("org.mpris.MediaPlayer2.Player")?,
+        state_properties(&state),
+        std::borrow::Cow::Borrowed(&[]),
+    )
+    .await
 }
 
 pub async fn run(app: Arc<App>) -> anyhow::Result<()> {
@@ -447,36 +493,66 @@ pub async fn run(app: Arc<App>) -> anyhow::Result<()> {
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
         };
 
-        match event {
-            Event::TrackChanged { .. } => {
+        // Коалесинг всплеска: панель noctalia запускает `tmus next` на
+        // каждый клик, и очередь событий приходит пачкой. Всплеск
+        // сворачиваем в два флага и последний снимок — иначе один next
+        // даёт несколько раундов уведомлений (замер: 40 PropertiesChanged
+        // на одно нажатие до коалесинга).
+        let mut needs_notify = false;
+        let mut track_changed = false;
+        let mut last_state: Option<PlayerState> = None;
+        let mut burst: Vec<Event> = vec![event];
+        // Выгребаем всё, что уже лежит в приёмнике: это не ожидание
+        // новых событий, а осушение уже накопленной пачки.
+        while let Ok(event) = rx.try_recv() {
+            burst.push(event);
+        }
+        for event in burst {
+            match event {
+                Event::TrackChanged { .. } => {
+                    track_changed = true;
+                    needs_notify = true;
+                    // Частный снимок StateChanged мог прийти до смены
+                    // трека; надёжнее пересобрать всё из плеера.
+                    last_state = None;
+                }
+                Event::StateChanged { state } => {
+                    needs_notify = true;
+                    last_state = Some(state);
+                }
+                // Частое событие: только в кэш для геттера `Position`.
+                // Сигналом не рассылаем — по спецификации `Position`
+                // без уведомлений, клиенты опрашивают сами.
+                Event::Position { position, duration } => {
+                    let mut state = cache.snapshot();
+                    state.position = Some(position);
+                    if duration.is_some() {
+                        state.duration = duration;
+                    }
+                    cache.store(state);
+                }
+                // Прогресс кэша и авторизация провайдеров в MPRIS не видны.
+                Event::QueueChanged { .. }
+                | Event::CacheProgress { .. }
+                | Event::AuthChanged { .. } => {}
+            }
+        }
+
+        if needs_notify {
+            if track_changed || last_state.is_none() {
                 // Трек сменился внутри плеера; снимок надёжнее частного
                 // события: включает и позицию, и длину нового трека.
                 cache.store(app.player().state().await);
-                notify_state_changed(&player_ref).await?;
+            } else if let Some(state) = last_state {
+                cache.store(state);
+            }
+            notify_state_changed(&player_ref).await?;
+            if track_changed {
                 // Seeked с новой позицией — прогрессбар не продолжает
                 // бежать от старого трека.
-                let position = cache.snapshot().position.map_or(0, length_micros);
+                let position = cache.with(|s| s.position.map_or(0, length_micros));
                 PlayerIface::seeked(player_ref.signal_emitter(), position).await?;
             }
-            Event::StateChanged { state } => {
-                cache.store(state);
-                notify_state_changed(&player_ref).await?;
-            }
-            // Частое событие: только в кэш для геттера `Position`.
-            // Сигналом не рассылаем — по спецификации `Position` без
-            // уведомлений, клиенты опрашивают сами.
-            Event::Position { position, duration } => {
-                let mut state = cache.snapshot();
-                state.position = Some(position);
-                if duration.is_some() {
-                    state.duration = duration;
-                }
-                cache.store(state);
-            }
-            // Прогресс кэша и авторизация провайдеров в MPRIS не видны.
-            Event::QueueChanged { .. }
-            | Event::CacheProgress { .. }
-            | Event::AuthChanged { .. } => {}
         }
     }
 }
@@ -573,6 +649,53 @@ mod tests {
         assert!(!md.contains_key("xesam:album"));
         assert!(!md.contains_key("xesam:url"));
         assert!(!md.contains_key("mpris:artUrl"));
+    }
+
+    /// Сигнал несёт ровно контрактный набор из десяти свойств, и
+    /// `PlaybackStatus` собран из того же источника, что и геттер, —
+    /// иначе сигнал и ответ на запрос свойства расходятся.
+    #[test]
+    fn state_properties_has_full_contract_set() {
+        let mut state = PlayerState {
+            status: tmus_core::model::PlaybackStatus::Playing,
+            track: Some(track("t", vec!["A".into()])),
+            position: None,
+            duration: None,
+            volume: 42.0,
+            loop_mode: LoopMode::Queue,
+            shuffle: true,
+            queue_index: Some(3),
+            queue_len: 10,
+            offline: false,
+        };
+        let props = state_properties(&state);
+        let expected = [
+            "PlaybackStatus",
+            "LoopStatus",
+            "Shuffle",
+            "Volume",
+            "Metadata",
+            "CanPlay",
+            "CanPause",
+            "CanSeek",
+            "CanGoNext",
+            "CanGoPrevious",
+        ];
+        assert_eq!(props.len(), expected.len(), "ровно десять свойств контракта");
+        for name in expected {
+            assert!(props.contains_key(name), "нет свойства {name}");
+        }
+        assert_eq!(
+            props.get("PlaybackStatus"),
+            Some(&Value::from(state.status.as_mpris().to_owned()))
+        );
+        // Геттер `CanGoNext` считает по той же чистой функции.
+        assert_eq!(props.get("CanGoNext"), Some(&Value::from(can_go_next_of(&state))));
+
+        state.track = None;
+        let props = state_properties(&state);
+        assert!(matches!(props.get("Metadata"), Some(Value::Dict(_))));
+        assert_eq!(props.get("CanPlay"), Some(&Value::from(false)));
     }
 
     /// Круговой перевод через MPRIS-имена, включая `Queue` ↔
