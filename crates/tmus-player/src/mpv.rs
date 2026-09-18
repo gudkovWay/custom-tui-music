@@ -376,6 +376,16 @@ impl Mpv {
         self.set_property("volume", json!(volume)).await
     }
 
+    /// Применить цепочку аудиофильтров (`af`). Эквалайзер приходит
+    /// одним lavfi-графом — mpv собирает цепочку биквадов за один
+    /// вызов, а не перенастраивает десять свойств по отдельности.
+    /// Пустой срез очищает `af` целиком: выключенный эквалайзер — это
+    /// отсутствие фильтра, а не фильтр с нулевыми усилениями, который
+    /// продолжал бы тратить CPU.
+    pub async fn set_audio_filter(&self, entries: &[String]) -> Result<(), MpvError> {
+        self.set_property("af", json!(entries)).await
+    }
+
     /// Остановить воспроизведение; благодаря `--idle=yes` процесс живёт.
     pub async fn stop(&self) -> Result<(), MpvError> {
         self.request(vec![json!("stop")]).await?;

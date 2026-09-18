@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use tokio::sync::Mutex;
-use tmus_core::model::{PlaybackStatus, TrackId};
+use tmus_core::model::{EqState, EQ_FREQUENCIES_HZ, EQ_GAIN_LIMIT_DB, PlaybackStatus, TrackId};
 use tmus_core::protocol::PlayerState;
 use tmus_provider::Registry;
 
@@ -43,6 +43,10 @@ struct Inner {
     /// Громкость зеркалируется из конфига и команд; mpv не наблюдается
     /// на ней, поэтому держим свою копию для `state()`.
     volume: Mutex<f64>,
+    /// Состояние эквалайзера — зеркало последнего применённого `af`:
+    /// mpv не наблюдается на фильтрах, поэтому держим свою копию и для
+    /// `state()`, и для слияния частичных команд Equalizer.
+    equalizer: Mutex<EqState>,
     status: Mutex<PlaybackStatus>,
     /// Трек, КОТОРЫЙ ЗАПРОШЕН, но ещё не загружен в mpv. `current`
     /// обновляется только после `mpv.load`, и без этого поля бар
@@ -95,6 +99,29 @@ struct Inner {
     advancing: std::sync::atomic::AtomicBool,
 }
 
+/// Собрать lavfi-граф эквалайзера для mpv-фильтра `af`.
+///
+/// Выключенный эквалайзер — пустой `af` (см. [`Mpv::set_audio_filter`]);
+/// включённый — один фильтр `lavfi` с цепочкой из десяти `equalizer`
+/// (биквад-секций): нулевые полосы НЕ выбрасываются, потому что
+/// пропуск менял бы индексацию в едином графе и усложнял чтение, а
+/// биквад с нулевым усилением стоит копейки.
+///
+/// Отдельная чистая функция — единственная нетривиальная часть
+/// эквалайзера, тестируемая без mpv-процесса.
+pub fn eq_af_graph(eq: &EqState) -> Vec<String> {
+    if !eq.enabled {
+        return Vec::new();
+    }
+    let chain = EQ_FREQUENCIES_HZ
+        .iter()
+        .zip(eq.bands.iter())
+        .map(|(hz, gain)| format!("equalizer=f={hz}:t=q:w=1:g={gain:.1}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    vec![format!("lavfi=[{chain}]")]
+}
+
 /// Пауза покоя после последнего скипа перед запуском трека. Автоповтор
 /// клавиатуры шлёт нажатия каждые ~33–40 мс: за это время серия должна
 /// успеть перевзвести отложенный запуск. Одиночный скип платит те же
@@ -138,6 +165,10 @@ impl Player {
                 duration: Mutex::new(None),
                 paused: Mutex::new(false),
                 volume: Mutex::new(volume),
+                // Эквалайзер стартует выключенным: начальное значение
+                // накладывает демон после `Player::new` (конфиг), затем
+                // персист (сохранённое состояние).
+                equalizer: Mutex::new(EqState::default()),
                 status: Mutex::new(PlaybackStatus::Stopped),
                 pending: Mutex::new(None),
                 preloaded: Mutex::new(None),
@@ -430,6 +461,7 @@ impl Player {
             position,
             duration,
             volume: *self.inner.volume.lock().await,
+            equalizer: self.inner.equalizer.lock().await.clone(),
             loop_mode: queue.loop_mode(),
             shuffle: queue.shuffle(),
             queue_index: index,
@@ -478,6 +510,31 @@ impl Player {
         self.inner.mpv.set_volume(volume).await?;
         *self.inner.volume.lock().await = volume;
         Ok(())
+    }
+
+    /// Применить эквалайзер: полосы клампятся к ±`EQ_GAIN_LIMIT_DB`
+    /// (клиппинг дальше ограничения не наша забота), копия хранится для
+    /// `state()` и слияния частичных команд, граф уходит в mpv одним
+    /// свойством `af`. Порядок «сначала mpv, потом копия» сознательный:
+    /// при ошибке IPC копия остаётся честной — применён не она.
+    pub async fn set_equalizer(&self, eq: EqState) -> Result<(), PlayerError> {
+        let mut eq = eq;
+        for gain in &mut eq.bands {
+            *gain = gain.clamp(-EQ_GAIN_LIMIT_DB, EQ_GAIN_LIMIT_DB);
+        }
+        self.inner.mpv.set_audio_filter(&eq_af_graph(&eq)).await?;
+        *self.inner.equalizer.lock().await = eq;
+        Ok(())
+    }
+
+    /// Текущее состояние эквалайзера (клон из мьютекса).
+    pub async fn equalizer(&self) -> EqState {
+        self.inner.equalizer.lock().await.clone()
+    }
+
+    /// Текущая громкость (клон из мьютекса) — персисту и вахтёру.
+    pub async fn volume(&self) -> f64 {
+        *self.inner.volume.lock().await
     }
 
     /// Очередь — для команд демона (`queue_append`, `queue_goto`, …).
@@ -604,7 +661,7 @@ impl Player {
     async fn on_track_end(&self) {
         let next = {
             let mut queue = self.inner.queue.lock().await;
-            queue.next().map(|t| t.id.clone())
+            queue.next_natural().map(|t| t.id.clone())
         };
         *self.inner.position.lock().await = None;
         match next {
@@ -641,3 +698,40 @@ impl Player {
         Ok(resolver.resolve(track_id).await?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Выключенный эквалайзер обязан давать пустой `af`: фильтр с
+    /// нулевыми усилениями продолжал бы тратить CPU без смысла.
+    #[test]
+    fn disabled_eq_gives_empty_filter() {
+        let eq = EqState { enabled: false, ..EqState::default() };
+        assert!(eq_af_graph(&eq).is_empty());
+    }
+
+    /// Включённый эквалайзер — ровно один элемент `af` (единый lavfi
+    /// граф) с десятью equalizer-фильтрами; нулевые полосы не
+    /// выбрасываются, индексация полос остаётся стабильной.
+    #[test]
+    fn enabled_eq_gives_one_filter_with_ten_bands() {
+        let eq = EqState { enabled: true, ..EqState::default() };
+        let graph = eq_af_graph(&eq);
+        assert_eq!(graph.len(), 1);
+        assert_eq!(graph[0].matches("equalizer=").count(), 10, "граф: {:?}", graph[0]);
+        assert!(graph[0].starts_with("lavfi=["), "граф: {:?}", graph[0]);
+    }
+
+    /// Усиление форматируется с одной десятичной: устойчивая строка
+    /// графа важна для логов и для сравнения в тестах персиста.
+    #[test]
+    fn gains_formatted_with_one_decimal() {
+        let eq = EqState { enabled: true, bands: [3.0, -1.24, 0.0, 15.0, 0.0, 0.0, 0.0, 0.0, 0.0, -15.0], ..EqState::default() };
+        let graph = eq_af_graph(&eq);
+        assert!(graph[0].contains("f=32:t=q:w=1:g=3.0"), "граф: {:?}", graph[0]);
+        assert!(graph[0].contains("f=64:t=q:w=1:g=-1.2"), "граф: {:?}", graph[0]);
+        assert!(graph[0].contains("f=16000:t=q:w=1:g=-15.0"), "граф: {:?}", graph[0]);
+    }
+}
+
