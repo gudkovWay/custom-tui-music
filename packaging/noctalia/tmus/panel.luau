@@ -16,6 +16,8 @@ local FONT = "Agave Nerd Font"
 local RAIL = 64
 local GAP = 12
 local PAD = 16
+local LIST_WINDOW = 10
+local CARD_WINDOW = 12
 
 local VIEWS = {
   { id = "home", title = "Home", glyph = "home" },
@@ -54,6 +56,7 @@ local SEARCH_KIND_TOKENS = { all = "all", track = "tracks", artist = "artists", 
 local snapshot = {}
 local view = "home"
 local cursor = 1
+local windowTop = 1
 local selected = nil
 local playlistId = ""
 local playlistTitle = ""
@@ -65,11 +68,11 @@ local lastSearchSerial = nil
 local doSearch -- defined below; used by chips and submitSearch
 
 local function poke(event, payload)
-  local cmd = "noctalia msg plugin " .. SERVICE .. " all " .. event
+  local argv = { "noctalia", "msg", "plugin", SERVICE, "all", event }
   if payload then
-    cmd = cmd .. " " .. payload
+    table.insert(argv, payload)
   end
-  noctalia.runAsync(cmd)
+  noctalia.runAsync(argv)
 end
 
 local function clock(seconds)
@@ -451,12 +454,54 @@ local function rows()
   return out
 end
 
+local function windowSize()
+  return view == "library" and CARD_WINDOW or LIST_WINDOW
+end
+
+local function clampCursor(items)
+  local count = #items
+  if count == 0 then
+    cursor = 1
+    windowTop = 1
+    return
+  end
+  if cursor < 1 then
+    cursor = 1
+  elseif cursor > count then
+    cursor = count
+  end
+  local maxTop = math.max(1, count - windowSize() + 1)
+  if windowTop < 1 then
+    windowTop = 1
+  elseif windowTop > maxTop then
+    windowTop = maxTop
+  end
+  if cursor < windowTop then
+    windowTop = cursor
+  elseif cursor >= windowTop + windowSize() then
+    windowTop = cursor - windowSize() + 1
+  end
+  if windowTop > maxTop then
+    windowTop = maxTop
+  end
+end
+
+local function visibleWindow(items)
+  local out = {}
+  local last = math.min(windowTop + windowSize() - 1, #items)
+  for i = windowTop, last do
+    table.insert(out, items[i])
+  end
+  return out, windowTop
+end
+
 local function openPlaylist(row)
   playlistTitle = row.openTitle or row.title
   playlistId = row.open
   playlistArtPath = row.openArt or ""
   view = "playlist"
   cursor = 1
+  windowTop = 1
   poke("tracks", row.open)
 end
 
@@ -483,25 +528,16 @@ local function move(delta)
   elseif cursor > #items then
     cursor = 1
   end
+  clampCursor(items)
   selected = items[cursor]
 end
 
 local function setView(id)
   view = id
   cursor = 1
+  windowTop = 1
   selected = nil
   searching = false
-end
-
-local function cycleView(step)
-  local i = VIEW_IDS[view] or 1
-  i = i + step
-  if i < 1 then
-    i = #VIEWS
-  elseif i > #VIEWS then
-    i = 1
-  end
-  setView(VIEWS[i].id)
 end
 
 local function railNode()
@@ -510,6 +546,7 @@ local function railNode()
     local active = view == v.id or (view == "playlist" and v.id == "library")
     table.insert(items, ui.column({
       key = "rail-" .. v.id,
+      width = 48,
       gap = 2,
       align = "center",
       paddingV = 8,
@@ -520,7 +557,9 @@ local function railNode()
         draw()
       end,
     }, {
-      ui.glyph({ key = "rail-glyph-" .. v.id, name = v.glyph, color = active and COLORS.accent or COLORS.muted }),
+      ui.row({ key = "rail-box-" .. v.id, width = 16, height = 16, align = "center" }, {
+        ui.glyph({ key = "rail-glyph-" .. v.id, name = v.glyph, size = 16, color = active and COLORS.accent or COLORS.muted }),
+      }),
       lbl(v.title, { key = "rail-label-" .. v.id, size = 10, color = active and COLORS.text or COLORS.muted }),
     }))
   end
@@ -582,10 +621,15 @@ local function contextTitle(text)
   return lbl(text, { key = "ctx-title", size = 12, color = COLORS.muted })
 end
 
-local function listChildren(items)
+local function listChildren(slice, first)
   local children = {}
   local lastKind = nil
-  for i, row in ipairs(items) do
+  if view == "search" and first > 1 then
+    local prior = rows()[first - 1]
+    lastKind = prior and prior.kind or nil
+  end
+  for k, row in ipairs(slice) do
+    local i = first + k - 1
     if view == "search" and row.kind ~= lastKind then
       table.insert(children, lbl(GROUP_TITLES[row.kind] or row.kind, {
         key = "group-" .. row.kind,
@@ -725,10 +769,10 @@ local function homeWorkspace(s)
   return card(children, { key = "now-playing", grow = 1, gap = 16 })
 end
 
-local function playlistCards(s)
+local function playlistCards(slice, first)
   local cards = {}
-  local items = rows()
-  for i, row in ipairs(items) do
+  for k, row in ipairs(slice) do
+    local i = first + k - 1
     table.insert(cards, ui.column({
       key = "pl" .. i,
       width = 168,
@@ -934,9 +978,8 @@ end
 function draw()
   local s = snapshot
   local items = rows()
-  if cursor > #items then
-    cursor = math.max(1, #items)
-  end
+  clampCursor(items)
+  local slice, first = visibleWindow(items)
 
   local workspace = nil
   local context = nil
@@ -961,8 +1004,8 @@ function draw()
     if state then
       table.insert(body, state)
     else
-      table.insert(body, ui.scroll({ key = "results", flexGrow = 1 }, {
-        ui.column({ key = "results-list", gap = 6 }, listChildren(items)),
+      table.insert(body, ui.scroll({ key = "results-" .. first, flexGrow = 1 }, {
+        ui.column({ key = "results-list", gap = 6 }, listChildren(slice, first)),
       }))
     end
     workspace = ui.column({ key = "ws", gap = GAP, flexGrow = 63 }, {
@@ -986,8 +1029,8 @@ function draw()
     if state then
       table.insert(body, state)
     else
-      table.insert(body, ui.scroll({ key = "library-scroll", flexGrow = 1 }, {
-        ui.column({ key = "library-grid", gap = GAP }, playlistCards(s)),
+      table.insert(body, ui.scroll({ key = "library-scroll-" .. first, flexGrow = 1 }, {
+        ui.column({ key = "library-grid", gap = GAP }, playlistCards(slice, first)),
       }))
     end
     workspace = ui.column({ key = "ws", gap = GAP, flexGrow = 7 }, {
@@ -1008,8 +1051,8 @@ function draw()
     if state then
       table.insert(body, state)
     else
-      table.insert(body, ui.scroll({ key = "playlist-scroll", flexGrow = 1 }, {
-        ui.column({ key = "playlist-list", gap = 4 }, listChildren(items)),
+      table.insert(body, ui.scroll({ key = "playlist-scroll-" .. first, flexGrow = 1 }, {
+        ui.column({ key = "playlist-list", gap = 4 }, listChildren(slice, first)),
       }))
     end
     workspace = ui.column({ key = "ws", gap = GAP, flexGrow = 7 }, {
@@ -1023,8 +1066,8 @@ function draw()
     if state then
       table.insert(body, state)
     else
-      table.insert(body, ui.scroll({ key = "queue-scroll", flexGrow = 1 }, {
-        ui.column({ key = "queue-list", gap = 4 }, listChildren(items)),
+      table.insert(body, ui.scroll({ key = "queue-scroll-" .. first, flexGrow = 1 }, {
+        ui.column({ key = "queue-list", gap = 4 }, listChildren(slice, first)),
       }))
     end
     workspace = ui.column({ key = "ws", gap = GAP, flexGrow = 7 }, {
@@ -1038,8 +1081,8 @@ function draw()
     if state then
       table.insert(body, state)
     else
-      table.insert(body, ui.scroll({ key = "clients-scroll", flexGrow = 1 }, {
-        ui.column({ key = "clients-list", gap = 6 }, listChildren(items)),
+      table.insert(body, ui.scroll({ key = "clients-scroll-" .. first, flexGrow = 1 }, {
+        ui.column({ key = "clients-list", gap = 6 }, listChildren(slice, first)),
       }))
     end
     workspace = ui.column({ key = "ws", gap = GAP, flexGrow = 7 }, {
@@ -1066,7 +1109,7 @@ function draw()
   })
 
   local footer = lbl(
-    "1–5 views · j/k move · Return open · Space play/pause · h/l back/deep · / search · "
+    "ctrl+j/k views · 1–5 views · j/k move · Return open · Space play/pause · h/l back/deep · / search · "
       .. "n/p track · r repeat · s shuffle · o terminal · g ends",
     { key = "footer", size = 11, color = COLORS.muted }
   )
@@ -1076,6 +1119,7 @@ function draw()
     gap = GAP,
     padding = PAD,
     fill = COLORS.bg,
+    flexGrow = 1,
   }, {
     ui.row({ key = "body", gap = GAP, flexGrow = 1 }, { railNode(), main }),
     footer,
@@ -1089,24 +1133,127 @@ local function handleViewKeys(key)
       if row and row.open then
         openPlaylist(row)
       end
-    elseif view ~= "playlist" then
-      cycleView(1)
     end
   elseif key == "h" then
     if view == "playlist" then
       setView("library")
-    else
-      cycleView(-1)
     end
+  end
+end
+
+local NAV_DELAY_MS = 350
+local NAV_REPEAT_MS = 80
+local MEDIA_DELAY_MS = 500
+local MEDIA_REPEAT_MS = 500
+local MAX_HOLD_MS = 6000
+
+local held = nil
+local heldMs = 0
+local heldFired = 0
+
+local function startHold(chord, action)
+  held = { chord = chord, action = action }
+  heldMs = 0
+  heldFired = 0
+  panel.setNeedsFrameTick(true)
+end
+
+local function endHold()
+  held = nil
+  panel.setNeedsFrameTick(false)
+end
+
+local function isMediaAction(action)
+  return action == "next" or action == "prev"
+end
+
+local function runHeld()
+  local action = held.action
+  if action == "down" then
+    move(1)
+    return true
+  elseif action == "up" then
+    move(-1)
+    return true
+  elseif action == "h" or action == "l" then
+    handleViewKeys(action)
+    return true
+  elseif action == "next" then
+    poke("next")
+    return false
+  elseif action == "prev" then
+    poke("prev")
+    return false
+  end
+  return false
+end
+
+function onFrameTick(deltaMs)
+  if not held then
+    return
+  end
+  heldMs = heldMs + (deltaMs or 0)
+  if heldMs >= MAX_HOLD_MS then
+    endHold()
+    return
+  end
+  local delay = isMediaAction(held.action) and MEDIA_DELAY_MS or NAV_DELAY_MS
+  local interval = isMediaAction(held.action) and MEDIA_REPEAT_MS or NAV_REPEAT_MS
+  if heldMs < delay then
+    return
+  end
+  local due = math.floor((heldMs - delay) / interval) + 1
+  local owed = due - heldFired
+  if owed <= 0 then
+    return
+  end
+  heldFired = due
+  local needsDraw = false
+  for _ = 1, owed do
+    if runHeld() then
+      needsDraw = true
+    end
+  end
+  if needsDraw then
+    draw()
   end
 end
 
 function onKey(chord, pressed)
   if not pressed then
+    if held and held.chord == chord then
+      endHold()
+    end
+    return
+  end
+
+  if held and held.chord == chord then
     return
   end
 
   local key = LAYOUT[chord] or chord
+
+  if chord == "ctrl+j" or chord == "ctrl+Cyrillic_o" or chord == "ctrl+k" or chord == "ctrl+Cyrillic_el" then
+    local forward = chord == "ctrl+j" or chord == "ctrl+Cyrillic_o"
+    local section = view == "playlist" and "library" or view
+    local i = VIEW_IDS[section] or 1
+    i = i + (forward and 1 or -1)
+    if i < 1 then
+      i = #VIEWS
+    elseif i > #VIEWS then
+      i = 1
+    end
+    setView(VIEWS[i].id)
+    draw()
+    return
+  end
+
+  if chord == "XF86AudioNext" or chord == "XF86AudioPrev" then
+    local action = chord == "XF86AudioNext" and "next" or "prev"
+    poke(action)
+    startHold(chord, action)
+    return
+  end
 
   if chord == "Escape" then
     panel.close()
@@ -1123,9 +1270,15 @@ function onKey(chord, pressed)
     poke("next")
   elseif key == "p" then
     poke("prev")
-  elseif key == "j" or chord == "Down" then
+  elseif key == "j" then
     move(1)
-  elseif key == "k" or chord == "Up" then
+    startHold(chord, "down")
+  elseif chord == "Down" then
+    move(1)
+  elseif key == "k" then
+    move(-1)
+    startHold(chord, "up")
+  elseif chord == "Up" then
     move(-1)
   elseif key == "h" or key == "l" or chord == "Left" or chord == "Right" then
     if chord == "Left" then
@@ -1134,6 +1287,9 @@ function onKey(chord, pressed)
       key = "l"
     end
     handleViewKeys(key)
+    if chord ~= "Left" and chord ~= "Right" then
+      startHold(chord, key)
+    end
   elseif chord == "1" or chord == "2" or chord == "3" or chord == "4" or chord == "5" then
     setView(VIEWS[tonumber(chord)].id)
   elseif key == "g" then
@@ -1165,6 +1321,10 @@ end
 function onOpen()
   poke("refresh")
   refresh(noctalia.state.get(KEY))
+end
+
+function onClose()
+  endHold()
 end
 
 function doSearch()

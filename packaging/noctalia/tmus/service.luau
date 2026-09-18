@@ -204,7 +204,7 @@ local function applyState(state)
   end
 end
 
-local function call(args, onOk, onDone)
+local function call(args, onOk, onDone, disconnectOnError)
   local argv = { TMUS }
   for _, a in ipairs(args) do
     table.insert(argv, a)
@@ -213,7 +213,9 @@ local function call(args, onOk, onDone)
     if not res or res.exitCode ~= 0 then
       local why = res and noctalia.string.trim(res.stderr or "") or ""
       data.error = why ~= "" and why or "tmus не ответил"
-      data.linked = false
+      if disconnectOnError == true then
+        data.linked = false
+      end
       if onDone then
         onDone()
       end
@@ -239,7 +241,7 @@ end
 local function pullStatus()
   call({ "status", "--json" }, function(got)
     applyState(got)
-  end)
+  end, nil, true)
 end
 
 local function pullProviders()

@@ -1,7 +1,7 @@
 id = "q/tmus"
 name = "Музыка"
 version = "0.3.0"
-plugin_api = 18
+plugin_api = 24
 author = "q"
 license = "MIT"
 dependencies = []
@@ -30,6 +30,8 @@ width = 1180
 height = 760
 capture_keys = [
   "Left", "Right", "Up", "Down", "Return", "Escape", "Space", "slash",
+  "ctrl+j", "ctrl+k", "ctrl+Cyrillic_o", "ctrl+Cyrillic_el",
+  "XF86AudioNext", "XF86AudioPrev",
   "G", "H", "J", "K", "L", "N", "O", "P", "R", "S",
   "1", "2", "3", "4", "5",
   "Cyrillic_pe", "Cyrillic_er", "Cyrillic_o", "Cyrillic_el", "Cyrillic_de",
