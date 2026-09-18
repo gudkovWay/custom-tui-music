@@ -13,7 +13,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 
@@ -114,6 +114,45 @@ impl Nav {
     }
 }
 
+/// Пикер плейлистов (`a` на треке): список «+ New playlist…» плюс
+/// библиотечные плейлисты. `input` — режим ввода имени нового
+/// плейлиста; в нём j/k и выбор пунктов не работают до Enter/Esc.
+struct PlaylistPicker {
+    sel: usize,
+    input: Option<String>,
+}
+
+impl PlaylistPicker {
+    fn new() -> Self {
+        Self { sel: 0, input: None }
+    }
+
+    /// Пункт 0 — «создать новый», остальные — плейлисты библиотеки.
+    fn move_cursor(&mut self, delta: i64, playlists_len: usize) {
+        let len = playlists_len + 1;
+        if len == 0 {
+            return;
+        }
+        let next = (self.sel as i64 + delta).clamp(0, len as i64 - 1);
+        self.sel = next as usize;
+    }
+
+    fn is_new_selected(&self) -> bool {
+        self.sel == 0
+    }
+
+    fn begin_input(&mut self) {
+        self.input = Some(String::new());
+    }
+
+    /// Готовое имя, если введено что-то кроме пробелов; иначе режим
+    /// ввода остаётся открытым — пустое имя создавать нельзя.
+    fn confirmed_title(&self) -> Option<String> {
+        let trimmed = self.input.as_deref()?.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    }
+}
+
 struct App {
     client: Client,
     /// Для фоновых команд: play-команды не должны держать цикл ввода.
@@ -152,6 +191,8 @@ struct App {
     track_view: Vec<usize>,
     /// То же для результатов поиска (плейлисты и артисты не фильтруются).
     search_view: Vec<usize>,
+    /// Открытый пикер плейлистов (`a`); None — закрыт.
+    picker: Option<PlaylistPicker>,
 }
 
 pub async fn run(paths: &Paths) -> Result<()> {
@@ -198,6 +239,7 @@ pub async fn run(paths: &Paths) -> Result<()> {
         show_disliked: false,
         track_view: Vec::new(),
         search_view: Vec::new(),
+        picker: None,
     };
 
     let mut terminal = enter_terminal()?;
@@ -327,6 +369,17 @@ async fn apply_event(app: &mut App, event: Event) -> bool {
             }
             true
         }
+        Event::PlaylistsChanged => {
+            // Событие не несёт дельту, а библиотека плейлистов невелика:
+            // перечитываем список целиком, как это делает CLI-путь
+            // library/list.
+            if let Ok(Payload::Playlists(ps)) =
+                app.client.call(Cmd::Library { provider: app.source.provider.clone() }).await
+            {
+                app.playlists = ps;
+            }
+            true
+        }
         Event::TrackChanged { .. } | Event::CacheProgress { .. } | Event::AuthChanged { .. } => false,
     }
 }
@@ -336,6 +389,9 @@ async fn apply_event(app: &mut App, event: Event) -> bool {
 async fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<bool> {
     if app.search_mode {
         return handle_search_key(app, code).await.map(|_| false);
+    }
+    if app.picker.is_some() {
+        return handle_picker_key(app, code).await.map(|_| false);
     }
     match code {
         KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(true),
@@ -403,6 +459,17 @@ async fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Re
         }
         KeyCode::Char('f') => rate_selected(app, Rating::Liked).await,
         KeyCode::Char('d') => rate_selected(app, Rating::Disliked).await,
+        // `a` — добавить трек под курсором (плейлист, очередь/now-playing
+        // или поиск — те же поверхности, что у f/d) в плейлист.
+        KeyCode::Char('a') => {
+            if selected_track(app).is_some() {
+                app.picker = Some(PlaylistPicker::new());
+            }
+        }
+        // `D` (shift): обычное `d` занято дизлайком, поэтому разрушительное
+        // действие сознательно посажено на shift — убрать трек из плейлиста
+        // или удалить плейлист целиком.
+        KeyCode::Char('D') => playlist_remove_or_delete(app).await,
         KeyCode::Char('/') => {
             app.nav.leave_playlist();
             app.search_mode = true;
@@ -440,6 +507,113 @@ async fn handle_search_key(app: &mut App, code: KeyCode) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+/// Клавиши открытого пикера плейлистов: пока он открыт, остальные
+/// бинды не срабатывают. j/k — навигация, Enter — выбор, Esc — отмена;
+/// в режиме ввода имени символы идут в строку, Enter — создать.
+async fn handle_picker_key(app: &mut App, code: KeyCode) -> Result<()> {
+    if app.picker.as_ref().is_some_and(|p| p.input.is_some()) {
+        match code {
+            KeyCode::Esc => {
+                if let Some(picker) = app.picker.as_mut() {
+                    picker.input = None;
+                }
+            }
+            KeyCode::Enter => create_and_add(app).await,
+            KeyCode::Backspace => {
+                if let Some(input) = app.picker.as_mut().and_then(|p| p.input.as_mut()) {
+                    input.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(input) = app.picker.as_mut().and_then(|p| p.input.as_mut()) {
+                    input.push(c);
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    match code {
+        KeyCode::Esc => app.picker = None,
+        KeyCode::Enter => {
+            let Some(picker) = app.picker.as_ref() else { return Ok(()) };
+            if picker.is_new_selected() {
+                app.picker.as_mut().expect("проверено выше").begin_input();
+                return Ok(());
+            }
+            let sel = picker.sel;
+            // Трек и плейлист читаем до закрытия пикера: selected_track
+            // ходит по app, а не по пикеру, так что порядок не важен, но
+            // borrow-чеккер требует разнести мутацию и чтение.
+            let track = selected_track(app);
+            let playlist = app.playlists.get(sel - 1).map(|p| p.id.clone());
+            app.picker = None;
+            if let (Some(track), Some(playlist)) = (track, playlist) {
+                fire(app, Cmd::PlaylistAdd { playlist, track });
+            }
+        }
+        _ => {
+            let len = app.playlists.len();
+            let delta = match code {
+                KeyCode::Char('j') | KeyCode::Down => 1,
+                KeyCode::Char('k') | KeyCode::Up => -1,
+                _ => return Ok(()),
+            };
+            if let Some(picker) = app.picker.as_mut() {
+                picker.move_cursor(delta, len);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Создать плейлист из введённого имени и сразу добавить в него трек
+/// под курсором: пользователь просил «добавить», создание — лишь
+/// средство. Ответ `PlaylistCreated` приходит синхронно, поэтому
+/// добавление уходит сразу после него.
+async fn create_and_add(app: &mut App) {
+    let title = match app.picker.as_ref().and_then(|p| p.confirmed_title()) {
+        Some(title) => title,
+        None => return,
+    };
+    match app.client.call(Cmd::PlaylistCreate { title }).await {
+        Ok(Payload::PlaylistCreated { playlist }) => {
+            app.picker = None;
+            app.notice = None;
+            if let Some(track) = selected_track(app) {
+                fire(app, Cmd::PlaylistAdd { playlist, track });
+            }
+        }
+        Ok(_) => app.notice = Some("неожиданный ответ на PlaylistCreate".to_owned()),
+        Err(e) => app.notice = Some(e.to_string()),
+    }
+}
+
+/// `D`: в списке треков плейлиста — убрать трек под курсором из
+/// плейлиста; в списке плейлистов библиотеки — удалить плейлист.
+async fn playlist_remove_or_delete(app: &mut App) {
+    if app.nav.focus == Focus::Tracks {
+        let Some(idx) = app.nav.open_playlist else { return };
+        let Some(playlist) = app.playlists.get(idx) else { return };
+        let id = playlist.id.clone();
+        let Some(track) = selected_track(app) else { return };
+        // Кэш и открытый список правим локально: PlaylistsChanged треки
+        // не несёт, иначе убранный трек висел бы до протухания TTL.
+        app.playlist_tracks.retain(|t| t.id != track);
+        if let Some((tracks, _)) = app.playlist_cache.get_mut(&id) {
+            tracks.retain(|t| t.id != track);
+        }
+        call_quiet(app, Cmd::PlaylistRemove { playlist: id, track }).await;
+    } else if app.nav.focus == Focus::Panel && app.nav.panel == Panel::Library {
+        let Some(idx) = app.nav.library_sel.selected() else { return };
+        let Some(playlist) = app.playlists.get(idx) else { return };
+        let id = playlist.id.clone();
+        app.playlist_cache.remove(&id);
+        call_quiet(app, Cmd::PlaylistDelete { playlist: id }).await;
+    }
 }
 
 /// TTL кэша треков плейлиста. Каталог провайдера меняется редко;
@@ -727,7 +901,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     // смешанная, без колонки провайдера она нечитаема.
     if app.nav.focus == Focus::Tracks {
         let title = match app.nav.open_playlist.and_then(|i| app.playlists.get(i)) {
-            Some(p) => format!("Плейлист: {} [h]", p.title),
+            Some(p) => format!("Плейлист: {} [h D]", p.title),
             None => "Плейлист [h]".to_owned(),
         };
         let current = app.state.track.as_ref().map(|t| t.id.clone());
@@ -747,7 +921,58 @@ fn draw(f: &mut Frame, app: &mut App) {
         f.render_widget(right_list, right);
     }
 
+    // Пикер плейлистов — модальный оверлей поверх основной области:
+    // рисуется последним, чтобы накрыть обе колонки.
+    if app.picker.is_some() {
+        draw_picker(f, app, main);
+    }
+
     draw_status(f, app, status);
+}
+
+/// Модальный пикер плейлистов: минимальные Clear+List по центру
+/// основной области — полноценных модалок в TUI нет. В режиме ввода
+/// имени список скрыт, ввод отражается в заголовке.
+fn draw_picker(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let Some(picker) = &app.picker else { return };
+    let rows = app.playlists.len() as u16 + 3;
+    let popup = centered_rect(60, rows, area);
+    let (title, items) = match &picker.input {
+        Some(input) => (format!("Новый плейлист: {input}_"), Vec::new()),
+        None => {
+            let mut items: Vec<ListItem> = Vec::with_capacity(app.playlists.len() + 1);
+            for i in 0..=app.playlists.len() {
+                let text = match i {
+                    0 => "+ New playlist…".to_owned(),
+                    _ => app.playlists[i - 1].title.clone(),
+                };
+                let item = if i == picker.sel {
+                    ListItem::new(text).style(Style::default().add_modifier(Modifier::REVERSED))
+                } else {
+                    ListItem::new(text)
+                };
+                items.push(item);
+            }
+            ("Добавить в плейлист [j/k Enter Esc]".to_owned(), items)
+        }
+    };
+    // Clear затирает под собой списки колонок, иначе сквозь «модалку»
+    // читается нижний текст.
+    f.render_widget(Clear, popup);
+    let list = List::new(items).block(Block::new().borders(Borders::ALL).title(title));
+    f.render_widget(list, popup);
+}
+
+/// Прямоугольник `percent_x`% ширины и `height` строк по центру `area`.
+fn centered_rect(percent_x: u16, height: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    let height = height.min(area.height);
+    let width = area.width.saturating_mul(percent_x) / 100;
+    ratatui::layout::Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
 }
 
 /// Строка трека в списках; `current` — играющий сейчас `TrackId`,
@@ -822,7 +1047,7 @@ fn draw_status(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         let dur = app.state.duration.map(|d| d.as_secs());
         let line = trim_fit(
             &format!(
-                "{} {} {} {} {}  vol:{} {}{} [{}] f/d rate ctrl+d hidden q=выход",
+                "{} {} {} {} {}  vol:{} {}{} [{}] f/d rate a add D del ctrl+d hidden q=выход",
                 status_icon(app.state.status),
                 track.title,
                 track.artist_line(),
@@ -1083,6 +1308,38 @@ mod tests {
         assert_eq!(rate_toggle(Some(Rating::Liked), Rating::Liked), Rating::None);
         assert_eq!(rate_toggle(Some(Rating::Liked), Rating::Disliked), Rating::Disliked);
         assert_eq!(rate_toggle(Some(Rating::Disliked), Rating::Disliked), Rating::None);
+    }
+
+    #[test]
+    fn picker_cursor_moves_over_new_plus_playlists() {
+        let mut picker = PlaylistPicker::new();
+        assert!(picker.is_new_selected());
+
+        // 0 — «новый», 1..=3 — плейлисты; границы зажимаются.
+        picker.move_cursor(1, 3);
+        picker.move_cursor(1, 3);
+        picker.move_cursor(1, 3);
+        picker.move_cursor(1, 3);
+        assert_eq!(picker.sel, 3);
+        picker.move_cursor(1, 3);
+        assert_eq!(picker.sel, 3);
+        picker.move_cursor(-10, 3);
+        assert_eq!(picker.sel, 0);
+        assert!(picker.is_new_selected());
+    }
+
+    #[test]
+    fn picker_input_collects_and_trims_name() {
+        let mut picker = PlaylistPicker::new();
+        picker.begin_input();
+        // Пустое имя не подтверждается — режим ввода остаётся открытым.
+        assert_eq!(picker.confirmed_title(), None);
+        for c in "  Chill mix ".chars() {
+            picker.input.as_mut().expect("input mode").push(c);
+        }
+        assert_eq!(picker.confirmed_title().as_deref(), Some("Chill mix"));
+        // Имя не «тратится» чтением: сбрасывает только Esc-ветка.
+        assert_eq!(picker.confirmed_title().as_deref(), Some("Chill mix"));
     }
 
     #[test]

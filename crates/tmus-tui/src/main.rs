@@ -119,6 +119,12 @@ enum CliCmd {
         #[arg(long)]
         start: Option<usize>,
     },
+    /// Работа с плейлистами. `pl`, а не `playlist`: подкоманду дергает
+    /// сервис плагина noctalia на каждое действие пользователя с
+    /// плейлистами, и сокращение экономит и строку конфига, и набор в
+    /// шелле.
+    #[command(subcommand)]
+    Pl(PlCmd),
     #[command(subcommand)]
     Cache(CacheCmd),
     /// Стрим событий демона построчно в stdout (для noctalia.runStream).
@@ -137,6 +143,25 @@ enum CacheCmd {
     Gc,
     /// Докачать плейлист в офлайн-кэш в фоне.
     Warm { playlist_id: String },
+}
+
+/// Подкоманды `tmus pl`. Названия повторяют контракт сервиса плагина:
+/// `new/add/rm/del/ls` зовутся из luau-кода ровно в такой форме.
+#[derive(Subcommand)]
+enum PlCmd {
+    /// Создать плейлист; печатает id созданного.
+    New { title: String },
+    /// Добавить трек в плейлист.
+    Add { playlist_id: String, track: String },
+    /// Убрать трек из плейлиста.
+    Rm { playlist_id: String, track: String },
+    /// Удалить плейлист вместе с содержимым.
+    Del { playlist_id: String },
+    /// Список библиотечных плейлистов; `--json` — как есть из демона.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Метка жизни потока `events`: печатается при простое, парсится
@@ -284,6 +309,7 @@ async fn main() -> Result<()> {
             playlist: parse_playlist_id(&playlist_id)?,
             start: Some(start.unwrap_or(0)),
         },
+        CliCmd::Pl(action) => return run_pl(&mut client, action).await,
         CliCmd::Cache(cache) => match cache {
             CacheCmd::Stats { json } => return print_payload(client.call(Cmd::CacheStats).await?, json),
             CacheCmd::Pin { track_id } => {
@@ -320,6 +346,45 @@ async fn main() -> Result<()> {
     };
 
     print_payload(client.call(cmd).await?, false)
+}
+
+/// `tmus pl …`: пять действий над плейлистами. Все ходят в те же Cmd,
+/// что и TUI; `new` разворачивает `Payload::PlaylistCreated` в голый
+/// id — потребителю (сервису плагина) больше ничего не нужно, а id он
+/// сразу передаёт в `pl add`. `ls` переиспользует путь `library/list`
+/// (`Cmd::Library`): отдельной команды плейлистов в протоколе нет.
+async fn run_pl(client: &mut client::Client, action: PlCmd) -> Result<()> {
+    match action {
+        PlCmd::New { title } => match client.call(Cmd::PlaylistCreate { title }).await? {
+            Payload::PlaylistCreated { playlist } => {
+                println!("{playlist}");
+                Ok(())
+            }
+            _ => bail!("неожиданный ответ на PlaylistCreate"),
+        },
+        PlCmd::Add { playlist_id, track } => {
+            let cmd = Cmd::PlaylistAdd {
+                playlist: parse_playlist_id(&playlist_id)?,
+                track: parse_track_id(&track)?,
+            };
+            print_payload(client.call(cmd).await?, false)
+        }
+        PlCmd::Rm { playlist_id, track } => {
+            let cmd = Cmd::PlaylistRemove {
+                playlist: parse_playlist_id(&playlist_id)?,
+                track: parse_track_id(&track)?,
+            };
+            print_payload(client.call(cmd).await?, false)
+        }
+        PlCmd::Del { playlist_id } => {
+            let cmd = Cmd::PlaylistDelete { playlist: parse_playlist_id(&playlist_id)? };
+            print_payload(client.call(cmd).await?, false)
+        }
+        PlCmd::Ls { json } => {
+            let provider = resolve_provider(client, None).await?;
+            print_payload(client.call(Cmd::Library { provider }).await?, json)
+        }
+    }
 }
 
 /// `tmus ping`: время отклика живого демона (connect + Cmd::State).
@@ -475,6 +540,9 @@ fn format_payload(payload: &Payload) -> String {
             .map(|(id, r)| format!("{id}: {r:?}"))
             .collect::<Vec<_>>()
             .join("\n"),
+        // Содержательный вид нужен только CLI `pl new`, который
+        // разворачивает payload сам; здесь — просто id.
+        Payload::PlaylistCreated { playlist } => playlist.to_string(),
     }
 }
 
@@ -746,6 +814,53 @@ mod tests {
         // rating — свободная строка, невалидное слово ловит parse_rating
         // уже после разбора argv (как у loop/shuffle).
         assert!(parse_rating("meh").is_err());
+    }
+
+    /// Контракт `pl`: пять подкоманд, id-строки доходят до тех же
+    /// парсеров, что и у соседних команд; `ls` знает `--json`.
+    #[test]
+    fn pl_subcommands_parse_ids_title_and_json_flag() {
+        match Cli::try_parse_from(["tmus", "pl", "new", "Chill"]).expect("valid").cmd {
+            Some(CliCmd::Pl(PlCmd::New { title })) => assert_eq!(title, "Chill"),
+            _ => panic!("ожидалась подкоманда pl new"),
+        }
+        match Cli::try_parse_from(["tmus", "pl", "add", "ytmusic:PL1", "ytmusic:abc"])
+            .expect("valid")
+            .cmd
+        {
+            Some(CliCmd::Pl(PlCmd::Add { playlist_id, track })) => {
+                assert_eq!(parse_playlist_id(&playlist_id).expect("valid").id, "PL1");
+                assert_eq!(parse_track_id(&track).expect("valid").id, "abc");
+            }
+            _ => panic!("ожидалась подкоманда pl add"),
+        }
+        match Cli::try_parse_from(["tmus", "pl", "rm", "ytmusic:PL1", "ytmusic:abc"])
+            .expect("valid")
+            .cmd
+        {
+            Some(CliCmd::Pl(PlCmd::Rm { playlist_id, track })) => {
+                assert_eq!(parse_playlist_id(&playlist_id).expect("valid").id, "PL1");
+                assert_eq!(parse_track_id(&track).expect("valid").id, "abc");
+            }
+            _ => panic!("ожидалась подкоманда pl rm"),
+        }
+        match Cli::try_parse_from(["tmus", "pl", "del", "ytmusic:PL1"]).expect("valid").cmd {
+            Some(CliCmd::Pl(PlCmd::Del { playlist_id })) => {
+                assert_eq!(parse_playlist_id(&playlist_id).expect("valid").id, "PL1");
+            }
+            _ => panic!("ожидалась подкоманда pl del"),
+        }
+        for (args, json) in [
+            (vec!["tmus", "pl", "ls"], false),
+            (vec!["tmus", "pl", "ls", "--json"], true),
+        ] {
+            match Cli::try_parse_from(args).expect("valid").cmd {
+                Some(CliCmd::Pl(PlCmd::Ls { json: got })) => assert_eq!(got, json),
+                _ => panic!("ожидалась подкоманда pl ls"),
+            }
+        }
+        // Незнакомый провайдер ловится тем же парсером id, что и везде.
+        assert!(parse_playlist_id("nosuch:PL").is_err());
     }
 
     #[test]
