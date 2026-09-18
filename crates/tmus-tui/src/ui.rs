@@ -115,6 +115,8 @@ impl Nav {
 
 struct App {
     client: Client,
+    /// Для фоновых команд: play-команды не должны держать цикл ввода.
+    paths: Paths,
     state: PlayerState,
     source: CatalogSource,
     playlists: Vec<Playlist>,
@@ -149,9 +151,9 @@ pub async fn run(paths: &Paths) -> Result<()> {
     {
         playlists = ps;
     }
-
     let mut app = App {
         client,
+        paths: paths.clone(),
         state,
         source,
         playlists,
@@ -413,7 +415,7 @@ fn track_cmd(app: &App) -> Option<Cmd> {
 async fn play_selected(app: &mut App) {
     if app.nav.focus == Focus::Tracks {
         if let Some(cmd) = track_cmd(app) {
-            call_quiet(app, cmd).await;
+            fire(app, cmd);
         }
         return;
     }
@@ -421,20 +423,43 @@ async fn play_selected(app: &mut App) {
         Panel::Library => {
             let Some(idx) = app.nav.library_sel.selected() else { return };
             let Some(playlist) = app.playlists.get(idx) else { return };
-            call_quiet(app, Cmd::PlayPlaylist { playlist: playlist.id.clone(), start: Some(0) }).await;
+            fire(app, Cmd::PlayPlaylist { playlist: playlist.id.clone(), start: Some(0) });
         }
         Panel::Queue => {
             if let Some(idx) = app.nav.queue_sel.selected() {
-                call_quiet(app, Cmd::QueueGoto { index: idx }).await;
+                fire(app, Cmd::QueueGoto { index: idx });
             }
         }
         Panel::Search => {
             let Some(idx) = app.nav.search_sel.selected() else { return };
             if let Some(SearchResult::Track(track)) = app.search_results.get(idx) {
-                call_quiet(app, Cmd::PlayTrack { track: track.id.clone() }).await;
+                fire(app, Cmd::PlayTrack { track: track.id.clone() });
             }
         }
     }
+}
+
+/// Запустить play-команду, не держа цикл ввода.
+///
+/// Демон отвечает на `PlayTrack`/`PlayPlaylist`/`QueueGoto` только после
+/// резолва и загрузки (до ~4–6 с на незакэшированном треке), и
+/// инлайновое ожидание замораживало весь TUI: ни ввода, ни кадров, ни
+/// событий — при том, что событие `TrackChanged` теперь приходит сразу
+/// (`pending`-трек в демоне). Отдельное одноразовое соединение:
+/// основное нужно для сериализации команд в одном цикле, а тут
+/// параллельность уместна. Ошибка уходит в журнал — состояние всё
+/// равно приедет событием.
+fn fire(app: &App, cmd: Cmd) {
+    let paths = app.paths.clone();
+    tokio::spawn(async move {
+        if let Ok(mut client) = Client::connect(&paths).await {
+            // Ошибку не показываем и не логируем: TUI живёт в alternate
+            // screen, stderr испортил бы кадр, а tracing в зависимостях
+            // нет. Неудавшийся запуск виден событием StateChanged и
+            // журналом демона.
+            let _ = client.call(cmd).await;
+        }
+    });
 }
 
 /// Выполнить команду, не роняя TUI при обрыве: сообщение об ошибке
