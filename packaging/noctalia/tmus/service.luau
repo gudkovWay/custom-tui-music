@@ -43,6 +43,13 @@ local retryAt = 0
 local libraryAt = 0
 local sourceReady = false
 
+-- Метка жизни потока `tmus events`: любая строка (включая keepalive)
+-- двигает её. У runStream нет onClose, поэтому единственный след
+-- умершего потока — тишина дольше интервала keepalive (2 с); 6 с
+-- покрывает три пропущенных метки и не задевает паузу.
+local STALE_MS = 6000
+local lastLineAt = noctalia.nowMs()
+
 local function urlDecode(text)
   return (tostring(text):gsub("%%(%x%x)", function(hex)
     return string.char(tonumber(hex, 16))
@@ -58,9 +65,27 @@ end
 
 local artDirty = false
 
+-- Лёгкий ключ для подписок на 1 Гц: позиция/статус приходят каждую
+-- секунду, а маршалить из-за них всю очередь/результаты/плейлисты —
+-- пустая работа (аудит 18.09). Тяжёлый и лёгкий ключи публикуются
+-- всегда парой, кроме ветки position — там достаточно лёгкого.
+local NOW_KEY = "tmus.now"
+
+local function publishNow()
+  data.at = os.time()
+  noctalia.state.set(NOW_KEY, {
+    linked = data.linked,
+    status = data.status,
+    position = data.position,
+    duration = data.duration,
+    at = data.at,
+  })
+end
+
 local function publish()
   data.at = os.time()
   noctalia.state.set(KEY, data)
+  publishNow()
 end
 
 local artCache = { pending = {}, done = {} }
@@ -283,8 +308,16 @@ local function pullQueue()
     if type(got) == "table" then
       data.queue = type(got.tracks) == "table" and got.tracks or {}
       data.queueIndex = tonumber(got.index)
-      for _, tr in ipairs(data.queue) do
-        decorateArt("track", tr)
+      -- Кэш артов ключуется по URL и привязан к прошлой очереди:
+      -- без сброса он рос без предела на каждое queue_changed.
+      -- pending не трогаем — там висят колбэки живых загрузок.
+      artCache.done = {}
+      -- Панель показывает 10 строк: качать арты всей очереди —
+      -- раздувать каталог art и трафик. Украшаем только видимое
+      -- окно: от текущего трека (queueIndex 0-based) и 14 следующих.
+      local start = (data.queueIndex or 0) + 1
+      for i = start, math.min(#data.queue, start + 14) do
+        decorateArt("track", data.queue[i])
       end
     end
   end)
@@ -295,6 +328,7 @@ local function onEvent(line)
   if text == "" then
     return
   end
+  lastLineAt = noctalia.nowMs()
   local got = noctalia.json.decode(text)
   if type(got) ~= "table" then
     return
@@ -304,11 +338,20 @@ local function onEvent(line)
   data.error = ""
 
   local kind = tostring(got.event or "")
+  -- Keepalive — метка жизни, а не событие состояния: достаточно того,
+  -- что она уже сдвинула lastLineAt и подтвердила связность.
+  if kind == "keepalive" then
+    return
+  end
   if kind == "position" then
     data.position = seconds(got.position)
     if got.duration ~= nil then
       data.duration = seconds(got.duration)
     end
+    -- 1 Гц: лёгкого ключа достаточно, тяжёлый (вся очередь, результаты,
+    -- плейлисты) здесь не менялся — маршалить его каждый тик расточительно.
+    publishNow()
+    return
   elseif kind == "track_changed" then
     applyTrack(got.track)
     data.queueIndex = tonumber(got.queue_index)
@@ -351,6 +394,19 @@ local function refreshAll()
 end
 
 function update()
+  if data.linked and noctalia.nowMs() - lastLineAt > STALE_MS then
+    -- Поток умер молча (перезапуск демона, обрыв сокета): у runStream
+    -- нет onClose, тишина дольше трёх keepalive — единственный след.
+    -- Без этой ветки виджет замерзал на последнем треке до ручного
+    -- открытия панели — панель дёргает "refresh", и только он чинил
+    -- картинку. Чинимся тем же путём, что и старт без демона.
+    streaming = false
+    data.linked = false
+    data.error = "поток событий оборвался"
+    publish()
+    connect()
+    refreshAll()
+  end
   if not data.linked and noctalia.nowMs() >= retryAt then
     streaming = false
     connect()
@@ -363,6 +419,8 @@ function update()
     artDirty = false
     publish()
   end
+  -- GC каталога art (аудит 18.09): API перечисления файлов у noctalia
+  -- нет (только fileExists/removeFile) — дисковую очистку написать нечем.
 end
 
 function onIpc(event, payload)
@@ -378,6 +436,10 @@ function onIpc(event, payload)
     poke({ "vol", "+5" })
   elseif event == "vol-down" then
     poke({ "vol", "-5" })
+  elseif event == "vol-by" and payload then
+    -- Скролл виджета шлёт одно агрегированное событие ("+15"/"-10");
+    -- tmus vol понимает знак.
+    poke({ "vol", tostring(payload) })
   elseif event == "play" and payload then
     poke({ "play", payload })
   elseif event == "playlist" and payload then

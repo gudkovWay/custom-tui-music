@@ -6,8 +6,11 @@ local SERVICE = "q/tmus:watch"
 local COLORS = {
   bg = "#15110F",
   surface = "#201A17",
-  selected = "#2B211D",
-  accent = "#FFA987",
+  -- Курсорная строка обязана читаться с одного взгляда: прежний
+  -- #2B211D хозяин не видел (замер 18.09, «невидно»). Играющий трек
+  -- держит запас яркости сверху, чтобы не сливаться с курсором.
+  selected = "#382823",
+  playing = "#4E352C",
   text = "#F2E8E2",
   muted = "#A99B94",
   border = "#463832",
@@ -33,14 +36,52 @@ end
 
 local LAYOUT = {
   G = "g", H = "h", J = "j", K = "k", L = "l",
-  N = "n", O = "o", P = "p", R = "r", S = "s",
+  I = "i", N = "n", O = "o", P = "p", R = "r", S = "s",
   Cyrillic_pe = "g", Cyrillic_er = "h", Cyrillic_o = "j", Cyrillic_el = "k",
   Cyrillic_de = "l", Cyrillic_te = "n", Cyrillic_shcha = "o", Cyrillic_ze = "p",
-  Cyrillic_ka = "r", Cyrillic_yeru = "s",
+  Cyrillic_sha = "i", Cyrillic_SHA = "i",
   Cyrillic_PE = "g", Cyrillic_ER = "h", Cyrillic_O = "j", Cyrillic_EL = "k",
   Cyrillic_DE = "l", Cyrillic_TE = "n", Cyrillic_SHCHA = "o", Cyrillic_ZE = "p",
   Cyrillic_KA = "r", Cyrillic_YERU = "s",
 }
+
+-- Ввод в поиске ведётся ЗДЕСЬ, а не в ui.input: захваченные клавиши
+-- (Enter, Space, буквы из capture_keys) до сфокусированного поля не
+-- доходят — хост отдаёт их только onKey, и родной submit мёртв
+-- (замер 18.09: Enter запускал первый трек списка, а не поиск).
+-- Поэтому в режиме ввода onKey сам копит строку, а ui.input — витрина.
+-- Латиница приходит одним аккордом в верхнем регистре (сглаживает
+-- хост), кириллица — именами кейсимов; таблица снята
+-- `xkbcli how-to-type --layout ru`, а не по памяти.
+local TEXT_CHARS = {
+  A = "a", B = "b", C = "c", D = "d", E = "e", F = "f", G = "g", H = "h",
+  I = "i", J = "j", K = "k", L = "l", M = "m", N = "n", O = "o", P = "p",
+  Q = "q", R = "r", S = "s", T = "t", U = "u", V = "v", W = "w", X = "x",
+  Y = "y", Z = "z",
+  ["0"] = "0", ["1"] = "1", ["2"] = "2", ["3"] = "3", ["4"] = "4",
+  ["5"] = "5", ["6"] = "6", ["7"] = "7", ["8"] = "8", ["9"] = "9",
+  minus = "-", comma = ",", apostrophe = "'", period = ".",
+  Cyrillic_a = "а", Cyrillic_be = "б", Cyrillic_ve = "в", Cyrillic_ghe = "г",
+  Cyrillic_de = "д", Cyrillic_ie = "е", Cyrillic_io = "ё", Cyrillic_zhe = "ж",
+  Cyrillic_ze = "з", Cyrillic_i = "и", Cyrillic_shorti = "й",
+  Cyrillic_ka = "к", Cyrillic_el = "л", Cyrillic_em = "м", Cyrillic_en = "н",
+  Cyrillic_o = "о", Cyrillic_pe = "п", Cyrillic_er = "р", Cyrillic_es = "с",
+  Cyrillic_te = "т", Cyrillic_u = "у", Cyrillic_ef = "ф", Cyrillic_ha = "х",
+  Cyrillic_tse = "ц", Cyrillic_che = "ч", Cyrillic_sha = "ш",
+  Cyrillic_shcha = "щ", Cyrillic_hardsign = "ъ", Cyrillic_yeru = "ы",
+  Cyrillic_softsign = "ь", Cyrillic_e = "э", Cyrillic_yu = "ю",
+  Cyrillic_ya = "я", Cyrillic_A = "А", Cyrillic_BE = "Б", Cyrillic_VE = "В",
+  Cyrillic_GHE = "Г", Cyrillic_DE = "Д", Cyrillic_IE = "Е", Cyrillic_IO = "Ё",
+  Cyrillic_ZHE = "Ж", Cyrillic_ZE = "З", Cyrillic_I = "И",
+  Cyrillic_SHORTI = "Й", Cyrillic_KA = "К", Cyrillic_EL = "Л",
+  Cyrillic_EM = "М", Cyrillic_EN = "Н", Cyrillic_O = "О", Cyrillic_PE = "П",
+  Cyrillic_ER = "Р", Cyrillic_ES = "С", Cyrillic_TE = "Т", Cyrillic_U = "У",
+  Cyrillic_EF = "Ф", Cyrillic_HA = "Х", Cyrillic_TSE = "Ц",
+  Cyrillic_CHE = "Ч", Cyrillic_SHA = "Ш", Cyrillic_SHCHA = "Щ",
+  Cyrillic_HARDSIGN = "Ъ", Cyrillic_YERU = "Ы", Cyrillic_SOFTSIGN = "Ь",
+  Cyrillic_E = "Э", Cyrillic_YU = "Ю", Cyrillic_YA = "Я",
+}
+local inputMode = false
 
 local REPEAT_CYCLE = { none = "track", track = "queue", queue = "none" }
 local REPEAT_LABEL = { none = "Repeat off", track = "Repeat track", queue = "Repeat queue" }
@@ -62,7 +103,14 @@ local playlistId = ""
 local playlistTitle = ""
 local playlistArtPath = ""
 local query = ""
-local searching = false
+local lastSearched = nil
+-- Вим-модальность поля поиска: typing=true — insert (буквы идут в
+-- запрос), false — normal (j/k листают, Enter активирует). Выход из
+-- insert: Esc или пары jj/jk/oo на физических клавишах (о/л на
+-- ЙЦУКЕН — это те же j/k); вход: i, / или точка.
+local typing = false
+local insertPending = nil
+local INSERT_ESCAPE_MS = 250
 local searchKind = "all"
 local lastSearchSerial = nil
 local doSearch -- defined below; used by chips and submitSearch
@@ -305,7 +353,10 @@ local function trackRow(i, t, opts)
   local current = o.current
   local children = {
     ui.box({ key = "mark" .. i, width = 28 }, {
-      lbl(o.index or tostring(i), { key = "idx" .. i, color = current and COLORS.accent or COLORS.muted }),
+      lbl(current and "▶" or (o.index or tostring(i)), {
+        key = "idx" .. i,
+        color = current and COLORS.accent or COLORS.muted,
+      }),
     }),
     artNode(o.art, 32),
     lbl(shorten(o.title, 52), {
@@ -323,7 +374,9 @@ local function trackRow(i, t, opts)
     paddingV = 6,
     radius = 6,
     align = "center",
-    fill = (active or current) and COLORS.selected or COLORS.bg,
+    -- Играющий трек важнее курсора: у них разные заливки, иначе
+    -- «что сейчас играет» не отличить от «где курсор» при скролле.
+    fill = current and COLORS.playing or (active and COLORS.selected or COLORS.bg),
     onClick = function()
       cursor = i
       selected = o
@@ -538,6 +591,11 @@ local function setView(id)
   windowTop = 1
   selected = nil
   searching = false
+  -- Режим ввода живёт ровно пока открыт вид поиска: смена вида любым
+  -- путём (Esc, ctrl+j/k, клик по рейлу) обязана вернуть бинды.
+  -- Вход в поиск всегда начинает с insert-моды.
+  inputMode = id == "search"
+  typing = id == "search"
 end
 
 local function railNode()
@@ -551,15 +609,9 @@ local function railNode()
       align = "center",
       paddingV = 8,
       radius = 6,
-      fill = active and COLORS.selected or COLORS.bg,
-      onClick = function()
-        setView(v.id)
-        draw()
-      end,
+      fill = active and COLORS.selected or COLORS.surface,
     }, {
-      ui.row({ key = "rail-box-" .. v.id, width = 16, height = 16, align = "center" }, {
         ui.glyph({ key = "rail-glyph-" .. v.id, name = v.glyph, size = 16, color = active and COLORS.accent or COLORS.muted }),
-      }),
       lbl(v.title, { key = "rail-label-" .. v.id, size = 10, color = active and COLORS.text or COLORS.muted }),
     }))
   end
@@ -805,15 +857,17 @@ end
 
 local function homeContext(s)
   local children = {
-    contextTitle("Search"),
-    ui.input({
+    ui.button({
       key = "home-search",
-      value = query,
-      placeholder = "Search",
+      glyph = "search",
+      text = "Search",
       controlSize = "sm",
-      submitOnEnter = true,
-      onSubmit = function(text)
-        submitSearch(text)
+      variant = "ghost",
+      onClick = function()
+        -- Раньше это было ui.input, но Enter перехватывается хостом
+        -- (capture_keys) и до submit не доходил — поле было мёртвым.
+        -- Ввод живёт в виде поиска.
+        setView("search")
       end,
     }),
     contextTitle("Queue"),
@@ -1009,15 +1063,38 @@ function draw()
       }))
     end
     workspace = ui.column({ key = "ws", gap = GAP, flexGrow = 63 }, {
-      ui.input({
-        key = "search",
-        value = query,
-        placeholder = "Search tracks, artists, collections",
-        focus = true,
-        submitOnEnter = true,
-        onSubmit = function(text)
-          submitSearch(text)
+      -- Поле поиска — витрина, а не ui.input: буфер ведёт onKey, а
+      -- ui.input после первого рендера игнорирует обновления `value`
+      -- (хозяин не видел набираемый текст реал-тайм). Label
+      -- перерисовывается каждым draw() — текст живой по определению.
+      ui.row({
+        key = "search-line",
+        gap = 8,
+        align = "center",
+        paddingH = 12,
+        paddingV = 8,
+        radius = 8,
+        fill = COLORS.surface,
+        onClick = function()
+          cursor = 1
         end,
+      }, {
+        ui.glyph({
+          key = "search-glyph",
+          name = typing and "pencil" or "search",
+          size = 14,
+          color = typing and COLORS.accent or COLORS.muted,
+        }),
+        lbl(query ~= "" and query or (typing and "Type…" or "i — ввод · j/k — навигация"), {
+          key = "search-text",
+          grow = 1,
+          color = query ~= "" and COLORS.text or COLORS.muted,
+        }),
+        lbl(typing and "INSERT" or "NORMAL", {
+          key = "search-mode",
+          size = 10,
+          color = typing and COLORS.accent or COLORS.muted,
+        }),
       }),
       ui.row({ key = "chips", gap = 8 }, chips),
       ui.column({ key = "ws-body", gap = GAP, flexGrow = 1 }, body),
@@ -1037,14 +1114,6 @@ function draw()
       lbl("Library", { key = "ws-title", size = 18, color = COLORS.text }),
       ui.column({ key = "ws-body", gap = GAP, flexGrow = 1 }, body),
     })
-    local current = currentTrack(s)
-    local ctxChildren = { contextTitle("Current") }
-    if current then
-      table.insert(ctxChildren, current)
-    else
-      table.insert(ctxChildren, lbl("Nothing playing", { key = "lib-none", color = COLORS.muted }))
-    end
-    context = ui.column({ key = "library-context", gap = GAP, flexGrow = 3 }, ctxChildren)
   elseif view == "playlist" then
     local state = stateNode(s, items)
     local body = {}
@@ -1109,8 +1178,8 @@ function draw()
   })
 
   local footer = lbl(
-    "ctrl+j/k views · 1–5 views · j/k move · Return open · Space play/pause · h/l back/deep · / search · "
-      .. "n/p track · r repeat · s shuffle · o terminal · g ends",
+    "ctrl+j/k views · 1–5 views · j/k move · Return open · Space play/pause · h/l back/deep · "
+      .. "/ search (i insert · jj/Esc normal) · n/p track · r repeat · s shuffle · o terminal · g ends",
     { key = "footer", size = 11, color = COLORS.muted }
   )
 
@@ -1126,23 +1195,37 @@ function draw()
   }))
 end
 
+-- Возвращает true, только когда вид реально сменился (вход в плейлист
+-- или выход из него): зажатые h/l в видах, где они ничего не делают,
+-- не должны дёргать draw() каждые ~33 мс (аудит 18.09).
 local function handleViewKeys(key)
   if key == "l" then
     if view == "library" then
       local row = rows()[cursor]
       if row and row.open then
         openPlaylist(row)
+        return true
       end
     end
   elseif key == "h" then
     if view == "playlist" then
       setView("library")
+      return true
     end
   end
+  return false
 end
 
-local NAV_DELAY_MS = 350
-local NAV_REPEAT_MS = 80
+-- Темп повтора сведён с системной клавиатурой (config/inputs.lua:
+-- repeat_delay 250, repeat_rate 55) — хозяин листает j/k с той же
+-- скоростью, что в nvim. Прежние 350/80 были вчетверо медленнее
+-- системы и ощущались как залипание. Навигация чуть спокойнее
+-- текста (30/с), как в gamepad-launcher: 55 шагов/с проходят всю
+-- библиотеку за секунду. Медиа-клавиши медленные сознательно:
+-- демон поглощает серию скипов через 120-мс settle, спамить незачем.
+local NAV_DELAY_MS = 250
+local NAV_REPEAT_MS = 1000 / 30
+local DELETE_REPEAT_MS = 1000 / 55
 local MEDIA_DELAY_MS = 500
 local MEDIA_REPEAT_MS = 500
 local MAX_HOLD_MS = 6000
@@ -1175,9 +1258,13 @@ local function runHeld()
   elseif action == "up" then
     move(-1)
     return true
-  elseif action == "h" or action == "l" then
-    handleViewKeys(action)
+  elseif action == "delete" then
+    -- Удержание BackSpace в поле поиска: темп — как у стрелок
+    -- (350 мс разгон, затем каждые 80 мс), а не медиа-клавиш.
+    query = string.sub(query, 1, -2)
     return true
+  elseif action == "h" or action == "l" then
+    return handleViewKeys(action)
   elseif action == "next" then
     poke("next")
     return false
@@ -1198,7 +1285,8 @@ function onFrameTick(deltaMs)
     return
   end
   local delay = isMediaAction(held.action) and MEDIA_DELAY_MS or NAV_DELAY_MS
-  local interval = isMediaAction(held.action) and MEDIA_REPEAT_MS or NAV_REPEAT_MS
+  local interval = isMediaAction(held.action) and MEDIA_REPEAT_MS
+    or (held.action == "delete" and DELETE_REPEAT_MS or NAV_REPEAT_MS)
   if heldMs < delay then
     return
   end
@@ -1255,6 +1343,94 @@ function onKey(chord, pressed)
     return
   end
 
+  -- Поиск: вим-модальность. typing=true — insert: буквы идут в
+  -- запрос, Esc или быстрые пары jj/jk/oo (физические j/k/o; на
+  -- ЙЦУКЕН это о/л/о/о) выходят в normal. typing=false — normal:
+  -- j/k и стрелки листают выдачу, Enter активирует строку, i/слэш/
+  -- точка возвращают insert. Медиа-клавиши работают в обеих.
+  if inputMode then
+    local isJ = chord == "J" or chord == "Cyrillic_o"
+    local isK = chord == "K" or chord == "Cyrillic_el"
+    local isO = chord == "O" or chord == "Cyrillic_shcha"
+    if typing then
+      -- Детект эскейп-пары: первый символ уже вставлен в запрос —
+      -- при подтверждении пары он снимается. Окно 250 мс, как
+      -- repeat_delay системной клавиатуры.
+      if insertPending and (noctalia.nowMs() - insertPending.at) <= INSERT_ESCAPE_MS then
+        local starter = insertPending.key
+        if (starter == "j" and (isJ or isK)) or (starter == "o" and isO) then
+          query = string.sub(query, 1, -2)
+          typing = false
+          insertPending = nil
+          draw()
+          return
+        end
+      end
+      insertPending = nil
+      if chord == "Return" then
+        -- Enter двоякий, как в каждом лаунчере: изменившийся запрос
+        -- уходит в поиск, неизменный (выдача уже на экране) —
+        -- активирует выбранную строку.
+        if query ~= "" and query ~= lastSearched then
+          doSearch()
+        else
+          activate(rows()[cursor])
+        end
+      elseif chord == "Escape" then
+        typing = false
+      elseif chord == "BackSpace" or chord == "Backspace" then
+        query = string.sub(query, 1, -2)
+        startHold(chord, "delete")
+      elseif chord == "Up" then
+        move(-1)
+        startHold(chord, "up")
+      elseif chord == "Down" then
+        move(1)
+        startHold(chord, "down")
+      elseif chord == "Space" then
+        if #query < 64 then
+          query = query .. " "
+        end
+      else
+        local ch = TEXT_CHARS[chord]
+        if ch and #query < 64 then
+          query = query .. ch
+          if isJ or isO then
+            insertPending = { key = isJ and "j" or "o", at = noctalia.nowMs() }
+          end
+        end
+      end
+    else
+      if chord == "Return" then
+        activate(rows()[cursor])
+      elseif chord == "Escape" then
+        setView("home")
+      elseif key == "i" or chord == "slash" or chord == "period" then
+        typing = true
+        insertPending = nil
+      elseif key == "j" then
+        move(1)
+        startHold(chord, "down")
+      elseif key == "k" then
+        move(-1)
+        startHold(chord, "up")
+      elseif chord == "Up" then
+        move(-1)
+        startHold(chord, "up")
+      elseif chord == "Down" then
+        move(1)
+        startHold(chord, "down")
+      elseif key == "g" then
+        local count = #rows()
+        cursor = cursor == 1 and count or 1
+      elseif chord == "BackSpace" or chord == "Backspace" then
+        -- Захвачена, чтобы не утекала под панель; в normal не делает
+        -- ничего.
+      end
+    end
+    draw()
+    return
+  end
   if chord == "Escape" then
     panel.close()
     return
@@ -1275,11 +1451,10 @@ function onKey(chord, pressed)
     startHold(chord, "down")
   elseif chord == "Down" then
     move(1)
+    startHold(chord, "down")
   elseif key == "k" then
     move(-1)
     startHold(chord, "up")
-  elseif chord == "Up" then
-    move(-1)
   elseif key == "h" or key == "l" or chord == "Left" or chord == "Right" then
     if chord == "Left" then
       key = "h"
@@ -1287,9 +1462,7 @@ function onKey(chord, pressed)
       key = "l"
     end
     handleViewKeys(key)
-    if chord ~= "Left" and chord ~= "Right" then
-      startHold(chord, key)
-    end
+    startHold(chord, key)
   elseif chord == "1" or chord == "2" or chord == "3" or chord == "4" or chord == "5" then
     setView(VIEWS[tonumber(chord)].id)
   elseif key == "g" then
@@ -1302,9 +1475,13 @@ function onKey(chord, pressed)
   elseif key == "o" then
     poke("tui")
     panel.close()
-    return
-  elseif key == "slash" or chord == "slash" then
+  elseif key == "slash" or chord == "slash" or chord == "period" then
+    -- `period` — та же физическая клавиша на ЙЦУКЕН: точка входит в
+    -- поиск и без переключения раскладки.
     setView("search")
+  elseif chord == "BackSpace" then
+    -- Захвачена, чтобы не утекала в приложения под панелью; в поиске
+    -- обрабатывает поле, вне его — гасим.
   end
 
   draw()
@@ -1329,6 +1506,7 @@ end
 
 function doSearch()
   lastSearchSerial = snapshot.searchSerial
+  lastSearched = query
   searching = true
   poke("search", (SEARCH_KIND_TOKENS[searchKind] or "all") .. "|" .. noctalia.string.urlEncode(query))
   draw()
@@ -1344,4 +1522,16 @@ function submitSearch(text)
 end
 
 noctalia.state.watch(KEY, refresh)
+-- Лёгкий ключ "tmus.now" (1 Гц): точечно обновляем волатильные поля
+-- текущего snapshot, тяжёлый snapshot не заменяем (аудит 18.09).
+noctalia.state.watch("tmus.now", function(now)
+  if type(now) ~= "table" or type(snapshot) ~= "table" then
+    return
+  end
+  snapshot.linked = now.linked
+  snapshot.status = now.status
+  snapshot.position = now.position
+  snapshot.duration = now.duration
+  draw()
+end)
 refresh(noctalia.state.get(KEY))

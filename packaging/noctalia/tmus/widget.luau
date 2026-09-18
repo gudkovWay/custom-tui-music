@@ -184,11 +184,23 @@ function onScroll(axis, steps)
   if count == 0 then
     return
   end
-  local event = (tonumber(steps) or 0) < 0 and "vol-up" or "vol-down"
-  for _ = 1, count do
-    poke(event)
-  end
+  -- Одно агрегированное событие вместо пейла покеров на каждый шаг:
+  -- каждый poke — отдельный процесс (аудит 18.09).
+  local sign = (tonumber(steps) or 0) < 0 and "+" or "-"
+  poke("vol-by", sign .. tostring(5 * count))
 end
 
 noctalia.state.watch(KEY, refresh)
+-- Лёгкий ключ "tmus.now" (1 Гц): обновляем волатильные поля текущего
+-- snapshot точечно, вместо замены всего тяжёлого snapshot раз в секунду.
+noctalia.state.watch("tmus.now", function(now)
+  if type(now) ~= "table" or type(snapshot) ~= "table" then
+    return
+  end
+  snapshot.linked = now.linked
+  snapshot.status = now.status
+  snapshot.position = now.position
+  snapshot.duration = now.duration
+  draw()
+end)
 refresh(noctalia.state.get(KEY))

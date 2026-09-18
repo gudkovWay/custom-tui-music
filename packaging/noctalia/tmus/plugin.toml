@@ -28,17 +28,34 @@ id = "library"
 entry = "panel.luau"
 width = 1180
 height = 760
+# Захват расширен до полного алфавита: пока панель открыта, она модальна
+# по клавиатуре, а поисковый ввод ведётся самим плагином (см. TEXT_CHARS
+# в panel.luau) — захваченный Enter до ui.input не доходит, и родной
+# submit мёртв. Имена кейсимов сняты `xkbcli how-to-type --layout ru`,
+# латиница приходит одним аккордом в верхнем регистре (сглаживает хост).
 capture_keys = [
   "Left", "Right", "Up", "Down", "Return", "Escape", "Space", "slash",
+  "period", "comma", "minus", "apostrophe", "BackSpace",
   "ctrl+j", "ctrl+k", "ctrl+Cyrillic_o", "ctrl+Cyrillic_el",
   "XF86AudioNext", "XF86AudioPrev",
-  "G", "H", "J", "K", "L", "N", "O", "P", "R", "S",
-  "1", "2", "3", "4", "5",
-  "Cyrillic_pe", "Cyrillic_er", "Cyrillic_o", "Cyrillic_el", "Cyrillic_de",
-  "Cyrillic_te", "Cyrillic_shcha", "Cyrillic_ze", "Cyrillic_ka",
-  "Cyrillic_yeru", "Cyrillic_PE", "Cyrillic_ER", "Cyrillic_O", "Cyrillic_EL",
-  "Cyrillic_DE", "Cyrillic_TE", "Cyrillic_SHCHA", "Cyrillic_ZE", "Cyrillic_KA",
-  "Cyrillic_YERU",
+  "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
+  "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+  "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+  "Cyrillic_a", "Cyrillic_be", "Cyrillic_ve", "Cyrillic_ghe", "Cyrillic_de",
+  "Cyrillic_ie", "Cyrillic_io", "Cyrillic_zhe", "Cyrillic_ze", "Cyrillic_i",
+  "Cyrillic_shorti", "Cyrillic_ka", "Cyrillic_el", "Cyrillic_em",
+  "Cyrillic_en", "Cyrillic_o", "Cyrillic_pe", "Cyrillic_er", "Cyrillic_es",
+  "Cyrillic_te", "Cyrillic_u", "Cyrillic_ef", "Cyrillic_ha", "Cyrillic_tse",
+  "Cyrillic_che", "Cyrillic_sha", "Cyrillic_shcha", "Cyrillic_hardsign",
+  "Cyrillic_yeru", "Cyrillic_softsign", "Cyrillic_e", "Cyrillic_yu",
+  "Cyrillic_ya", "Cyrillic_A", "Cyrillic_BE", "Cyrillic_VE", "Cyrillic_GHE",
+  "Cyrillic_DE", "Cyrillic_IE", "Cyrillic_IO", "Cyrillic_ZHE", "Cyrillic_ZE",
+  "Cyrillic_I", "Cyrillic_SHORTI", "Cyrillic_KA", "Cyrillic_EL",
+  "Cyrillic_EM", "Cyrillic_EN", "Cyrillic_O", "Cyrillic_PE", "Cyrillic_ER",
+  "Cyrillic_ES", "Cyrillic_TE", "Cyrillic_U", "Cyrillic_EF", "Cyrillic_HA",
+  "Cyrillic_TSE", "Cyrillic_CHE", "Cyrillic_SHA", "Cyrillic_SHCHA",
+  "Cyrillic_HARDSIGN", "Cyrillic_YERU", "Cyrillic_SOFTSIGN", "Cyrillic_E",
+  "Cyrillic_YU", "Cyrillic_YA",
 ]
 
 [[service]]
