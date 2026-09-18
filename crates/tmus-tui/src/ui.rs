@@ -10,13 +10,13 @@ use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModif
 use crossterm::{execute, terminal};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 
-use tmus_core::model::{LoopMode, PlaybackStatus, Playlist, SearchResult, Track};
+use tmus_core::model::{LoopMode, PlaybackStatus, Playlist, SearchResult, Track, TrackId};
 use tmus_core::protocol::{CatalogSource, Cmd, Event, Payload, PlayerState};
 use tmus_core::Paths;
 
@@ -522,7 +522,12 @@ fn draw(f: &mut Frame, app: &mut App) {
             Some(p) => format!("Плейлист: {} [h]", p.title),
             None => "Плейлист [h]".to_owned(),
         };
-        let items: Vec<ListItem> = app.playlist_tracks.iter().map(track_line).collect();
+        let current = app.state.track.as_ref().map(|t| t.id.clone());
+        let items: Vec<ListItem> = app
+            .playlist_tracks
+            .iter()
+            .map(|t| track_line(t, current.as_ref()))
+            .collect();
         let right_list = List::new(items)
             .block(Block::new().borders(Borders::ALL).title(title))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
@@ -536,30 +541,44 @@ fn draw(f: &mut Frame, app: &mut App) {
     draw_status(f, app, status);
 }
 
-/// Строка очереди с провайдером: `ytmusic:abc` из `TrackId::Display`.
-fn track_line(track: &Track) -> ListItem<'static> {
-    ListItem::new(Line::from(format!(
-        "[{}] {} — {}",
-        track.id.provider,
-        track.artist_line(),
-        track.title
-    )))
+/// Строка трека в списках; `current` — играющий сейчас `TrackId`.
+/// Играющий трек получает тёплый фон и метку `▶`: в плейлисте на сотни
+/// строк взгляд ищет «что же играет» чаще, чем позицию курсора.
+fn track_line(track: &Track, current: Option<&TrackId>) -> ListItem<'static> {
+    let playing = current == Some(&track.id);
+    let text = if playing {
+        format!("▶ [{}] {} — {}", track.id.provider, track.artist_line(), track.title)
+    } else {
+        format!("[{}] {} — {}", track.id.provider, track.artist_line(), track.title)
+    };
+    let item = ListItem::new(Line::from(text));
+    if playing {
+        item.style(
+            Style::new()
+                .bg(Color::Rgb(44, 30, 24))
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        item
+    }
 }
 
 fn queue_items(app: &App) -> Vec<ListItem<'static>> {
     // Полная очередь у клиента не хранится (приходит только длина),
     // показываем текущий трек и подсказку.
     match &app.state.track {
-        Some(track) => vec![track_line(track)],
+        Some(track) => vec![track_line(track, Some(&track.id))],
         None => vec![ListItem::new("очередь пуста")],
     }
 }
 
 fn search_items(app: &App) -> Vec<ListItem<'static>> {
+    let current = app.state.track.as_ref().map(|t| t.id.clone());
     app.search_results
         .iter()
         .map(|r| match r {
-            SearchResult::Track(t) => track_line(t),
+            SearchResult::Track(t) => track_line(t, current.as_ref()),
             SearchResult::Playlist(p) => ListItem::new(format!("{}: {}", p.id, p.title)),
             SearchResult::Artist { provider, id, name } => {
                 ListItem::new(format!("[{provider}:{id}] {name}"))
