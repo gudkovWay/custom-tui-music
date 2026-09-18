@@ -126,6 +126,16 @@ struct App {
     search_input: String,
     search_mode: bool,
     nav: Nav,
+    /// Кэш треков плейлистов по id: (треки, момент загрузки). Без него
+    /// каждое движение j/k по колонке библиотеки уходило в InnerTube
+    /// (~1–2 с на запрос), и зажатая клавиша сериально гоняла сеть.
+    /// TTL 600 с: каталог меняется редко, инвалидация по событиям ради
+    /// этого не стоит.
+    playlist_cache: std::collections::HashMap<tmus_core::model::PlaylistId, (Vec<Track>, std::time::Instant)>,
+    /// Отложенная загрузка: (плейлист, момент последнего шага курсора).
+    /// Ставится при промахе кэша, исполняется в event_loop, когда курсор
+    /// стоит 400 мс, — дебаунс сетевых запросов.
+    pending_load: Option<(tmus_core::model::PlaylistId, std::time::Instant)>,
     /// Что показать в строке состояния при отсутствии живых данных:
     /// «демон не отвечает» вместо падения при обрыве.
     notice: Option<String>,
@@ -158,6 +168,8 @@ pub async fn run(paths: &Paths) -> Result<()> {
         source,
         playlists,
         playlist_tracks: Vec::new(),
+        playlist_cache: std::collections::HashMap::new(),
+        pending_load: None,
         search_results: Vec::new(),
         search_input: String::new(),
         search_mode: false,
@@ -227,6 +239,12 @@ async fn event_loop(
                     return Ok(());
                 }
             }
+        }
+
+        // Дебаунс загрузки библиотеки: сначала ждём, не двинется ли
+        // курсор дальше, — только дозревший запрос уходит в сеть.
+        if flush_pending_load(app).await {
+            dirty = true;
         }
 
         if event::poll(Duration::from_millis(100))? {
@@ -391,19 +409,57 @@ async fn handle_search_key(app: &mut App, code: KeyCode) -> Result<()> {
     Ok(())
 }
 
-/// Загрузить треки подсвеченного плейлиста в правую колонку. На каждый
-/// шаг курсора — один запрос; треки не кэшируются, каталог может
-/// меняться под ногами.
+/// TTL кэша треков плейлиста. Каталог провайдера меняется редко;
+/// протокол не сообщает об изменениях, поэтому живём устареванием.
+const PLAYLIST_CACHE_TTL: Duration = Duration::from_secs(600);
+
+/// Пауза дебаунса: загрузка стартует, только когда курсор стоит так
+/// долго. Замерено на InnerTube: ответ занимает 1–2 с, так что 400 мс
+/// надёжно покрывают темп ручного и зажатого листания.
+const LOAD_DEBOUNCE: Duration = Duration::from_millis(400);
+
+/// Подготовить загрузку треков подсвеченного плейлиста. Свежий кэш
+/// применяется мгновенно; при промахе сеть НЕ дёргаем — ставим
+/// `pending_load`, его исполнит event_loop после паузы. Инвариант
+/// дебаунса: каждое движение курсора перезаписывает метку времени, при
+/// непрерывном листании возраст не дорастает до `LOAD_DEBOUNCE` и
+/// запросы не уходят вовсе; один запрос — когда курсор замер.
 async fn load_selected_playlist(app: &mut App) {
     let Some(idx) = app.nav.library_sel.selected() else { return };
     let Some(playlist) = app.playlists.get(idx) else { return };
     let id = playlist.id.clone();
+    if let Some((tracks, loaded_at)) = app.playlist_cache.get(&id) {
+        if loaded_at.elapsed() < PLAYLIST_CACHE_TTL {
+            app.playlist_tracks = tracks.clone();
+            app.notice = None;
+            return;
+        }
+    }
     app.playlist_tracks.clear();
-    match app.client.call(Cmd::LibraryTracks { playlist: id }).await {
-        Ok(Payload::Tracks(tracks)) => app.playlist_tracks = tracks,
+    app.notice = Some("загрузка…".to_owned());
+    app.pending_load = Some((id, std::time::Instant::now()));
+}
+
+/// Исполнить дозревший `pending_load`: один сетевой запрос вместо
+/// запроса на каждый шаг курсора. Ошибки — в строку состояния.
+async fn flush_pending_load(app: &mut App) -> bool {
+    let due = match app.pending_load.as_ref() {
+        Some((_, started)) if started.elapsed() >= LOAD_DEBOUNCE => {
+            app.pending_load.take().map(|(id, _)| id)
+        }
+        _ => None,
+    };
+    let Some(id) = due else { return false };
+    match app.client.call(Cmd::LibraryTracks { playlist: id.clone() }).await {
+        Ok(Payload::Tracks(tracks)) => {
+            app.playlist_cache.insert(id, (tracks.clone(), std::time::Instant::now()));
+            app.playlist_tracks = tracks;
+            app.notice = None;
+        }
         Ok(_) => app.notice = Some("неожиданный ответ на LibraryTracks".to_owned()),
         Err(e) => app.notice = Some(e.to_string()),
     }
+    true
 }
 
 fn track_cmd(app: &App) -> Option<Cmd> {

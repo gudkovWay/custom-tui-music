@@ -23,6 +23,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum CliCmd {
+    /// Диагностика: RTT демона без поднятия нового.
+    Ping,
     /// Играть трек (по умолчанию — текущий/первый из очереди).
     Play { track_id: Option<String> },
     Pause,
@@ -158,6 +160,10 @@ async fn main() -> Result<()> {
         return run_events(&paths).await;
     }
 
+    if let CliCmd::Ping = cmd {
+        return run_ping(&paths).await;
+    }
+
     let mut client = client::Client::connect_or_spawn(&paths).await?;
     let cmd = match cmd {
         CliCmd::Events => unreachable!("обработан выше"),
@@ -225,9 +231,34 @@ async fn main() -> Result<()> {
             CacheCmd::Gc => Cmd::CacheGc,
         },
         CliCmd::StopDaemon => Cmd::Shutdown,
+        // Обработан до connect_or_spawn; ветка для полноты match.
+        CliCmd::Ping => unreachable!("обработан выше"),
     };
 
     print_payload(client.call(cmd).await?, false)
+}
+
+/// `tmus ping`: время отклика живого демона (connect + Cmd::State).
+/// В отличие от остальных подкоманд НЕ автозапускает демона — смысл
+/// команды в диагностике того, что уже работает; поднятый ради пинга
+/// новый демон исказил бы результат. Состояние не трогает.
+async fn run_ping(paths: &Paths) -> Result<()> {
+    let t0 = std::time::Instant::now();
+    let result = async {
+        let mut client = client::Client::connect(paths).await?;
+        client.call(Cmd::State).await
+    }
+    .await;
+    match result {
+        Ok(_) => {
+            println!("tmusd отвечает за {} мс", t0.elapsed().as_millis());
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("tmusd не отвечает: {e}");
+            Err(e)
+        }
+    }
 }
 
 /// Текущая громкость нужна только для относительной `vol`; отдельный
