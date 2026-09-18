@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn extractor_and_cookie_args_are_passed() {
         let cookies = tmus_core::cookies::CookieSource::Browser {
-            spec: "chromium:/home/q/.config/YouTube Music Desktop App/Partitions/ytmview".into(),
+            spec: "chromium:/home/user/.config/ytm/profile".into(),
         };
         let req = YtDlpRequest {
             provider: YTM,

@@ -689,7 +689,7 @@ mod tests {
     fn configured_profile_is_used_as_is() {
         let cfg = Config {
             browser: crate::config::BrowserConfig {
-                profile: Some("chromium:/home/q/.config/YouTube Music Desktop App/Partitions/ytmview".to_owned()),
+                profile: Some("chromium:/home/user/.config/ytm/profile".to_owned()),
             },
             ..Config::default()
         };
@@ -699,7 +699,7 @@ mod tests {
         assert_eq!(
             source,
             CookieSource::Browser {
-                spec: "chromium:/home/q/.config/YouTube Music Desktop App/Partitions/ytmview"
+                spec: "chromium:/home/user/.config/ytm/profile"
                     .to_owned()
             }
         );
