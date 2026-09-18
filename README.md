@@ -63,6 +63,8 @@ tmus status | library | liked | queue | providers
 tmus search <запрос> [--kind all|tracks|artists|playlists]  # по умолчанию tracks
 tmus play <provider>:<id>  # напр. tmus play ytmusic:dQw4w9WgXcQ
 tmus cache stats | pin <id> | unpin <id> | gc
+tmus ping                  # RTT демона (диагностика: жив / тупит / мёртв)
+tmus cache warm <playlist> # докачать плейлист в офлайн-кэш в фоне
 tmus events                # поток событий JSON (им пользуется плагин noctalia)
 ```
 
