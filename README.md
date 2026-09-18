@@ -153,14 +153,34 @@ Discord RPC требует своего приложения: `discord.com/devel
 
 MIT.
 
-## Медиа-клавиши Hyprland
+## Медиа-клавиши
+
+Своих глобальных хоткеев плеер не регистрирует, и это не пробел. В
+Wayland клиент получает клавиши только с фокусом, а у демона нет окна
+вовсе. Клавишу ловит компоновщик — приложению остаётся объявить себя
+плеером, что и делает MPRIS. Electron-плееры работают так же: свой
+MPRIS им даёт Chromium, а `globalShortcut` у них на Wayland не
+регистрируется вообще.
+
+Отсюда два варианта, и разница между ними одна.
+
+**Через MPRIS — ничего настраивать не надо**, если оболочка уже
+привязала клавиши к активному плееру (у noctalia это
+`noctalia msg media toggle|next|previous`). Минус: когда на шине висит
+второй плеер — мессенджер, браузер — «дальше» может уехать туда.
+
+**Напрямую — клавиши всегда управляют музыкой:**
 
 ```conf
-bindl = , XF86AudioPlay,  exec, tmus toggle
-bindl = , XF86AudioNext,  exec, tmus next
-bindl = , XF86AudioPrev,  exec, tmus prev
-bindl = , XF86AudioStop,  exec, tmus stop
-bind  = SUPER, M,         exec, kitty -e tmus
+bindl = , XF86AudioPlay, exec, ~/.cargo/bin/tmus toggle
+bindl = , XF86AudioNext, exec, ~/.cargo/bin/tmus next
+bindl = , XF86AudioPrev, exec, ~/.cargo/bin/tmus prev
+bindl = , XF86AudioStop, exec, ~/.cargo/bin/tmus stop
 ```
 
-`bindl` вместо `bind` — чтобы клавиши работали и на залоченном экране.
+`bindl`, а не `bind` — тогда клавиши работают и на залоченном экране.
+Полный путь обязателен: `~/.cargo/bin` в PATH у компоновщика обычно нет,
+и короткое `tmus` молча ничего не сделает.
+
+Системную громкость на плеер вешать не стоит: `XF86AudioRaiseVolume`
+меняет громкость всего звука, а не одного трека.
