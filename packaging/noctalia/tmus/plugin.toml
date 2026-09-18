@@ -1,6 +1,6 @@
 id = "q/tmus"
 name = "Музыка"
-version = "0.4.0"
+version = "0.5.0"
 plugin_api = 24
 author = "q"
 license = "MIT"
@@ -12,6 +12,8 @@ tags = ["multimedia"]
 [[widget]]
 id = "tmus-widget"
 entry = "widget.luau"
+audio_spectrum = true
+audio_spectrum_bands = 24
 
   [[widget.setting]]
   key = "title_width"

@@ -3,17 +3,32 @@
 local KEY = "tmus"
 local SERVICE = "q/tmus:watch"
 
+-- Цвета — ИМЕНА РОЛЕЙ палитры хоста, а не hex: хост сам резолвит их в
+-- актуальный Material-цвет, поэтому смена темы/обоев перекрашивает
+-- панель без правок плагина. Роли проверены живой пробой 19.09:
+-- surface/surface_variant/hover/surface_container_high/
+-- secondary_container/tertiary/on_surface/on_surface_variant/outline/
+-- primary/error рендерятся, а primary_container валиден, но НЕ
+-- рисуется (невидим) — его здесь сознательно нет. Играющая строка
+-- (playing) и курсорная (selected) могут численно совпасть
+-- (surface_container_high ≈ hover) — их различие держит не заливка, а
+-- маркер ▶ и accent-цвет текста играющего трека.
 local COLORS = {
-  bg = "#15110F",
-  surface = "#201A17",
-  -- Курсорная строка обязана читаться с одного взгляда: прежний
-  -- #2B211D хозяин не видел (замер 18.09, «невидно»). Играющий трек
-  -- держит запас яркости сверху, чтобы не сливаться с курсором.
-  selected = "#382823",
-  playing = "#4E352C",
-  text = "#F2E8E2",
-  muted = "#A99B94",
-  border = "#463832",
+  bg = "surface",
+  surface = "surface_variant",
+  -- Курсорная строка обязана читаться с одного взгляда: проба 18.09
+  -- показала, что прежний хозяин не видел её.
+  selected = "hover",
+  playing = "surface_container_high",
+  text = "on_surface",
+  muted = "on_surface_variant",
+  border = "outline",
+  -- До 0.4.0 accent использовался в 9 местах (заголовки, активные
+  -- глифы, прогресс), но не был определён — при --!nonstrict туда
+  -- тихо уходил nil.
+  accent = "primary",
+  -- Зарезервировано под будущие ошибки (срыв потока, отказ демона).
+  error = "error",
 }
 local FONT = "Agave Nerd Font"
 local RAIL = 64
@@ -120,6 +135,19 @@ local selected = nil
 local playlistId = ""
 local playlistTitle = ""
 local playlistArtPath = ""
+-- Спектр: CSV-строка значений полос, публикуемая виджетом в лёгкий
+-- ключ "tmus.spectrum" (троттлинг ≥125 мс — 8 Гц, тяжёлый snapshot
+-- KEY "tmus" не дёргается). nil — бары не рисуются.
+local spectrum = nil
+-- Ввод имени нового плейлиста (Library): буфер ведёт onKey, как в
+-- поиске — захваченные клавиши до сфокусированного поля не доходят.
+local plNaming = false
+local plName = ""
+-- Трек, который надо добавить в только что созданный плейлист (из
+-- поповера «в плейлист» → «+ New playlist…»).
+local plAddAfterCreate = nil
+-- Поповер выбора плейлиста для трека: { track = "prov:id", cursor = n }.
+local plPicker = nil
 local query = ""
 local lastSearched = nil
 -- Вим-модальность поля поиска: typing=true — insert (буквы идут в
@@ -176,6 +204,38 @@ local function eqBar(gain)
   return table.concat(cells)
 end
 
+-- Ряд полос спектра из CSV-строки ("0.12,0.87,..."). Разбираем каждый
+-- draw(): строка крошечная, а кэш усложнил бы синк с троттлингом
+-- виджета. Панель НЕ считает темп сама: виджет публикует не чаще 8 Гц
+-- (троттлинг ≥125 мс на его стороне — полный render у виджета дорог),
+-- панель просто рисует последнее присланное значение. Значения вне
+-- [0..1] клампятся: бар высотой value*maxHeight, минимум 1 px, чтобы
+-- нулевая полоса оставляла базовую линию.
+local function spectrumBars(count, maxHeight, barWidth, gap)
+  local values = {}
+  local at = 1
+  for num in string.gmatch(tostring(spectrum or ""), "([^,]+)") do
+    if at > count then
+      break
+    end
+    local v = tonumber(num) or 0
+    values[at] = math.max(0, math.min(1, v))
+    at = at + 1
+  end
+  local bars = {}
+  for i = 1, count do
+    local v = values[i] or 0
+    bars[i] = ui.box({
+      key = "spec-bar" .. i,
+      width = barWidth or 6,
+      height = math.max(1, math.floor(v * maxHeight + 0.5)),
+      radius = 1,
+      fill = COLORS.accent,
+    })
+  end
+  return ui.row({ key = "spec-bars", gap = gap or 2, align = "center" }, bars)
+end
+
 local function clock(seconds)
   local total = math.floor(tonumber(seconds) or 0)
   if total < 0 then
@@ -227,6 +287,17 @@ local function idOf(row)
     return tostring(id or "")
   end
   return tostring(id.provider or "") .. ":" .. tostring(id.id or "")
+end
+
+-- Ссылка на плейлист для IPC "pl": БЕЗ двоеточий. Сервис разбирает
+-- add/rm как "^([^:]+):([^:]+):(.+)$" — составной idOf вида "prov:id"
+-- сломал бы разбор, поэтому передаём голый id (CLI находит плейлист
+-- сам). По той же причине имя плейлиста после create чистим от ':'.
+local function plRef(p)
+  if type(p.id) == "table" then
+    return tostring(p.id.id or "")
+  end
+  return tostring(p.id or "")
 end
 
 -- Оценка трека из snapshot.ratings (map "provider:id" →
@@ -474,6 +545,14 @@ local function trackRow(i, t, opts)
     lbl(shorten(o.subtitle, 32), { key = "sub" .. i, color = COLORS.muted, maxWidth = 220 }),
     lbl(o.time or "", { key = "time" .. i, color = COLORS.muted, width = 56 }),
   }
+  -- Мини-спектр у играющей строки: 7 полос до 8 px в блоке ~44 px.
+  -- Только для current и только пока виден спектр — иначе строки
+  -- списков не меняют геометрию при скролле.
+  if current and spectrum then
+    table.insert(children, ui.box({ key = "spec-mini" .. i, width = 44 }, {
+      spectrumBars(7, 8, 4, 2),
+    }))
+  end
   return ui.row({
     key = "track" .. i,
     gap = 10,
@@ -555,6 +634,8 @@ function rows()
         subtitle = count and (tostring(count) .. " tracks") or tostring(p.subtitle or ""),
         art = tostring(p.art_path or ""),
         provider = type(p.id) == "table" and tostring(p.id.provider or "") or "",
+        -- Голая ссылка для del (см. plRef): двоеточий нет.
+        plid = plRef(p),
         open = idOf(p),
         openTitle = tostring(p.title or ""),
         openArt = tostring(p.art_path or ""),
@@ -750,6 +831,12 @@ local function setView(id)
   -- Вход в поиск всегда начинает с insert-моды.
   inputMode = id == "search"
   typing = id == "search"
+  -- Ввод имени и поповер плейлистов живут только в вью, где открыты:
+  -- смена вида (Esc, ctrl+j/k, клик по рейлу) обязана вернуть бинды.
+  plNaming = false
+  plName = ""
+  plAddAfterCreate = nil
+  plPicker = nil
 end
 
 local function railNode()
@@ -909,6 +996,9 @@ local function homeWorkspace(s)
         lbl("Now Playing", { key = "np-over", size = 12, color = COLORS.muted }),
         lbl(shorten(tostring(s.title or ""), 34), { key = "np-title", size = 26, color = COLORS.text }),
         lbl(shorten(tostring(s.artist or ""), 40), { key = "np-artist", size = 16, color = COLORS.accent }),
+        -- Спектр в хиро: ~20 полос до 28 px, рисуется только пока
+        -- виджет публикует "tmus.spectrum" (nil — тихо пропускаем).
+        spectrum and spectrumBars(20, 28) or nil,
         lbl((tostring(s.album or "") ~= "" and shorten(s.album, 40) .. "  ·  " or "")
           .. clock(pos) .. (dur > 0 and (" / " .. clock(dur)) or "")
           .. (#marks > 0 and ("  ·  " .. table.concat(marks, " · ")) or ""), {
@@ -1227,6 +1317,98 @@ local function chipNode(kind, title)
   })
 end
 
+-- Ввод имени нового плейлиста: как поиск, буфер ведёт onKey (витрину
+-- рисует Library-заголовок). forTrack — трек, который после создания
+-- надо сразу добавить.
+local function startPlNaming(forTrack)
+  plNaming = true
+  plName = ""
+  plAddAfterCreate = forTrack
+end
+
+local function cancelPlNaming()
+  plNaming = false
+  plName = ""
+  plAddAfterCreate = nil
+end
+
+local function submitPlNaming()
+  local name = string.gsub(plName, ":", "")
+  local add = plAddAfterCreate
+  cancelPlNaming()
+  if name == "" then
+    return
+  end
+  if add then
+    -- Создание и добавление — ОДНО составное событие: id нового
+    -- плейлиста знает только сервис (он видит stdout `tmus pl new`),
+    -- панели он недоступен. Разбор `add:NAME:…` в сервисе по имени
+    -- был бы гонкой с дубликатами имён — newadd делает цепочку
+    -- детерминированной.
+    poke("pl", "newadd:" .. name .. ":" .. add)
+  else
+    poke("pl", "new:" .. name)
+  end
+end
+
+-- Трек для «a — в плейлист»: на home — играющий, иначе строка под
+-- курсором (нужна kind=="track" и составной id "prov:id").
+local function trackForAdd()
+  if view == "home" then
+    local idstr = tostring(snapshot.trackId or "")
+    if idstr ~= "" then
+      return idstr
+    end
+    return nil
+  end
+  local row = rows()[cursor]
+  if row and row.kind == "track" and row.id then
+    return row.id
+  end
+  return nil
+end
+
+-- Поповер «в плейлист»: отдельного оверлей-слоя у panel.render нет,
+-- поэтому рисуем карточку выбора вместо правой context-колонки —
+-- это самый дешёвый «поповер» без нового API. Состояние в plPicker
+-- (track + cursor), пункты = «+ New playlist…» + snapshot.playlists.
+local function playlistPickerNode(s)
+  local items = { { title = "+ New playlist…" } }
+  for _, p in ipairs(s.playlists or {}) do
+    table.insert(items, { ref = plRef(p), title = tostring(p.title or "") })
+  end
+  if plPicker.cursor > #items then
+    plPicker.cursor = #items
+  end
+  if plPicker.cursor < 1 then
+    plPicker.cursor = 1
+  end
+  local out = { contextTitle("Add to playlist") }
+  for i, item in ipairs(items) do
+    local active = i == plPicker.cursor
+    table.insert(out, ui.row({
+      key = "plpick" .. i,
+      gap = 8,
+      paddingH = 10,
+      paddingV = 6,
+      radius = 6,
+      align = "center",
+      fill = active and COLORS.selected or COLORS.surface,
+      onClick = function()
+        plPicker.cursor = i
+        draw()
+      end,
+    }, {
+      lbl(shorten(item.title, 34), {
+        key = "plpick-t" .. i,
+        grow = 1,
+        color = active and COLORS.accent or COLORS.text,
+      }),
+    }))
+  end
+  return ui.column({ key = "pl-picker", gap = 6, flexGrow = 3 }, out)
+end
+
 function draw()
   local s = snapshot
   local items = rows()
@@ -1309,7 +1491,16 @@ function draw()
       }))
     end
     workspace = ui.column({ key = "ws", gap = GAP, flexGrow = 7 }, {
-      lbl("Library", { key = "ws-title", size = 18, color = COLORS.text }),
+      -- Во время ввода имени заголовок превращается в витрину буфера
+      -- (клавиши захвачены, ui.input до них не доходит — грабля из
+      -- поиска), подсказка объясняет Enter/Esc.
+      plNaming
+        and lbl("New playlist: " .. plName .. "▌  (Enter — создать · Esc — отмена)", {
+          key = "pl-name-hint",
+          size = 14,
+          color = COLORS.accent,
+        })
+        or lbl("Library", { key = "ws-title", size = 18, color = COLORS.text }),
       ui.column({ key = "ws-body", gap = GAP, flexGrow = 1 }, body),
     })
   elseif view == "playlist" then
@@ -1373,6 +1564,11 @@ function draw()
     context = clientsContext(s)
   end
 
+  -- Поповер выбора плейлиста перекрывает обычный context в любом виде.
+  if plPicker then
+    context = playlistPickerNode(s)
+  end
+
   local main = ui.row({
     key = "main",
     gap = GAP,
@@ -1394,7 +1590,7 @@ function draw()
       and "j/k move · h/l adjust · Return toggle · 0 flat · 1-6 views"
       or "ctrl+j/k views · 1–6 views · j/k move · Return open · Space play/pause · h/l back/deep · "
         .. "/ search (i insert · jj/Esc normal) · n/p track · r repeat · s shuffle · < /> vol · "
-        .. "f/d rate · ctrl+d hidden · o terminal · g ends",
+        .. "f/d rate · ctrl+d hidden · o terminal · g ends · a в плейлист · D удалить",
     { key = "footer", size = 11, color = COLORS.muted }
   )
 
@@ -1491,6 +1687,10 @@ local function runHeld()
     -- (350 мс разгон, затем каждые 80 мс), а не медиа-клавиш.
     query = string.sub(query, 1, -2)
     return true
+  elseif action == "pl-delete" then
+    -- Тот же BackSpace, но в буфере имени плейлиста.
+    plName = string.sub(plName, 1, -2)
+    return true
   elseif action == "h" or action == "l" then
     return handleViewKeys(action)
   elseif action == "next" then
@@ -1574,6 +1774,58 @@ function onKey(chord, pressed)
     local action = chord == "XF86AudioNext" and "next" or "prev"
     poke(action)
     startHold(chord, action)
+    return
+  end
+
+  -- Ввод имени плейлиста: тот же принцип, что и поиск — клавиши
+  -- захвачены хостом, буфер ведём сами, витрина в заголовке Library.
+  if plNaming then
+    if chord == "Return" then
+      submitPlNaming()
+    elseif chord == "Escape" then
+      cancelPlNaming()
+    elseif chord == "BackSpace" or chord == "Backspace" then
+      plName = string.sub(plName, 1, -2)
+      startHold(chord, "pl-delete")
+    elseif chord == "Space" then
+      if #plName < 64 then
+        plName = plName .. " "
+      end
+    else
+      local ch = TEXT_CHARS[chord]
+      if ch and #plName < 64 then
+        plName = plName .. ch
+      end
+    end
+    draw()
+    return
+  end
+
+  -- Поповер выбора плейлиста: j/k — навигация, Enter — добавить (или
+  -- уйти в ввод имени), Esc — отмена. Всё локально, демона не дёргаем
+  -- до подтверждения.
+  if plPicker then
+    local count = 1 + #(snapshot.playlists or {})
+    if chord == "Escape" then
+      plPicker = nil
+    elseif chord == "Return" then
+      if plPicker.cursor == 1 then
+        local track = plPicker.track
+        plPicker = nil
+        startPlNaming(track)
+      else
+        local pl = (snapshot.playlists or {})[plPicker.cursor - 1]
+        if pl then
+          poke("pl", "add:" .. plRef(pl) .. ":" .. plPicker.track)
+        end
+        plPicker = nil
+      end
+    elseif key == "j" or chord == "Down" then
+      plPicker.cursor = plPicker.cursor % count + 1
+    elseif key == "k" or chord == "Up" then
+      plPicker.cursor = (plPicker.cursor - 2) % count + 1
+    end
+    draw()
     return
   end
 
@@ -1725,6 +1977,46 @@ function onKey(chord, pressed)
     rateSelected("liked")
   elseif key == "d" then
     rateSelected("disliked")
+  elseif chord == "A" or chord == "Cyrillic_f" then
+    -- a: Library — ввод имени нового плейлиста; в списках треков —
+    -- поповер «в плейлист». chord приходит в верхнем регистре (сглаживает
+    -- хост), ЛАТИНИЦА: физическая «a» на ЙЦУКЕН — это Cyrillic_f.
+    -- В виде поиска 'a' недоступна: там insert-режим съедает буквы.
+    if view == "library" then
+      startPlNaming(nil)
+    else
+      local track = trackForAdd()
+      if track then
+        plPicker = { track = track, cursor = 1 }
+      end
+    end
+  elseif chord == "D" or chord == "Cyrillic_v" then
+    -- D (shift+d): удаление. Прямой chord проверяем ДО LAYOUT: таблица
+    -- мапит заглавные в нижний регистр, и D→"d" столкнулся бы с
+    -- rateSelected("disliked"). В плейлисте — убрать трек под курсором,
+    -- в Library на карточке плейлиста — удалить сам плейлист.
+    -- pullLibrary() на стороне сервиса перезакажет список, панель
+    -- обновится через watch KEY "tmus".
+    if view == "playlist" then
+      local row = rows()[cursor]
+      local ref
+      if row and row.kind == "track" and row.id then
+        for _, pl in ipairs(snapshot.playlists or {}) do
+          if idOf(pl) == playlistId then
+            ref = plRef(pl)
+            break
+          end
+        end
+        if ref then
+          poke("pl", "rm:" .. ref .. ":" .. row.id)
+        end
+      end
+    elseif view == "library" then
+      local row = rows()[cursor]
+      if row and row.kind == "playlist" and (row.plid or "") ~= "" then
+        poke("pl", "del:" .. row.plid)
+      end
+    end
   elseif chord == "ctrl+d" then
     -- Тогл показа дизлайкнутых: фильтрует rows() локально, демона
     -- не дёргает. Ловится только здесь (не в insert-режиме поиска),
@@ -1794,3 +2086,11 @@ noctalia.state.watch("tmus.now", function(now)
   draw()
 end)
 refresh(noctalia.state.get(KEY))
+-- Спектр: лёгкий ключ от виджета, троттлинг ≥125 мс (8 Гц) — на
+-- стороне виджета, панель не считает и не рисует чаще, чем приходят
+-- значения; тяжёлый snapshot KEY "tmus" не трогаем (аудит 18.09).
+-- nil/пустая строка — бары пропадают до следующего значения.
+noctalia.state.watch("tmus.spectrum", function(v)
+  spectrum = (type(v) == "string" and v ~= "") and v or nil
+  draw()
+end)

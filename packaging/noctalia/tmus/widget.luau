@@ -175,6 +175,24 @@ function onMiddleClick()
   poke("next")
 end
 
+-- Спектр хоста (аудио-мост): полосы приходят строкой CSV. Пишем только
+-- лёгкий ключ "tmus.spectrum" — панель подписана на него watch'ем и
+-- перерисовывается сама; полный snapshot KEY "tmus" не трогаем.
+-- Троттлинг ≥125 мс: потолок перерисовки панели — полный draw 8 раз/с
+-- (аудит 18.09), чаще писать бессмысленно. Спектр без слушателя всё
+-- равно пишется — это один маленький ключ, дешевле, чем ветвиться.
+local SPECTRUM_MS = 125
+local lastSpectrumAt = 0
+
+function onAudioSpectrum(valuesCsv, stateCsv)
+  local now = noctalia.nowMs()
+  if now - lastSpectrumAt < SPECTRUM_MS then
+    return
+  end
+  lastSpectrumAt = now
+  noctalia.state.set("tmus.spectrum", tostring(valuesCsv or ""))
+end
+
 function onRightClick()
   poke("toggle")
 end

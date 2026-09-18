@@ -403,6 +403,11 @@ local function onEvent(line)
     else
       data.ratings[key] = tostring(got.rating)
     end
+  elseif kind == "playlists_changed" then
+    -- Демон шлёт только сигнал без списка: перечитываем library целиком —
+    -- полный ответ дешевле инкрементальных правок на 18 плейлистов, а
+    -- панель обновится через watch тяжёлого ключа после publish().
+    pullLibrary()
   elseif kind == "state_changed" then
     applyState(got.state)
   elseif kind == "queue_changed" then
@@ -498,6 +503,47 @@ function onIpc(event, payload)
     local want, id = tostring(payload):match("^([%a]+):(.+)$")
     if (want == "like" or want == "dislike" or want == "none") and id and id ~= "" then
       poke({ "rate", id, want })
+    end
+  elseif event == "pl" and payload then
+    -- Кастомные плейлисты: панель шлёт "new:<title>" |
+    -- "newadd:<title>:<prov>:<id>" | "add:<pl>:<prov>:<id>" |
+    -- "rm:<pl>:<prov>:<id>" | "del:<pl>". После успешного вызова
+    -- перечитываем библиотеку целиком: демон шлёт только сигнал
+    -- (playlists_changed), полный список дешевле инкрементальных правок
+    -- на 18 плейлистов.
+    local op, rest = tostring(payload):match("^([%a]+):(.*)$")
+    if op == "new" then
+      call({ "pl", "new", rest }, nil, function() pullLibrary() end)
+    elseif op == "newadd" then
+      -- Создание + немедленное добавление трека. id нового плейлиста
+      -- существует только в stdout `pl new` (голая строка, не JSON),
+      -- поэтому цепочка живёт здесь: call() прогоняет stdout через
+      -- json.decode и голый id наружу не отдаёт — runAsync напрямую,
+      -- по образцу call(). Панель слала бы add по ИМЕНИ — гонка с
+      -- дубликатами имён; в цепочке id точный.
+      local title, prov, tid = rest:match("^([^:]+):([^:]+):(.+)$")
+      if title and prov and tid then
+        noctalia.runAsync({ TMUS, "pl", "new", title }, function(res)
+          if not res or res.exitCode ~= 0 then
+            data.error = res and noctalia.string.trim(res.stderr or "") ~= ""
+              and noctalia.string.trim(res.stderr) or "tmus не ответил"
+            publish()
+            return
+          end
+          local plId = noctalia.string.trim(res.stdout or "")
+          if plId == "" then
+            return
+          end
+          call({ "pl", "add", plId, prov .. ":" .. tid }, nil, function() pullLibrary() end)
+        end)
+      end
+    elseif op == "add" or op == "rm" then
+      local plId, prov, tid = rest:match("^([^:]+):([^:]+):(.+)$")
+      if plId and prov and tid then
+        call({ "pl", op, plId, prov .. ":" .. tid }, nil, function() pullLibrary() end)
+      end
+    elseif op == "del" and rest ~= "" then
+      call({ "pl", "del", rest }, nil, function() pullLibrary() end)
     end
   elseif event == "playlist" and payload then
     poke({ "play-playlist", payload, "--start", "0" })
