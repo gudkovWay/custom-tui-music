@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{CoreError, Result};
-use crate::model::{Playlist, PlaylistId, ProviderId, Track, TrackId};
+use crate::model::{Playlist, PlaylistId, ProviderId, Rating, Track, TrackId};
 use crate::paths::Paths;
 use crate::protocol::CacheStats;
 
@@ -87,6 +87,18 @@ CREATE TABLE IF NOT EXISTS playlist_sync (
     playlist    TEXT    NOT NULL,
     updated_at  INTEGER NOT NULL,
     PRIMARY KEY (provider, playlist)
+);
+
+-- Локальный журнал оценок. Дублирует состояние на сервере намеренно:
+-- панель должна показывать оценку мгновенно и офлайн, а подтверждение
+-- сервера приходит асинхронно. `Rating::None` в таблице не живёт —
+-- отсутствие оценки это отсутствие строки, а не её значение.
+CREATE TABLE IF NOT EXISTS ratings (
+    provider    TEXT    NOT NULL,
+    id          TEXT    NOT NULL,
+    kind        TEXT    NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (provider, id)
 );
 
 -- gc ходит именно так: незакреплённые, самые старые первыми.
@@ -356,6 +368,112 @@ impl Cache {
             return Ok(None);
         }
         self.playlist_tracks(id).map(Some)
+    }
+
+    /// Сбросить метку свежести состава плейлиста: следующий запрос пойдёт
+    /// в сеть, а не в TTL-ветку [`Cache::playlist_tracks_if_fresh`].
+    ///
+    /// Нужен после лайка у провайдера: плейлист лайкнутого (`LM`) меняется
+    /// на сервере, и держать состав ещё `PLAYLIST_TTL_SECS` значило бы
+    /// показывать библиотеку без только что добавленного трека.
+    pub fn forget_playlist_sync(&self, id: &PlaylistId) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM playlist_sync WHERE provider = ?1 AND playlist = ?2",
+                params![id.provider.as_str(), id.id.as_str()],
+            )
+            .map_err(|e| self.db_error(e))?;
+        Ok(())
+    }
+
+    /// Сохранить оценку трека. `Rating::None` удаляет строку: отсутствие
+    /// оценки — отсутствие записи, а не значение `kind`.
+    pub fn set_rating(&self, id: &TrackId, rating: Rating) -> Result<()> {
+        if rating == Rating::None {
+            self.conn
+                .execute(
+                    "DELETE FROM ratings WHERE provider = ?1 AND id = ?2",
+                    params![id.provider.as_str(), id.id.as_str()],
+                )
+                .map_err(|e| self.db_error(e))?;
+            return Ok(());
+        }
+        self.conn
+            .execute(
+                "INSERT INTO ratings (provider, id, kind, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (provider, id) DO UPDATE SET
+                     kind = excluded.kind,
+                     updated_at = excluded.updated_at",
+                params![
+                    id.provider.as_str(),
+                    id.id.as_str(),
+                    rating_kind(rating),
+                    now_secs()
+                ],
+            )
+            .map_err(|e| self.db_error(e))?;
+        Ok(())
+    }
+
+    /// Локальная оценка трека, если она есть.
+    pub fn get_rating(&self, id: &TrackId) -> Result<Option<Rating>> {
+        let kind: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT kind FROM ratings WHERE provider = ?1 AND id = ?2",
+                params![id.provider.as_str(), id.id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| self.db_error(e))?;
+        Ok(kind.and_then(|kind| match rating_from_kind(&kind) {
+            Some(rating) => Some(rating),
+            // Испорченная строка не должна подменять оценку «какой-нибудь»:
+            // пропускаем с журналом, как в [`Cache::ratings`].
+            None => {
+                tracing::debug!(provider = %id.provider, id = %id.id, %kind,
+                    "неизвестный kind оценки в кэше — запись пропущена");
+                None
+            }
+        }))
+    }
+
+    /// Все локальные оценки. Порядок не специфицирован: потребитель —
+    /// панель, ей порядок безразличен.
+    pub fn ratings(&self) -> Result<Vec<(TrackId, Rating)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT provider, id, kind FROM ratings")
+            .map_err(|e| self.db_error(e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| self.db_error(e))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (provider, id, kind) = row.map_err(|e| self.db_error(e))?;
+            let Some(rating) = rating_from_kind(&kind) else {
+                tracing::debug!(%provider, %id, %kind,
+                    "неизвестный kind оценки в кэше — запись пропущена");
+                continue;
+            };
+            // Незнакомое имя провайдера здесь не ошибка базы, а мусорная
+            // строка: `provider_from_db` громко падает, а список оценок
+            // обязан читаться целиком. Поэтому тихий skip с журналом.
+            let Some(provider) = ProviderId::from_name(&provider) else {
+                tracing::debug!(%provider, %id,
+                    "провайдер оценки не объявлен в ядре — запись пропущена");
+                continue;
+            };
+            out.push((TrackId::new(provider, id), rating));
+        }
+        Ok(out)
     }
 
     /// Куда класть скачанный файл.
@@ -718,6 +836,29 @@ fn provider_from_db(name: &str) -> rusqlite::Result<ProviderId> {
         })
 }
 
+/// Строковое представление оценки в базе. Один источник истины с
+/// serde-представлением [`Rating`] (`snake_case`): вторая таблица
+/// констант рядом с ним разошлась бы молча.
+fn rating_kind(rating: Rating) -> &'static str {
+    match rating {
+        Rating::None => "none",
+        Rating::Liked => "liked",
+        Rating::Disliked => "disliked",
+    }
+}
+
+/// Обратное [`rating_kind`]. Незнакомая строка — не паника: база общая
+/// для версий программы, и чтение старой/чужой записи не должно валить
+/// демон.
+fn rating_from_kind(kind: &str) -> Option<Rating> {
+    match kind {
+        "none" => Some(Rating::None),
+        "liked" => Some(Rating::Liked),
+        "disliked" => Some(Rating::Disliked),
+        _ => None,
+    }
+}
+
 /// Оставить в имени только `[A-Za-z0-9_-]`, остальное заменить на `_`.
 ///
 /// Точка тоже заменяется — поэтому `..` в имени не собирается, и выйти из
@@ -848,6 +989,84 @@ mod tests {
             .put_playlist_tracks(&playlist, &shorter)
             .expect("put");
         assert_eq!(cache.playlist_tracks(&playlist).expect("get"), shorter);
+    }
+
+    #[test]
+    fn rating_round_trip() {
+        let (_dir, cache) = bench(u64::MAX);
+        let a = TrackId::new(ProviderId::YTMUSIC, "vid-a");
+        let b = TrackId::new(ProviderId::YTMUSIC, "vid-b");
+
+        assert_eq!(cache.get_rating(&a).expect("get"), None);
+
+        cache.set_rating(&a, Rating::Liked).expect("set liked");
+        cache.set_rating(&b, Rating::Disliked).expect("set disliked");
+        assert_eq!(cache.get_rating(&a).expect("get"), Some(Rating::Liked));
+
+        // Перезапись оценки тем же треком не дублирует строки: ключ
+        // составной (provider, id).
+        cache.set_rating(&a, Rating::Disliked).expect("overwrite");
+        assert_eq!(cache.get_rating(&a).expect("get"), Some(Rating::Disliked));
+
+        let mut ratings = cache.ratings().expect("list");
+        ratings.sort_by(|x, y| x.0.id.cmp(&y.0.id));
+        assert_eq!(
+            ratings,
+            vec![(a.clone(), Rating::Disliked), (b.clone(), Rating::Disliked)]
+        );
+    }
+
+    #[test]
+    fn rating_none_deletes_row() {
+        let (_dir, cache) = bench(u64::MAX);
+        let id = TrackId::new(ProviderId::YTMUSIC, "vid-a");
+        cache.set_rating(&id, Rating::Liked).expect("set");
+        cache.set_rating(&id, Rating::None).expect("unset");
+        assert_eq!(cache.get_rating(&id).expect("get"), None);
+        assert!(cache.ratings().expect("list").is_empty());
+    }
+
+    #[test]
+    fn rating_unknown_kind_is_skipped() {
+        let (_dir, cache) = bench(u64::MAX);
+        cache
+            .conn
+            .execute(
+                "INSERT INTO ratings (provider, id, kind, updated_at)
+                 VALUES ('ytmusic', 'good', 'liked', 0),
+                        ('ytmusic', 'bad', 'meh', 0),
+                        ('nosuch', 'x', 'liked', 0)",
+                [],
+            )
+            .expect("insert");
+        let ratings = cache.ratings().expect("list");
+        assert_eq!(ratings.len(), 1, "мусорные строки пропущены: {ratings:?}");
+        assert_eq!(ratings[0].0.id, "good");
+
+        // Чтение одной записи тоже не поднимает мусорную строку.
+        let bad = TrackId::new(ProviderId::YTMUSIC, "bad");
+        assert_eq!(cache.get_rating(&bad).expect("get"), None);
+    }
+
+    #[test]
+    fn playlist_sync_invalidation_forces_network_path() {
+        let (_dir, cache) = bench(u64::MAX);
+        let id = PlaylistId::new(ProviderId::YTMUSIC, "LM");
+        let tracks = vec![track(ProviderId::YTMUSIC, "t1", "Трек")];
+        cache.put_playlist_tracks(&id, &tracks).expect("put");
+        assert_eq!(
+            cache
+                .playlist_tracks_if_fresh(&id, 600)
+                .expect("fresh")
+                .expect("попадание в TTL"),
+            tracks
+        );
+        cache.forget_playlist_sync(&id).expect("forget");
+        assert_eq!(
+            cache.playlist_tracks_if_fresh(&id, 600).expect("stale"),
+            None,
+            "после сброса метки состав считается устаревшим"
+        );
     }
 
     #[test]

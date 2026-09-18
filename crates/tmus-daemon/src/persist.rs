@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tmus_core::model::{LoopMode, Track};
+use tmus_core::model::{EqState, LoopMode, Track};
 use tmus_core::paths::Paths;
 use tmus_core::protocol::Event;
 
@@ -27,6 +27,15 @@ struct PersistState {
     index: Option<usize>,
     loop_mode: LoopMode,
     shuffle: bool,
+    /// Громкость на момент записи. `Option` + `default`: старые
+    /// queue.json без этих полей обязаны парситься — миграции формата
+    /// нет, и обратная совместимость достигается отсутствием значения.
+    #[serde(default)]
+    volume: Option<f64>,
+    /// Состояние эквалайзера. `None` для старых файлов: тогда действует
+    /// конфиговый EQ, наложенный на старте до `restore`.
+    #[serde(default)]
+    equalizer: Option<EqState>,
 }
 
 /// Путь файла очереди. Каталог тот же, куда пишет
@@ -49,6 +58,8 @@ pub async fn flush_now(app: &App) -> anyhow::Result<()> {
         index: snapshot.1,
         loop_mode: snapshot.2,
         shuffle: snapshot.3,
+        volume: Some(app.player().volume().await),
+        equalizer: Some(app.player().equalizer().await),
     };
     let file = queue_file(app.paths());
     let tmp = file.with_extension("json.tmp");
@@ -67,12 +78,31 @@ pub async fn flush_now(app: &App) -> anyhow::Result<()> {
 pub async fn run(app: Arc<App>) {
     let mut events = app.subscribe();
     let mut dirty = false;
+    // Последняя записанная пара (громкость, эквалайзер). `None` — ещё
+    // не видели ни одного StateChanged: первый инициализирует `last`
+    // без выставки dirty, иначе каждый старт демона делал бы лишнюю
+    // запись даже без единого изменения. StateChanged идёт и на смену
+    // трека, и на паузу — писать из-за них нечего, сравнение до
+    // выставки dirty отсеивает шум; Position каждую секунду сюда не
+    // попадает вовсе.
+    let mut last: Option<(f64, EqState)> = None;
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             event = events.recv() => match event {
                 Ok(Event::QueueChanged { .. } | Event::TrackChanged { .. }) => dirty = true,
+                Ok(Event::StateChanged { state }) => {
+                    let now = (state.volume, state.equalizer.clone());
+                    match &last {
+                        None => last = Some(now),
+                        Some(prev) if *prev != now => {
+                            last = Some(now);
+                            dirty = true;
+                        }
+                        Some(_) => {}
+                    }
+                }
                 Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             },
@@ -112,5 +142,52 @@ pub async fn restore(app: &App) {
     app.player()
         .with_queue(|q| q.restore(state.queue, state.index, state.loop_mode, state.shuffle))
         .await;
+    // Громкость и эквалайзер применяются после очереди и НЕ валят старт:
+    // битое сохранённое значение не должно стоить человеку музыки.
+    if let Some(volume) = state.volume {
+        if let Err(err) = app.player().set_volume(volume).await {
+            tracing::warn!(%err, "сохранённая громкость не применилась");
+        }
+    }
+    if let Some(eq) = state.equalizer {
+        if let Err(err) = app.player().set_equalizer(eq).await {
+            tracing::warn!(%err, "сохранённый эквалайзер не применился");
+        }
+    }
     tracing::info!("очередь восстановлена: {} треков", len);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Старый queue.json без volume/equalizer обязан парситься: миграции
+    /// формата нет, а отсутствие полей — штатный случай первого запуска
+    /// после обновления.
+    #[test]
+    fn old_snapshot_without_audio_fields_parses_as_none() {
+        let state: PersistState = serde_json::from_str(
+            r#"{"queue":[],"index":null,"loop_mode":"none","shuffle":false}"#,
+        )
+        .expect("старый снапшот обязан парситься");
+        assert_eq!(state.volume, None);
+        assert_eq!(state.equalizer, None);
+    }
+
+    /// Новый снапшот несёт громкость и эквалайзер: парсятся как есть.
+    #[test]
+    fn new_snapshot_with_audio_fields_parses_values() {
+        let state: PersistState = serde_json::from_str(
+            r#"{"queue":[],"index":null,"loop_mode":"none","shuffle":false,
+                "volume":73.5,
+                "equalizer":{"enabled":true,"preset":"Rock","bands":[5.0,4.0,2.0,0.0,-1.0,-1.0,0.0,2.0,4.0,5.0]}}"#,
+        )
+        .expect("новый снапшот обязан парситься");
+        assert_eq!(state.volume, Some(73.5));
+        let eq = state.equalizer.expect("эквалайзер должен быть");
+        assert!(eq.enabled);
+        assert_eq!(eq.preset, "Rock");
+        assert_eq!(eq.bands[0], 5.0);
+    }
+}
+

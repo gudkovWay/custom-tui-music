@@ -17,7 +17,7 @@ use std::sync::Arc;
 use tmus_core::cache::Cache;
 use tmus_core::config::Config;
 use tmus_core::model::{
-    PlaybackStatus, PlaylistId, Track, TrackId,
+    eq_presets, PlaybackStatus, PlaylistId, Track, TrackId, EQ_GAIN_LIMIT_DB,
 };
 use tmus_core::paths::Paths;
 use tmus_core::protocol::{Ack, CatalogSource, Cmd, Event, Payload, QueueView};
@@ -232,6 +232,58 @@ impl App {
                 self.emit_state().await;
                 Ok(Payload::Ack(Ack::default()))
             }
+            Cmd::Equalizer { enabled, preset, bands } => {
+                // Частичная команда сливается с текущим состоянием:
+                // опущенные поля остаются как были (см. serde-контракт
+                // `Cmd::Equalizer` в ядре).
+                let mut eq = self.player.equalizer().await;
+                if let Some(v) = enabled {
+                    eq.enabled = v;
+                }
+                if let Some(name) = preset {
+                    match eq_presets().iter().find(|(n, _)| *n == name) {
+                        // Пресет подставляет и имя, и табличные полосы:
+                        // держать полосы без имени значило бы терять
+                        // происхождение настройки при следующем рестарте.
+                        Some((matched, table)) => {
+                            eq.preset = (*matched).to_owned();
+                            eq.bands = *table;
+                        }
+                        None => {
+                            // Не перечисляем пресеты — их двадцать, а
+                            // клиенты знают их из eq_presets(). Намёк на
+                            // формат дешевле и полезнее простыни имён.
+                            return Err(anyhow::anyhow!(
+                                "неизвестный пресет эквалайзера {name:?}; точное имя из списка пресетов (см. eq_presets)"
+                            ));
+                        }
+                    }
+                }
+                if let Some(raw) = bands {
+                    let out_of_range = |g: f64| {
+                        !(-EQ_GAIN_LIMIT_DB..=EQ_GAIN_LIMIT_DB).contains(&g)
+                    };
+                    if raw.len() != 10 || raw.iter().copied().any(out_of_range) {
+                        return Err(anyhow::anyhow!(
+                            "bands: ожидается ровно 10 значений в диапазоне -{EQ_GAIN_LIMIT_DB}..={EQ_GAIN_LIMIT_DB} дБ"
+                        ));
+                    }
+                    let gains: [f64; 10] = raw.try_into().expect("длина проверена выше");
+                    // Точное совпадение с табличным пресетом сохраняет
+                    // его имя — пользователь выбрал пресет, а не набрал
+                    // свой; всё остальное честно зовётся Custom.
+                    eq.preset = match eq_presets().iter().find(|(_, table)| *table == gains) {
+                        Some((matched, _)) => (*matched).to_owned(),
+                        None => "Custom".to_owned(),
+                    };
+                    eq.bands = gains;
+                }
+                self.player.set_equalizer(eq).await?;
+                // emit_state публикует StateChanged — персист подхватит
+                // громкость/эквалайзер через своё правило dirty.
+                self.emit_state().await;
+                Ok(Payload::Ack(Ack::default()))
+            }
             Cmd::SetLoop { mode } => {
                 self.player.with_queue(|q| q.set_loop_mode(mode)).await;
                 self.emit_state().await;
@@ -323,6 +375,15 @@ impl App {
                 release_memory();
                 Ok(Payload::Tracks(out))
             }
+
+            // Оценки: список — из локального кэша, установка — через
+            // оптимистичную запись и сетевой вызов провайдера
+            // (см. `rate_track` в catalog.rs).
+            Cmd::Rate { track, rating } => {
+                self.rate_track(&track, rating).await?;
+                Ok(Payload::Ack(Ack::default()))
+            }
+            Cmd::Ratings => Ok(Payload::Ratings(self.with_cache(|c| c.ratings())?)),
 
             Cmd::GetCatalogSource => {
                 Ok(Payload::Catalog(self.catalog_source.lock().expect("catalog source").clone()))
@@ -437,7 +498,7 @@ impl App {
     /// отвечают `Ack` мгновенно, а не после резолва (~4 с на
     /// незакэшированном треке — закрывая давний пункт TODO). Ошибки
     /// запуска видны событием `StateChanged` и журналом демона.
-    async fn step(&self, forward: bool) -> anyhow::Result<()> {
+    pub(crate) async fn step(&self, forward: bool) -> anyhow::Result<()> {
         match self.player.skip(forward).await {
             Some(_) => Ok(()),
             None => {
@@ -492,5 +553,275 @@ pub(crate) fn release_memory() {
     // кучи, 0 значит «вернуть всё, что можно».
     unsafe {
         libc::malloc_trim(0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tmus_core::model::{AuthStatus, ProviderId, Rating};
+    use tmus_provider::{Catalog, Provider, ProviderError, Resolver};
+
+    /// Фейковый провайдер: резолв отдаёт локальный WAV (mpv играет его
+    /// без сети), rate ведёт себя по флагу — так проверяются и успех, и
+    /// сетевой сбой с откатом.
+    struct FakeProvider {
+        id: ProviderId,
+        audio: PathBuf,
+        fail_rate: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl tmus_provider::Account for FakeProvider {
+        fn provider(&self) -> ProviderId {
+            self.id
+        }
+        fn display_name(&self) -> &str {
+            "Фейк"
+        }
+        fn auth(&self) -> AuthStatus {
+            AuthStatus::Ready
+        }
+        async fn refresh(&self) -> Result<AuthStatus, ProviderError> {
+            Ok(AuthStatus::Ready)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Catalog for FakeProvider {
+        fn provider(&self) -> ProviderId {
+            self.id
+        }
+        async fn search(
+            &self,
+            _query: &str,
+            _kind: tmus_core::model::SearchKind,
+        ) -> Result<Vec<tmus_core::model::SearchResult>, ProviderError> {
+            Ok(Vec::new())
+        }
+        async fn playlists(&self) -> Result<Vec<tmus_core::model::Playlist>, ProviderError> {
+            Ok(Vec::new())
+        }
+        async fn playlist_tracks(
+            &self,
+            _playlist: &tmus_core::model::PlaylistId,
+        ) -> Result<Vec<Track>, ProviderError> {
+            Ok(Vec::new())
+        }
+        async fn liked(&self) -> Result<Vec<Track>, ProviderError> {
+            Ok(Vec::new())
+        }
+        async fn rate(&self, _id: &TrackId, _rating: Rating) -> Result<(), ProviderError> {
+            if self.fail_rate.load(Ordering::SeqCst) {
+                Err(ProviderError::Format {
+                    provider: self.id,
+                    reason: "тестовый сбой сети".to_owned(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Resolver for FakeProvider {
+        fn provider(&self) -> ProviderId {
+            self.id
+        }
+        async fn resolve(
+            &self,
+            _track: &TrackId,
+        ) -> Result<tmus_core::model::StreamSource, ProviderError> {
+            Ok(tmus_core::model::StreamSource::Local(self.audio.clone()))
+        }
+    }
+
+    impl Provider for FakeProvider {
+        fn account(&self) -> &dyn tmus_provider::Account {
+            self
+        }
+        fn catalog(&self) -> &dyn Catalog {
+            self
+        }
+        fn resolver(&self) -> &dyn Resolver {
+            self
+        }
+    }
+
+    /// Тишина в WAV-контейнере: настоящий playable-файл, чтобы mpv
+    /// честно перешёл в Playing, но без слышимого звука.
+    fn write_silence_wav(path: PathBuf) -> PathBuf {
+        const RATE: u32 = 8000;
+        const SECS: u32 = 1;
+        let samples = (RATE * SECS) as usize;
+        let data_len = (samples * 2) as u32;
+        let mut bytes = Vec::with_capacity(44 + data_len as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes()); // PCM
+        bytes.extend_from_slice(&1_u16.to_le_bytes()); // mono
+        bytes.extend_from_slice(&RATE.to_le_bytes());
+        bytes.extend_from_slice(&(RATE * 2).to_le_bytes()); // байт/с: mono 16-bit
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        bytes.resize(44 + data_len as usize, 0);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, bytes).expect("write wav");
+        path
+    }
+
+    fn sample_track(id: &TrackId) -> Track {
+        Track {
+            id: id.clone(),
+            title: id.id.clone(),
+            artists: vec!["Артист".to_owned()],
+            album: None,
+            duration: None,
+            art_url: None,
+            page_url: None,
+        }
+    }
+
+    /// Полный `App` с живым mpv (headless, сокет во временном каталоге)
+    /// и одним фейковым провайдером.
+    async fn app(fail_rate: bool) -> (Arc<App>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::under(dir.path());
+        // mpv создаёт IPC-сокет сам, но каталог run/ должен уже быть.
+        paths.ensure_dirs().expect("dirs");
+        let audio = write_silence_wav(dir.path().join("audio/silence.wav"));
+        let mut registry = Registry::new();
+        registry.insert(Arc::new(FakeProvider {
+            id: ProviderId::YTMUSIC,
+            audio,
+            fail_rate: AtomicBool::new(fail_rate),
+        }));
+        let gate = Arc::new(tokio::sync::Semaphore::new(2));
+        let player = Player::new(
+            registry.clone(),
+            std::path::PathBuf::from("mpv"),
+            &paths,
+            0.0,
+            gate.clone(),
+        )
+        .await
+        .expect("mpv запустился");
+        let cache = Arc::new(std::sync::Mutex::new(
+            Cache::open(&paths, u64::MAX).expect("cache"),
+        ));
+        let app = App::new(player, registry, cache, Config::default(), paths, gate);
+        (app, dir)
+    }
+
+    /// Успешная оценка: пишется в кэш, вещается событие и видна в
+    /// `Cmd::Ratings` — весь путь панели.
+    #[tokio::test]
+    async fn liked_rating_is_cached_broadcast_and_listed() {
+        let (app, _dir) = app(false).await;
+        let track = TrackId::new(ProviderId::YTMUSIC, "vid-1");
+        let mut events = app.subscribe();
+
+        app.handle(Cmd::Rate { track: track.clone(), rating: Rating::Liked })
+            .await
+            .expect("rate");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("событие пришло")
+            .expect("шина жива");
+        assert!(
+            matches!(&event, Event::RatingChanged { track: t, rating: Rating::Liked } if t == &track),
+            "неожиданное событие: {event:?}"
+        );
+        assert_eq!(
+            app.with_cache(|c| c.get_rating(&track)).expect("get"),
+            Some(Rating::Liked)
+        );
+
+        match app.handle(Cmd::Ratings).await.expect("ratings") {
+            Payload::Ratings(list) => assert_eq!(list, vec![(track, Rating::Liked)]),
+            other => panic!("неожиданный ответ: {other:?}"),
+        }
+    }
+
+    /// Дизлайк играющего трека скипает его немедленно.
+    #[tokio::test]
+    async fn disliked_playing_track_is_skipped() {
+        let (app, _dir) = app(false).await;
+        let first = TrackId::new(ProviderId::YTMUSIC, "vid-1");
+        let second = TrackId::new(ProviderId::YTMUSIC, "vid-2");
+        app.player
+            .with_queue(|q| {
+                q.append(sample_track(&first));
+                q.append(sample_track(&second));
+            })
+            .await;
+        app.play_track(&first).await.expect("play");
+        assert_eq!(
+            app.player.state().await.track.map(|t| t.id),
+            Some(first.clone()),
+            "первый трек должен играть"
+        );
+
+        app.handle(Cmd::Rate {
+            track: first.clone(),
+            rating: Rating::Disliked,
+        })
+        .await
+        .expect("rate");
+
+        // Скип асинхронный (короткий покой перед запуском следующего):
+        // ждём смены играющего трека, а не мгновенного состояния.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if app.player.state().await.track.as_ref().map(|t| &t.id) == Some(&second) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "дизлайк играющего трека не скипнул его"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Ошибка провайдера откатывает оптимистичную запись: и прошлое
+    /// значение возвращается, и событие не разлетается.
+    #[tokio::test]
+    async fn provider_error_rolls_back_local_rating() {
+        let (app, _dir) = app(true).await;
+        let track = TrackId::new(ProviderId::YTMUSIC, "vid-1");
+        let fresh = TrackId::new(ProviderId::YTMUSIC, "vid-2");
+        app.with_cache(|c| c.set_rating(&track, Rating::Liked))
+            .expect("seed");
+        let mut events = app.subscribe();
+
+        let result = app
+            .handle(Cmd::Rate { track: track.clone(), rating: Rating::Disliked })
+            .await;
+        assert!(result.is_err(), "ошибка провайдера обязана дойти наружу");
+        assert_eq!(
+            app.with_cache(|c| c.get_rating(&track)).expect("get"),
+            Some(Rating::Liked),
+            "прошлая оценка вернулась после отката"
+        );
+
+        // Откат из состояния «оценки не было» не оставляет строки.
+        let result = app
+            .handle(Cmd::Rate { track: fresh.clone(), rating: Rating::Liked })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(app.with_cache(|c| c.get_rating(&fresh)).expect("get"), None);
+
+        assert!(
+            events.try_recv().is_err(),
+            "при ошибке сети RatingChanged вещаться не должен"
+        );
     }
 }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tmus_core::model::{Playlist, PlaylistId, SearchKind, SearchResult, Track};
+use tmus_core::model::{Playlist, PlaylistId, Rating, SearchKind, SearchResult, Track, TrackId};
 use tmus_core::protocol::{CatalogSource, Event, ProviderView};
 
 use crate::app::App;
@@ -140,6 +140,59 @@ impl App {
             self.with_cache(|c| c.put_tracks(&out))?;
         }
         Ok(out)
+    }
+
+    /// Поставить оценку треку: локально сразу, у провайдера — в сеть.
+    ///
+    /// Порядок намеренно оптимистичный: кэш пишется ДО сетевого вызова,
+    /// чтобы панель скрыла/показала трек мгновенно; при ошибке сети
+    /// локальное состояние откатывается, и человек видит ошибку, а не
+    /// расхождение панели с сервером.
+    pub(crate) async fn rate_track(
+        &self,
+        id: &TrackId,
+        rating: Rating,
+    ) -> anyhow::Result<()> {
+        let past = self.with_cache(|c| c.get_rating(id))?;
+        self.with_cache(|c| c.set_rating(id, rating))?;
+
+        let provider = self.registry.get(id.provider).ok_or_else(|| {
+            anyhow::anyhow!("провайдер {} не подключён", id.provider)
+        })?;
+        match provider.catalog().rate(id, rating).await {
+            Ok(()) => {
+                self.emit(Event::RatingChanged { track: id.clone(), rating });
+                // Скрытие играющего дизлайком должно быть немедленным:
+                // человек как раз хочет, чтобы это ушло из ушей сейчас.
+                // Тот же `step`, что и у `Cmd::Next`: одна логика
+                // перехода на все пути.
+                if rating == Rating::Disliked {
+                    let current = self.player.state().await.track.map(|t| t.id);
+                    if current.as_ref() == Some(id) {
+                        self.step(true).await?;
+                    }
+                }
+                if rating == Rating::Liked {
+                    // Лайк улетел на сервер — плейлист лайкнутого там уже
+                    // изменился, и TTL-кэш его состава больше не правда.
+                    let liked_playlist = PlaylistId::new(id.provider, "LM");
+                    self.with_cache(|c| c.forget_playlist_sync(&liked_playlist))?;
+                }
+                Ok(())
+            }
+            Err(err) => {
+                tracing::warn!(provider = %provider.id(), %err, "оценка не принята");
+                self.report_auth(provider, &err);
+                if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
+                    self.try_reauth(provider).await;
+                }
+                // Откат: `past = None` даёт `Rating::None`, то есть
+                // удаление строки — оптимистичная запись не оставляет
+                // ложного следа.
+                self.with_cache(|c| c.set_rating(id, past.unwrap_or(Rating::None)))?;
+                Err(err.into())
+            }
+        }
     }
 
     pub(crate) fn remember(&self, results: &[SearchResult]) -> anyhow::Result<()> {
