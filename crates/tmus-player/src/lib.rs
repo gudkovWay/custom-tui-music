@@ -547,7 +547,43 @@ impl Player {
                         self.inner.changed.notify_one();
                     }
                 }
-                MpvEvent::Restarted | MpvEvent::GaveUp { .. } => {
+                MpvEvent::Restarted => {
+                    // Супервизор существует ради продолжения игры: после
+                    // рестарта mpv пуст, поэтому текущий трек запускаем
+                    // заново — как это делает on_track_end для следующего.
+                    let current = self
+                        .inner
+                        .current
+                        .lock()
+                        .await
+                        .as_ref()
+                        .map(|c| c.track_id.clone());
+                    match current {
+                        Some(id) => {
+                            self.inner
+                                .advancing
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            if let Err(e) = self.resolve_and_play(&id).await {
+                                tracing::warn!(track = %id, error = %e, "перезапуск трека после рестарта mpv не удался");
+                                self.inner
+                                    .advancing
+                                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                                *self.inner.status.lock().await = PlaybackStatus::Stopped;
+                                self.inner.changed.notify_one();
+                            }
+                        }
+                        None => {
+                            // Играть было нечего — прежнее поведение.
+                            *self.inner.status.lock().await = PlaybackStatus::Stopped;
+                            *self.inner.position.lock().await = None;
+                            self.inner
+                                .advancing
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                            self.inner.changed.notify_one();
+                        }
+                    }
+                }
+                MpvEvent::GaveUp { .. } => {
                     // Процесс умер вместе с воспроизведением; человек
                     // обязан это увидеть, а не слушать тишину.
                     *self.inner.status.lock().await = PlaybackStatus::Stopped;

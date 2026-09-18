@@ -78,6 +78,10 @@ pub fn mpv_args(socket: &Path, volume: f64) -> Vec<String> {
         "--no-terminal".into(),
         format!("--input-ipc-server={}", socket.display()),
         format!("--volume={volume}"),
+        // Кэш демуксера сглаживает старт удалённого потока до полной
+        // загрузки; локальным файлам не мешает.
+        "--cache=yes".into(),
+        "--demuxer-max-bytes=33554432".into(),
     ]
 }
 
@@ -106,6 +110,11 @@ const QUIT_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Сколько ждать, пока mpv уйдёт сам после `quit`.
 const QUIT_WAIT: Duration = Duration::from_millis(1500);
+
+/// Живой, но зависший mpv не отвечает по IPC: без таймаута он вешал бы
+/// `on_track_end`, а с ним весь цикл событий плеера. Поздний ответ просто
+/// не найдёт ждущего (запись в pending убирает reader), утечки нет.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Жив ли процесс. `kill(pid, 0)` ничего не посылает — только проверяет
 /// право послать, то есть существование процесса.
@@ -405,11 +414,12 @@ impl Mpv {
             .await
             .map_err(|_| MpvError::Closed)?;
 
-        match rx.await {
-            Ok(result) => result,
+        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(result)) => result,
             // Отправитель выброшен: reader умер и разослал ошибки, либо
             // запись в мёртвый сокет не удалась.
-            Err(_) => Err(MpvError::Closed),
+            Ok(Err(_)) => Err(MpvError::Closed),
+            Err(_) => Err(MpvError::Ipc("mpv не ответил за 5 с".into())),
         }
     }
 }
@@ -578,6 +588,13 @@ async fn supervise(
                 }
                 spawn_reader(read, inner.clone());
                 consecutive = 0;
+                // Без переподписки рестартнувший mpv жив, но молчит по
+                // свойствам: регистрации observe_property умирают вместе
+                // с упавшим процессом.
+                let mpv = Mpv { inner: Arc::clone(&inner) };
+                if let Err(e) = mpv.observe().await {
+                    tracing::warn!(%e, "observe после рестарта mpv не удался");
+                }
                 let _ = events.send(MpvEvent::Restarted).await;
             }
             Err(_) => {
@@ -609,6 +626,10 @@ mod tests {
             .iter()
             .any(|a| a == "--input-ipc-server=/run/user/1000/tmus-mpv.sock"));
         assert!(args.iter().any(|a| a == "--volume=80"));
+        assert!(args.iter().any(|a| a == "--cache=yes"), "аргументы: {args:?}");
+        assert!(args
+            .iter()
+            .any(|a| a == "--demuxer-max-bytes=33554432"));
     }
 
     #[test]
