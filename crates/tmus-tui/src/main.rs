@@ -110,6 +110,8 @@ enum CacheCmd {
     Pin { track_id: String },
     Unpin { track_id: String },
     Gc,
+    /// Докачать плейлист в офлайн-кэш в фоне.
+    Warm { playlist_id: String },
 }
 
 /// Метка жизни потока `events`: печатается при простое, парсится
@@ -229,6 +231,26 @@ async fn main() -> Result<()> {
                 Cmd::CacheUnpin { tracks: vec![parse_track_id(&track_id)?] }
             }
             CacheCmd::Gc => Cmd::CacheGc,
+            CacheCmd::Warm { playlist_id } => {
+                // Двухходовка: сначала треки плейлиста, затем заказ
+                // фонового прогрева. Ошибка любого хода — Err в caller,
+                // как у остальных подкоманд.
+                let ids = match client
+                    .call(Cmd::LibraryTracks { playlist: parse_playlist_id(&playlist_id)? })
+                    .await?
+                {
+                    Payload::Tracks(tracks) => tracks.into_iter().map(|t| t.id).collect::<Vec<_>>(),
+                    _ => anyhow::bail!("неожиданный ответ на LibraryTracks"),
+                };
+                let n = ids.len();
+                match client.call(Cmd::CacheWarm { tracks: ids }).await? {
+                    Payload::Ack(_) => {
+                        println!("грею {} треков в фоне; прогресс — tmus cache stats", n);
+                    }
+                    _ => anyhow::bail!("неожиданный ответ на CacheWarm"),
+                }
+                return Ok(());
+            }
         },
         CliCmd::StopDaemon => Cmd::Shutdown,
         // Обработан до connect_or_spawn; ветка для полноты match.

@@ -71,17 +71,23 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("ни один провайдер не подключён — доступен только офлайн-кэш");
     }
 
+    // Семафор резолвов — один на процесс: он сериализует yt-dlp и у
+    // плеера, и у филлера. Создаётся здесь ровно один раз и
+    // внедряется в оба, иначе плеер и филлер не знали бы друг о друге
+    // и запускали по параллельному yt-dlp (~0.9 CPU-с и 335 МБ каждый).
+    let resolve_gate = Arc::new(tokio::sync::Semaphore::new(1));
 
     let player = Player::new(
         registry.clone(),
         config.mpv.clone(),
         &paths,
         config.volume_clamped(),
+        Arc::clone(&resolve_gate),
     )
         .await
         .context("mpv не поднялся")?;
 
-    let app = App::new(player.clone(), registry, cache, config, paths);
+    let app = App::new(player.clone(), registry, cache, config, paths, resolve_gate);
 
     // Очередь восстанавливаем ДО поднятия подсистем: watcher и MPRIS
     // должны увидеть уже восстановленное состояние, а не пустую очередь,

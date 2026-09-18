@@ -68,7 +68,9 @@ struct Inner {
     play_gen_rx: tokio::sync::watch::Receiver<u64>,
     /// Сериализатор запусков yt-dlp: один резолв — 0.9 CPU-с и 335 МБ,
     /// поэтому параллелить их бессмысленно, ждущие проверяют gen и выходят.
-    resolve_gate: tokio::sync::Semaphore,
+    /// Семафор внедряется снаружи и общий на процесс: филлер демона
+    /// зовёт тот же резолв, и без общего гейта он обгонял плеер.
+    resolve_gate: Arc<tokio::sync::Semaphore>,
     /// Хендл живой предзагрузки с её целью: прерывать надо только чужую.
     /// Своя (тот же трек) доживёт и положит результат в слот — убив её,
     /// settle скипа запускал бы второй yt-dlp на тот же трек.
@@ -114,12 +116,14 @@ pub struct Player {
 impl Player {
     /// Запустить mpv. `volume` — начальная громкость из конфига.
     /// `mpv_binary` приходит из конфига (`mpv = "..."`): жёсткое
-    /// `"mpv"` делало бы эту настройку ложью.
+    /// `"mpv"` делало бы эту настройку ложью. `resolve_gate` — общий
+    /// на процесс семафор резолвов (владелец — демон).
     pub async fn new(
         registry: Registry,
         mpv_binary: std::path::PathBuf,
         paths: &tmus_core::paths::Paths,
         volume: f64,
+        resolve_gate: Arc<tokio::sync::Semaphore>,
     ) -> Result<Self, PlayerError> {
         let (mpv, events) = Mpv::spawn(mpv_binary, paths, volume).await?;
         mpv.observe().await?;
@@ -139,7 +143,7 @@ impl Player {
                 preloaded: Mutex::new(None),
                 play_gen,
                 play_gen_rx,
-                resolve_gate: tokio::sync::Semaphore::new(1),
+                resolve_gate,
                 preload_task: tokio::sync::Mutex::new(None),
                 skip_settle: tokio::sync::Mutex::new(None),
                 changed: tokio::sync::Notify::new(),

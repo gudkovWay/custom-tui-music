@@ -26,6 +26,7 @@ use tmus_provider::Registry;
 use tokio::sync::broadcast;
 
 use crate::catalog::resolve_catalog_source;
+use crate::filler;
 
 /// Сколько событий держится в шине для отстающего подписчика.
 ///
@@ -60,6 +61,15 @@ pub struct App {
     /// Без кулдауна ливень auth-ошибок превращается в ливень чтений
     /// профиля браузера.
     pub(crate) auth_retry: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// Слабая ссылка на себя для фоновых задач: команды приходят по
+    /// `&self`, а фоновая работа (грядущий `Cmd::CacheWarm`) должна
+    /// пережить ответ клиенту, но и не держать `Arc` вечно.
+    pub(crate) self_arc: std::sync::OnceLock<std::sync::Weak<App>>,
+    /// Общий семафор резолвов на процесс. Один и тот же `Arc` внедряется
+    /// и в плеер, и в филлер: параллельные yt-dlp не имеют смысла
+    /// (замер перф-раунда: 0.9 CPU-с и 335 МБ на процесс), а филлер без
+    /// общего гейта обгонял плеер и запускал второй yt-dlp параллельно.
+    resolve_gate: Arc<tokio::sync::Semaphore>,
 }
 
 impl App {
@@ -69,6 +79,7 @@ impl App {
         cache: Arc<std::sync::Mutex<Cache>>,
         config: Config,
         paths: Paths,
+        resolve_gate: Arc<tokio::sync::Semaphore>,
     ) -> Arc<Self> {
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         let saved = tmus_core::catalog_source::load(&paths);
@@ -85,13 +96,27 @@ impl App {
             catalog_source: std::sync::Mutex::new(catalog_source),
             shutdown: tokio::sync::Notify::new(),
             auth_retry: std::sync::Mutex::new(std::collections::HashMap::new()),
+            self_arc: std::sync::OnceLock::new(),
+            resolve_gate,
         });
-
+        // Поле нельзя заполнить внутри конструируемого `Self`: нужен
+        // готовый `Arc`. Слабая ссылка не продлевает жизнь, а фоновые
+        // задачи через `self_arc()` просто не стартуют, если демон
+        // уже гасится.
+        let _ = arc.self_arc.set(Arc::downgrade(&arc));
         arc
     }
 
+    /// Arc на себя для фоновых задач из handle(): команды приходят по
+    /// `&self`, а фоновая работа должна пережить ответ клиенту.
+    pub(crate) fn self_arc(&self) -> Option<Arc<Self>> {
+        self.self_arc.get().and_then(std::sync::Weak::upgrade)
+    }
 
-
+    /// Общий семафор резолвов на процесс (см. поле).
+    pub(crate) fn resolve_gate(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.resolve_gate)
+    }
 
     pub fn player(&self) -> &Player {
         &self.player
@@ -326,6 +351,16 @@ impl App {
             Cmd::CacheGc => {
                 self.with_cache(|c| c.gc())?;
                 Ok(Payload::Cache(self.with_cache(|c| c.stats())?))
+            }
+            Cmd::CacheWarm { tracks } => {
+                // Прогрев сотен треков не должен держать соединение
+                // клиента: спавним фоновую задачу и сразу отвечаем Ack.
+                // Прогресс клиент видит потоком CacheProgress.
+                let Some(app) = self.self_arc() else {
+                    anyhow::bail!("демон гасится — прогрев не стартовал");
+                };
+                tokio::spawn(filler::warm(app, tracks));
+                Ok(Payload::Ack(Ack::default()))
             }
 
             Cmd::Shutdown => {

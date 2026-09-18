@@ -96,6 +96,9 @@ pub enum Cmd {
     CacheUnpin { tracks: Vec<TrackId> },
     /// Вытеснить всё незакреплённое сверх лимита.
     CacheGc,
+    /// Докачать список треков в офлайн-кэш в фоне. Демон сразу
+    /// отвечает `Ack`, прогресс идёт потоком `CacheProgress`.
+    CacheWarm { tracks: Vec<TrackId> },
 
     Shutdown,
 }

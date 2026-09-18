@@ -166,6 +166,32 @@ mod relevance_tests {
 /// URL не кэшируется никогда: у googlevideo он живёт около шести часов
 /// (`expire=`). Кэшируется файл.
 async fn fetch_into_cache(app: &Arc<App>, id: &TrackId) -> anyhow::Result<()> {
+    // Семафор резолвов один на процесс: параллельные yt-dlp не имеют
+    // смысла (0.9 CPU-с и 335 МБ на процесс), а филлер без него обгонял
+    // плеер и запускал второй yt-dlp параллельно. Пока ждём очередь,
+    // трек мог выпасть из окна префетча — поэтому ждём с периодической
+    // проверкой актуальности: устаревшее место в очереди освобождаем,
+    // а не держим.
+    // Гейт вынесен за цикл: `acquire()` держит ссылку на семафор, и
+    // временный `Arc` из геттера внутри `select!` жил бы только до конца
+    // итерации.
+    let gate = app.resolve_gate();
+    let permit = loop {
+        tokio::select! {
+            biased;
+            permit = gate.acquire() =>
+                break permit.expect("семафор резолвов живёт столько же, сколько демон"),
+            _ = tokio::time::sleep(RELEVANCE_INTERVAL) => {
+                let (current, ahead) = relevance_snapshot(app).await;
+                if !still_wanted(id, current.as_ref(), &ahead) {
+                    tracing::debug!("докачка отменена в очереди резолвов: трек вне окна префетча");
+                    return Ok(());
+                }
+            }
+        }
+    };
+    let _permit = permit;
+
     let resolver = app.registry.resolver_for(id)?;
     let source = resolver.resolve(id).await?;
     let tmus_core::model::StreamSource::Remote { url, user_agent, expires_at } = &source else {
@@ -267,5 +293,37 @@ async fn reqwest_get(url: &str, user_agent: Option<&str>) -> anyhow::Result<reqw
     Ok(response)
 }
 
+/// Фоновый прогрев кэша: докачать список треков, пропуская готовое.
+/// Прогресс виден потоком `CacheProgress` (как у фоновой докачки).
+///
+/// Ошибка одного трека (сеть, возраст, выпиленное видео) не останавливает
+/// прогрев: warn и дальше — заказчик греет плейлист целиком, а не один
+/// конкретный трек. Дедуп с сохранением порядка: плейлисты бывают с
+/// повторами, качать один трек дважды незачем.
+pub async fn warm(app: Arc<App>, tracks: Vec<TrackId>) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    let tracks: Vec<TrackId> = tracks
+        .into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .collect();
+    let total = tracks.len();
+    let mut done: usize = 0;
+    for id in &tracks {
+        match app.with_cache(|c| c.lookup_audio(id)) {
+            Ok(Some(_)) => continue,
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(track = %id, %err, "кэш не опрашивается при прогреве");
+                continue;
+            }
+        }
+        match fetch_into_cache(&app, id).await {
+            Ok(()) => done += 1,
+            Err(err) => tracing::warn!(track = %id, %err, "прогрев трека не удался"),
+        }
+    }
+    tracing::info!(успешно = done, всего = total, "прогрев кэша завершён");
+    Ok(())
+}
 
 
