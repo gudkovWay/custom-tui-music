@@ -2,6 +2,7 @@
 //! FontAwesome не используются, потому что именно на них сломался
 //! готовый клиент youtui, чей README требует особых шрифтов.
 
+use std::collections::HashMap;
 use std::io::stdout;
 use std::time::Duration;
 
@@ -16,7 +17,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 
-use tmus_core::model::{LoopMode, PlaybackStatus, Playlist, SearchResult, Track, TrackId};
+use tmus_core::model::{LoopMode, PlaybackStatus, Playlist, Rating, SearchResult, Track, TrackId};
 use tmus_core::protocol::{CatalogSource, Cmd, Event, Payload, PlayerState};
 use tmus_core::Paths;
 
@@ -139,6 +140,18 @@ struct App {
     /// Что показать в строке состояния при отсутствии живых данных:
     /// «демон не отвечает» вместо падения при обрыве.
     notice: Option<String>,
+    /// Локальные оценки: маркеры и фильтрация списков не должны
+    /// запрашивать демон на каждый кадр.
+    ratings: HashMap<TrackId, Rating>,
+    /// ctrl+d: false — дизлайкнутые скрыты из списков, true — видны.
+    show_disliked: bool,
+    /// Индексы видимых треков плейлиста после фильтрации дизлайков:
+    /// курсор списка ходит по отфильтрованному множеству, поэтому
+    /// воспроизведение и оценка обязаны маппить индекс через него.
+    /// Пересчитывается в `draw`.
+    track_view: Vec<usize>,
+    /// То же для результатов поиска (плейлисты и артисты не фильтруются).
+    search_view: Vec<usize>,
 }
 
 pub async fn run(paths: &Paths) -> Result<()> {
@@ -161,6 +174,12 @@ pub async fn run(paths: &Paths) -> Result<()> {
     {
         playlists = ps;
     }
+    // Стартовый снимок оценок: далее карта живёт на событиях
+    // RatingChanged, полные списки больше не запрашиваются.
+    let mut ratings = HashMap::new();
+    if let Ok(Payload::Ratings(rs)) = client.call(Cmd::Ratings).await {
+        ratings = rs.into_iter().collect();
+    }
     let mut app = App {
         client,
         paths: paths.clone(),
@@ -175,6 +194,10 @@ pub async fn run(paths: &Paths) -> Result<()> {
         search_mode: false,
         nav: Nav::new(),
         notice: None,
+        ratings,
+        show_disliked: false,
+        track_view: Vec::new(),
+        search_view: Vec::new(),
     };
 
     let mut terminal = enter_terminal()?;
@@ -294,6 +317,16 @@ async fn apply_event(app: &mut App, event: Event) -> bool {
             app.state.queue_index = index;
             true
         }
+        Event::RatingChanged { track, rating } => {
+            // `None` удаляет запись: «нет оценки» и «none» — одно
+            // состояние, мёртвые ключи в карте не нужны.
+            if rating == Rating::None {
+                app.ratings.remove(&track);
+            } else {
+                app.ratings.insert(track, rating);
+            }
+            true
+        }
         Event::TrackChanged { .. } | Event::CacheProgress { .. } | Event::AuthChanged { .. } => false,
     }
 }
@@ -319,7 +352,7 @@ async fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Re
                 app.playlists.len(),
                 app.state.queue_len,
                 app.search_results.len(),
-                app.playlist_tracks.len(),
+                app.track_view.len(),
             );
             app.nav.move_active(1, p, q, s, t);
             if app.nav.focus == Focus::Panel && app.nav.panel == Panel::Library {
@@ -331,7 +364,7 @@ async fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Re
                 app.playlists.len(),
                 app.state.queue_len,
                 app.search_results.len(),
-                app.playlist_tracks.len(),
+                app.track_view.len(),
             );
             app.nav.move_active(-1, p, q, s, t);
             if app.nav.focus == Focus::Panel && app.nav.panel == Panel::Library {
@@ -365,15 +398,15 @@ async fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Re
             };
             call_quiet(app, Cmd::SetLoop { mode: next }).await;
         }
+        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.show_disliked = !app.show_disliked;
+        }
+        KeyCode::Char('f') => rate_selected(app, Rating::Liked).await,
+        KeyCode::Char('d') => rate_selected(app, Rating::Disliked).await,
         KeyCode::Char('/') => {
             app.nav.leave_playlist();
             app.search_mode = true;
             app.search_input.clear();
-        }
-        KeyCode::Char('f') => {
-            if let Some(track) = app.state.track.clone() {
-                call_quiet(app, Cmd::CachePin { tracks: vec![track.id] }).await;
-            }
         }
         _ => {}
     }
@@ -465,7 +498,117 @@ async fn flush_pending_load(app: &mut App) -> bool {
 fn track_cmd(app: &App) -> Option<Cmd> {
     let (idx, start) = app.nav.track_play_sel()?;
     let playlist = app.playlists.get(idx)?;
+    // Курсор ходит по отфильтрованному списку: маппим в индекс полного.
+    let start = *app.track_view.get(start)?;
     Some(Cmd::PlayPlaylist { playlist: playlist.id.clone(), start: Some(start) })
+}
+
+/// Маркер рейтинга перед названием трека в списках: нет оценки —
+/// ничего, лайк — сердце, дизлайк — крест.
+fn rating_marker(rating: Option<&Rating>) -> &'static str {
+    match rating {
+        Some(Rating::Liked) => "♥ ",
+        Some(Rating::Disliked) => "× ",
+        _ => "",
+    }
+}
+
+/// Видимость трека в списках: дизлайкнутые по умолчанию спрятаны,
+/// ctrl+d возвращает их. Чистая функция ради тестов.
+fn track_visible(rating: Option<&Rating>, show_disliked: bool) -> bool {
+    show_disliked || rating != Some(&Rating::Disliked)
+}
+
+/// Индексы видимых треков после фильтрации: курсор и рендер ходят по
+/// ним, полный вектор остаётся источником данных.
+fn visible_track_indices(
+    tracks: &[Track],
+    ratings: &HashMap<TrackId, Rating>,
+    show_disliked: bool,
+) -> Vec<usize> {
+    tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| track_visible(ratings.get(&t.id), show_disliked))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// То же для выдачи поиска: фильтруются только треки-результаты,
+/// плейлисты и артисты остаются всегда.
+fn visible_search_indices(
+    results: &[SearchResult],
+    ratings: &HashMap<TrackId, Rating>,
+    show_disliked: bool,
+) -> Vec<usize> {
+    results
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| match r {
+            SearchResult::Track(t) => track_visible(ratings.get(&t.id), show_disliked),
+            _ => true,
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Повторное f/d на уже проставленной оценке снимает её.
+fn rate_toggle(current: Option<Rating>, want: Rating) -> Rating {
+    if current == Some(want) {
+        Rating::None
+    } else {
+        want
+    }
+}
+
+/// Трек под курсором активного списка — тот же, которого касается
+/// Space/Return: плейлист (через фильтр), очередь (единственный
+/// видимый трек — текущий) или результат поиска. Курсор вне трека
+/// (плейлисты библиотеки, плейлист/артист в поиске) — ничего.
+fn selected_track(app: &App) -> Option<TrackId> {
+    if app.nav.focus == Focus::Tracks {
+        let idx = app.nav.playlist_sel.selected()?;
+        let idx = *app.track_view.get(idx)?;
+        return app.playlist_tracks.get(idx).map(|t| t.id.clone());
+    }
+    match app.nav.panel {
+        Panel::Queue => app.state.track.as_ref().map(|t| t.id.clone()),
+        Panel::Search => {
+            let idx = app.nav.search_sel.selected()?;
+            match app.search_results.get(idx) {
+                Some(SearchResult::Track(t)) => Some(t.id.clone()),
+                _ => None,
+            }
+        }
+        Panel::Library => None,
+    }
+}
+
+/// Оценить трек под курсором: повторное f/d снимает оценку. Ответ
+/// демона не нужен — придёт событие RatingChanged.
+async fn rate_selected(app: &mut App, want: Rating) {
+    let Some(track) = selected_track(app) else { return };
+    let rating = rate_toggle(app.ratings.get(&track).copied(), want);
+    call_quiet(app, Cmd::Rate { track, rating }).await;
+}
+
+/// Сколько треков активного списка спрятано фильтром дизлайков: для
+/// счётчика в строке состояния.
+fn hidden_count(app: &App) -> usize {
+    if app.show_disliked {
+        return 0;
+    }
+    let disliked = |t: &Track| app.ratings.get(&t.id) == Some(&Rating::Disliked);
+    if app.nav.focus == Focus::Tracks {
+        app.playlist_tracks.iter().filter(|t| disliked(t)).count()
+    } else if app.nav.panel == Panel::Search {
+        app.search_results
+            .iter()
+            .filter(|r| matches!(r, SearchResult::Track(t) if disliked(t)))
+            .count()
+    } else {
+        0
+    }
 }
 
 async fn play_selected(app: &mut App) {
@@ -488,6 +631,10 @@ async fn play_selected(app: &mut App) {
         }
         Panel::Search => {
             let Some(idx) = app.nav.search_sel.selected() else { return };
+            let idx = match app.search_view.get(idx) {
+                Some(&i) => i,
+                None => return,
+            };
             if let Some(SearchResult::Track(track)) = app.search_results.get(idx) {
                 fire(app, Cmd::PlayTrack { track: track.id.clone() });
             }
@@ -529,6 +676,11 @@ async fn call_quiet(app: &mut App, cmd: Cmd) {
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
+    // Пересчёт фильтров в начале кадра: и рендер, и обработчики клавиш
+    // (через track_cmd/play_selected/rate_selected) ходят по ним.
+    app.track_view = visible_track_indices(&app.playlist_tracks, &app.ratings, app.show_disliked);
+    app.search_view = visible_search_indices(&app.search_results, &app.ratings, app.show_disliked);
+
     let [main, status] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(3)])
@@ -580,9 +732,10 @@ fn draw(f: &mut Frame, app: &mut App) {
         };
         let current = app.state.track.as_ref().map(|t| t.id.clone());
         let items: Vec<ListItem> = app
-            .playlist_tracks
+            .track_view
             .iter()
-            .map(|t| track_line(t, current.as_ref()))
+            .filter_map(|&i| app.playlist_tracks.get(i))
+            .map(|t| track_line(t, current.as_ref(), app.ratings.get(&t.id)))
             .collect();
         let right_list = List::new(items)
             .block(Block::new().borders(Borders::ALL).title(title))
@@ -597,15 +750,17 @@ fn draw(f: &mut Frame, app: &mut App) {
     draw_status(f, app, status);
 }
 
-/// Строка трека в списках; `current` — играющий сейчас `TrackId`.
-/// Играющий трек получает тёплый фон и метку `▶`: в плейлисте на сотни
-/// строк взгляд ищет «что же играет» чаще, чем позицию курсора.
-fn track_line(track: &Track, current: Option<&TrackId>) -> ListItem<'static> {
+/// Строка трека в списках; `current` — играющий сейчас `TrackId`,
+/// `rating` — локальная оценка трека. Играющий трек получает тёплый
+/// фон и метку `▶`: в плейлисте на сотни строк взгляд ищет «что же
+/// играет» чаще, чем позицию курсора.
+fn track_line(track: &Track, current: Option<&TrackId>, rating: Option<&Rating>) -> ListItem<'static> {
     let playing = current == Some(&track.id);
+    let marker = rating_marker(rating);
     let text = if playing {
-        format!("▶ [{}] {} — {}", track.id.provider, track.artist_line(), track.title)
+        format!("{marker}▶ [{}] {} — {}", track.id.provider, track.artist_line(), track.title)
     } else {
-        format!("[{}] {} — {}", track.id.provider, track.artist_line(), track.title)
+        format!("{marker}[{}] {} — {}", track.id.provider, track.artist_line(), track.title)
     };
     let item = ListItem::new(Line::from(text));
     if playing {
@@ -622,19 +777,24 @@ fn track_line(track: &Track, current: Option<&TrackId>) -> ListItem<'static> {
 
 fn queue_items(app: &App) -> Vec<ListItem<'static>> {
     // Полная очередь у клиента не хранится (приходит только длина),
-    // показываем текущий трек и подсказку.
+    // показываем текущий трек и подсказку. Играющий не прячется фильтром
+    // дизлайков: скрыть единственную строку очереди — спрятать саму
+    // очередь, а d на нём всё равно доступен.
     match &app.state.track {
-        Some(track) => vec![track_line(track, Some(&track.id))],
+        Some(track) => {
+            vec![track_line(track, Some(&track.id), app.ratings.get(&track.id))]
+        }
         None => vec![ListItem::new("очередь пуста")],
     }
 }
 
 fn search_items(app: &App) -> Vec<ListItem<'static>> {
     let current = app.state.track.as_ref().map(|t| t.id.clone());
-    app.search_results
+    app.search_view
         .iter()
+        .filter_map(|&i| app.search_results.get(i))
         .map(|r| match r {
-            SearchResult::Track(t) => track_line(t, current.as_ref()),
+            SearchResult::Track(t) => track_line(t, current.as_ref(), app.ratings.get(&t.id)),
             SearchResult::Playlist(p) => ListItem::new(format!("{}: {}", p.id, p.title)),
             SearchResult::Artist { provider, id, name } => {
                 ListItem::new(format!("[{provider}:{id}] {name}"))
@@ -651,12 +811,18 @@ fn draw_status(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         spans.push(Span::styled(format!("! {notice} "), Style::new().red()));
     }
 
+    // Счётчик спрятанных фильтром дизлайков активного списка.
+    let hidden = hidden_count(app);
+    if hidden > 0 {
+        spans.push(Span::styled(format!("hidden:{hidden} "), Style::new().fg(Color::DarkGray)));
+    }
+
     if let Some(track) = &app.state.track {
         let pos = app.state.position.map(|d| d.as_secs());
         let dur = app.state.duration.map(|d| d.as_secs());
         let line = trim_fit(
             &format!(
-                "{} {} {} {} {}  vol:{} {}{} [{}] f=кэш q=выход",
+                "{} {} {} {} {}  vol:{} {}{} [{}] f/d rate ctrl+d hidden q=выход",
                 status_icon(app.state.status),
                 track.title,
                 track.artist_line(),
@@ -844,6 +1010,79 @@ mod tests {
         assert_eq!(start, 2);
         nav.leave_playlist();
         assert_eq!(nav.track_play_sel(), None);
+    }
+
+    fn track(provider_id: &str) -> Track {
+        let (provider, id) = provider_id.split_once(':').expect("provider:id");
+        Track {
+            id: TrackId::new(ProviderId::from_name(provider).expect("known"), id.to_owned()),
+            title: id.into(),
+            artists: vec![],
+            album: None,
+            duration: None,
+            art_url: None,
+            page_url: None,
+        }
+    }
+
+    #[test]
+    fn marker_reflects_rating_only_when_present() {
+        assert_eq!(rating_marker(None), "");
+        assert_eq!(rating_marker(Some(&Rating::None)), "");
+        assert_eq!(rating_marker(Some(&Rating::Liked)), "♥ ");
+        assert_eq!(rating_marker(Some(&Rating::Disliked)), "× ");
+    }
+
+    #[test]
+    fn disliked_hidden_until_flag_set() {
+        assert!(!track_visible(Some(&Rating::Disliked), false));
+        assert!(track_visible(Some(&Rating::Disliked), true));
+        // Лайк и отсутствие оценки видны всегда.
+        assert!(track_visible(Some(&Rating::Liked), false));
+        assert!(track_visible(None, false));
+    }
+
+    #[test]
+    fn visible_indices_filter_only_disliked_tracks() {
+        let tracks = vec![track("ytmusic:a"), track("ytmusic:b"), track("ytmusic:c")];
+        let mut ratings = HashMap::new();
+        ratings.insert(tracks[0].id.clone(), Rating::Liked);
+        ratings.insert(tracks[1].id.clone(), Rating::Disliked);
+
+        assert_eq!(visible_track_indices(&tracks, &ratings, false), vec![0, 2]);
+        assert_eq!(visible_track_indices(&tracks, &ratings, true), vec![0, 1, 2]);
+        assert_eq!(visible_track_indices(&tracks, &HashMap::new(), false), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn search_indices_keep_playlists_and_artists() {
+        let results = vec![
+            SearchResult::Track(track("ytmusic:a")),
+            SearchResult::Playlist(Playlist {
+                id: PlaylistId { provider: ProviderId::YTMUSIC, id: "pl".into() },
+                title: "pl".into(),
+                subtitle: None,
+                art_url: None,
+                track_count: None,
+            }),
+            SearchResult::Artist { provider: ProviderId::YTMUSIC, id: "ar".into(), name: "ar".into() },
+            SearchResult::Track(track("ytmusic:b")),
+        ];
+        let mut ratings = HashMap::new();
+        ratings.insert(TrackId::new(ProviderId::YTMUSIC, "a"), Rating::Disliked);
+        ratings.insert(TrackId::new(ProviderId::YTMUSIC, "b"), Rating::Disliked);
+
+        // Дизлайкнутые треки спрятаны, плейлист и артист остались.
+        assert_eq!(visible_search_indices(&results, &ratings, false), vec![1, 2]);
+        assert_eq!(visible_search_indices(&results, &ratings, true).len(), 4);
+    }
+
+    #[test]
+    fn repeat_rating_removes_it() {
+        assert_eq!(rate_toggle(None, Rating::Liked), Rating::Liked);
+        assert_eq!(rate_toggle(Some(Rating::Liked), Rating::Liked), Rating::None);
+        assert_eq!(rate_toggle(Some(Rating::Liked), Rating::Disliked), Rating::Disliked);
+        assert_eq!(rate_toggle(Some(Rating::Disliked), Rating::Disliked), Rating::None);
     }
 
     #[test]

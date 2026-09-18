@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use tmus_core::model::{LoopMode, PlaylistId, ProviderId, SearchKind, TrackId};
+use tmus_core::model::{EqState, LoopMode, PlaylistId, ProviderId, Rating, SearchKind, TrackId, EQ_GAIN_LIMIT_DB};
 use tmus_core::protocol::{Cmd, Payload};
 use tmus_core::Paths;
 
@@ -36,6 +36,24 @@ enum CliCmd {
     Seek { seconds: String },
     /// Громкость 0..100: со знаком — от текущей.
     Vol { value: String },
+    /// Эквалайзер: без флагов печатает состояние, с флагами правит.
+    /// Флаги комбинируются, каждый заданный — применяется; один
+    /// `--band` за вызов.
+    Eq {
+        #[arg(long)]
+        on: bool,
+        #[arg(long)]
+        off: bool,
+        #[arg(long)]
+        preset: Option<String>,
+        /// Полоса и абсолютное усиление: `3:-4.5` — третья полоса
+        /// в −4.5 дБ. Абсолютное, а не относительное: панель noctalia
+        /// считает дельту у себя и шлёт итог.
+        #[arg(long)]
+        band: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Состояние плеера.
     Status {
         #[arg(long)]
@@ -46,6 +64,13 @@ enum CliCmd {
         json: bool,
     },
     Liked {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Оценить трек: `tmus rate <provider>:<id> like|dislike|none`.
+    Rate { track: String, rating: String },
+    /// Все локальные оценки демона.
+    Ratings {
         #[arg(long)]
         json: bool,
     },
@@ -182,6 +207,38 @@ async fn main() -> Result<()> {
         CliCmd::Prev => Cmd::Prev,
         CliCmd::Seek { seconds } => parse_seek(&seconds)?,
         CliCmd::Vol { value } => parse_vol(&value, current_volume(&mut client).await?)?,
+        CliCmd::Eq { on, off, preset, band, json } => {
+            let enabled = match (on, off) {
+                (true, true) => bail!("--on и --off вместе задавать нельзя"),
+                (true, false) => Some(true),
+                (false, true) => Some(false),
+                (false, false) => None,
+            };
+            // `--band` задаёт одну полосу абсолютным значением, а демон
+            // принимает только полную десятку: текущие полосы читаем
+            // здесь и подменяем один элемент.
+            let bands = match &band {
+                Some(spec) => {
+                    let (index, gain) = parse_band(spec)?;
+                    let mut eq = current_equalizer(&mut client).await?;
+                    eq[index] = gain;
+                    Some(eq.to_vec())
+                }
+                None => None,
+            };
+            if enabled.is_none() && preset.is_none() && bands.is_none() {
+                let payload = client.call(Cmd::State).await?;
+                if json {
+                    return print_payload(payload, true);
+                }
+                match payload {
+                    Payload::State(state) => println!("{}", format_eq(&state.equalizer)),
+                    _ => bail!("неожиданный ответ на State"),
+                }
+                return Ok(());
+            }
+            Cmd::Equalizer { enabled, preset, bands }
+        }
         CliCmd::Status { json } => return print_payload(client.call(Cmd::State).await?, json),
         CliCmd::Providers { json } => return print_payload(client.call(Cmd::Providers).await?, json),
         CliCmd::Library { provider, json } => {
@@ -189,6 +246,11 @@ async fn main() -> Result<()> {
             return print_payload(client.call(Cmd::Library { provider }).await?, json);
         }
         CliCmd::Liked { json } => return print_payload(client.call(Cmd::Liked { provider: None }).await?, json),
+        CliCmd::Rate { track, rating } => Cmd::Rate {
+            track: parse_track_id(&track)?,
+            rating: parse_rating(&rating)?,
+        },
+        CliCmd::Ratings { json } => return print_payload(client.call(Cmd::Ratings).await?, json),
         CliCmd::Source { arg, json } => {
             let cmd = match arg {
                 Some(arg) => Cmd::SetCatalogSource {
@@ -293,6 +355,53 @@ async fn current_volume(client: &mut client::Client) -> Result<f64> {
     })
 }
 
+/// Текущие полосы нужны `--band`: демон принимает только полную
+/// десятку, а клиент правит одну полосу.
+async fn current_equalizer(client: &mut client::Client) -> Result<[f64; 10]> {
+    Ok(match client.call(Cmd::State).await? {
+        Payload::State(state) => state.equalizer.bands,
+        _ => [0.0; 10],
+    })
+}
+
+/// Короткий текст состояния эквалайзера: `eq off` либо
+/// `eq on <preset> +5.0 +4.0 …` — все десять полос с одной десятичной
+/// и ведущим знаком.
+fn format_eq(eq: &EqState) -> String {
+    if !eq.enabled {
+        return "eq off".to_owned();
+    }
+    let bands = eq
+        .bands
+        .iter()
+        .map(|g| format!("{g:+.1}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("eq on {} {bands}", eq.preset)
+}
+
+/// `"3:-4.5" → (2, -4.5)`. Полоса 1-базная (1..=10), усиление в дБ
+/// −[`EQ_GAIN_LIMIT_DB`]..=[`EQ_GAIN_LIMIT_DB`]. Чистая функция ради
+/// тестов: разбор аргумента не должен требовать живого демона.
+fn parse_band(s: &str) -> Result<(usize, f64)> {
+    let Some((raw_n, raw_gain)) = s.split_once(':') else {
+        bail!("полоса: ожидается N:GAIN, например 3:-4.5, получено {s:?}")
+    };
+    let n: usize = raw_n
+        .parse()
+        .map_err(|_| anyhow::anyhow!("номер полосы: целое 1..=10, получено {raw_n:?}"))?;
+    if !(1..=10).contains(&n) {
+        bail!("номер полосы: 1..=10, получено {n}")
+    }
+    let gain: f64 = raw_gain
+        .parse()
+        .map_err(|_| anyhow::anyhow!("усиление: число в дБ, получено {raw_gain:?}"))?;
+    if !(-EQ_GAIN_LIMIT_DB..=EQ_GAIN_LIMIT_DB).contains(&gain) {
+        bail!("усиление: -{EQ_GAIN_LIMIT_DB}..={EQ_GAIN_LIMIT_DB} дБ, получено {gain}")
+    }
+    Ok((n - 1, gain))
+}
+
 fn print_payload(payload: Payload, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string(&payload)?);
@@ -361,6 +470,11 @@ fn format_payload(payload: &Payload) -> String {
             c.pinned_bytes as f64 / 1048576.0,
             c.limit_bytes as f64 / 1048576.0,
         ),
+        Payload::Ratings(ratings) => ratings
+            .iter()
+            .map(|(id, r)| format!("{id}: {r:?}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
 }
 
@@ -513,6 +627,17 @@ fn parse_loop(s: &str) -> Result<LoopMode> {
     }
 }
 
+/// Слово оценки команды `rate`. Отдельная функция ради тестов: разбор
+/// аргумента не должен требовать живого демона.
+fn parse_rating(s: &str) -> Result<Rating> {
+    match s {
+        "like" => Ok(Rating::Liked),
+        "dislike" => Ok(Rating::Disliked),
+        "none" => Ok(Rating::None),
+        _ => bail!("оценка: like|dislike|none, получено {s:?}"),
+    }
+}
+
 fn parse_shuffle(s: &str) -> Result<Option<bool>> {
     match s {
         "on" => Ok(Some(true)),
@@ -599,6 +724,31 @@ mod tests {
     }
 
     #[test]
+    fn rating_parses_three_names_only() {
+        assert_eq!(parse_rating("like").expect("ok"), Rating::Liked);
+        assert_eq!(parse_rating("dislike").expect("ok"), Rating::Disliked);
+        assert_eq!(parse_rating("none").expect("ok"), Rating::None);
+        assert!(parse_rating("liked").is_err());
+        assert!(parse_rating("").is_err());
+    }
+
+    /// Контракт команды `rate`: track в формате TrackId, rating словом.
+    #[test]
+    fn rate_subcommand_parses_track_and_rating() {
+        let cmd = Cli::try_parse_from(["tmus", "rate", "ytmusic:abc", "dislike"]).expect("valid");
+        match cmd.cmd {
+            Some(CliCmd::Rate { track, rating }) => {
+                assert_eq!(parse_track_id(&track).expect("valid").id, "abc");
+                assert_eq!(parse_rating(&rating).expect("valid"), Rating::Disliked);
+            }
+            _ => panic!("ожидалась подкоманда rate"),
+        }
+        // rating — свободная строка, невалидное слово ловит parse_rating
+        // уже после разбора argv (как у loop/shuffle).
+        assert!(parse_rating("meh").is_err());
+    }
+
+    #[test]
     fn shuffle_parses_on_off_toggle() {
         assert_eq!(parse_shuffle("on").expect("ok"), Some(true));
         assert_eq!(parse_shuffle("off").expect("ok"), Some(false));
@@ -631,5 +781,40 @@ mod tests {
         assert_eq!(fmt_time(Some(187)), "3:07");
         assert_eq!(fmt_time(Some(3723)), "1:02:03");
         assert_eq!(fmt_time(None), "--:--");
+    }
+
+    /// Контракт `--band`: 1-базный номер в 0-базный индекс, дробное
+    /// усиление, границы допустимы.
+    #[test]
+    fn band_parses_one_based_index_and_gain() {
+        assert_eq!(parse_band("1:0").expect("ok"), (0, 0.0));
+        assert_eq!(parse_band("10:+15").expect("ok"), (9, 15.0));
+        assert_eq!(parse_band("3:-4.5").expect("ok"), (2, -4.5));
+        // Границы обе включены.
+        assert_eq!(parse_band("1:-15").expect("ok"), (0, -15.0));
+    }
+
+    #[test]
+    fn band_rejects_out_of_range_and_garbage() {
+        for bad in ["0:1", "11:1", "1:15.1", "1:-15.1", "1", "1:", "a:1", "1:x"] {
+            let err = parse_band(bad).expect_err("must fail");
+            let text = err.to_string();
+            assert!(!text.is_empty(), "{bad}: пустой текст ошибки");
+        }
+    }
+
+    /// Текст состояния: выключенный — две колонки, включённый — все
+    /// десять полос с одной десятичной и ведущим знаком.
+    #[test]
+    fn eq_state_formats_on_and_off() {
+        let mut eq = EqState::default();
+        assert_eq!(format_eq(&eq), "eq off");
+        eq.enabled = true;
+        eq.preset = "Rock".to_owned();
+        eq.bands = [5.0, 4.0, 2.0, 0.0, -1.0, 0.0, 0.0, 2.0, 4.0, 5.0];
+        assert_eq!(
+            format_eq(&eq),
+            "eq on Rock +5.0 +4.0 +2.0 +0.0 -1.0 +0.0 +0.0 +2.0 +4.0 +5.0"
+        );
     }
 }
