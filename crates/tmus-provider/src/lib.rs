@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tmus_core::model::{
-    AuthStatus, Playlist, PlaylistId, ProviderId, Rating, SearchKind, SearchResult, StreamSource,
-    Track, TrackId,
+    AuthStatus, CatalogShelf, Playlist, PlaylistId, ProviderId, Rating, SearchKind, SearchResult,
+    StreamSource, Track, TrackId,
 };
 
 pub mod ytdlp;
@@ -99,6 +99,16 @@ pub trait Catalog: Send + Sync {
     /// Лайкнутое. У YouTube Music это плейлист `LM`, у других — своё;
     /// вызывающего это не касается.
     async fn liked(&self) -> Result<Vec<Track>>;
+
+    /// Домашняя лента рекомендаций. Дефолт `Unsupported` — не сбой:
+    /// вызывающий обязан считать её пустой лентой (см.
+    /// [`ProviderError::Unsupported`]), а не «рекомендации сломались».
+    async fn home(&self) -> Result<Vec<CatalogShelf>> {
+        Err(ProviderError::Unsupported {
+            provider: self.provider(),
+            what: "домашняя лента",
+        })
+    }
 
     /// Поставить оценку треку у провайдера.
     ///
@@ -325,6 +335,18 @@ mod tests {
         let error = tokio::runtime::Runtime::new()
             .expect("runtime")
             .block_on(stub.rate(&track, Rating::Liked))
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::Unsupported { provider, .. } if provider == ProviderId::SOUNDCLOUD));
+    }
+
+    #[test]
+    fn default_home_is_unsupported() {
+        // Провайдер без переопределения `home` обязан отвечать
+        // Unsupported: вызывающий трактует это как пустую ленту.
+        let stub = Stub(ProviderId::SOUNDCLOUD);
+        let error = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(stub.home())
             .unwrap_err();
         assert!(matches!(error, ProviderError::Unsupported { provider, .. } if provider == ProviderId::SOUNDCLOUD));
     }
