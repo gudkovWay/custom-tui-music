@@ -15,8 +15,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    EqState, LoopMode, PlaybackStatus, PlaylistId, Rating, SearchKind, SearchResult, Track,
-    TrackId,
+    CatalogShelf, EqState, LoopMode, PlaybackStatus, PlaylistId, Rating, SearchKind, SearchResult,
+    Track, TrackId,
 };
 
 /// `id`, после которого соединение переходит в режим потока событий.
@@ -101,6 +101,8 @@ pub enum Cmd {
     Library { provider: Option<String> },
     LibraryTracks { playlist: PlaylistId },
     Liked { provider: Option<String> },
+    /// Домашняя лента рекомендаций; provider = None — из всех.
+    Home { provider: Option<String> },
     /// Поставить оценку треку: провайдер получает лайк/дизлайк, демон
     /// сохраняет её локально и рассылает [`Event::RatingChanged`].
     Rate { track: TrackId, rating: Rating },
@@ -158,6 +160,10 @@ pub enum Payload {
     Ratings(Vec<(TrackId, Rating)>),
     Tracks(Vec<Track>),
     Playlists(Vec<crate::model::Playlist>),
+    // Полка домашней ленты безопасна после Playlists: {title, subtitle,
+    // items} структурно не матчится ни с Results (нет тега kind), ни с
+    // Tracks/Playlists (нет обязательного id), ни с Ratings (не пары).
+    Home(Vec<CatalogShelf>),
     /// Ответ на `PlaylistCreate`: id нового плейлиста, по которому его
     /// можно сразу пополнять и открывать.
     PlaylistCreated { playlist: PlaylistId },
@@ -451,6 +457,41 @@ mod tests {
                 assert_eq!(playlist.to_string(), "ytmusic:PLnew");
             }
             other => panic!("expected a playlist_created payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn home_request_serializes() {
+        let got = line(&Request { id: 30, cmd: Cmd::Home { provider: None } });
+        assert_eq!(got, r#"{"id":30,"cmd":"home","provider":null}"#);
+        let back: Request = serde_json::from_str(&got).expect("parse");
+        assert_eq!(back.cmd, Cmd::Home { provider: None });
+    }
+
+    #[test]
+    fn home_payload_roundtrips() {
+        let shelf = CatalogShelf {
+            title: "Quick picks".into(),
+            subtitle: None,
+            items: vec![SearchResult::Track(Track {
+                id: TrackId::new(ProviderId::YTMUSIC, "abc"),
+                title: "Song".into(),
+                artists: vec!["Artist".into()],
+                album: None,
+                duration: None,
+                art_url: None,
+                page_url: None,
+            })],
+        };
+        let response = line(&Response::Ok { id: 31, ok: Payload::Home(vec![shelf.clone()]) });
+        // Фиксируем форму untagged-контракта: полка — объект с ключом title.
+        assert!(response.contains(r#""ok":[{"title""#), "shelf must stay an object: {response}");
+        match serde_json::from_str::<Frame>(&response).expect("parse response") {
+            Frame::Response(Response::Ok { id, ok: Payload::Home(shelves) }) => {
+                assert_eq!(id, 31);
+                assert_eq!(shelves, vec![shelf]);
+            }
+            other => panic!("home payload must not degrade to Results/Tracks, got {other:?}"),
         }
     }
 

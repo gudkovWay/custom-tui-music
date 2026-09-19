@@ -342,6 +342,17 @@ pub enum SearchResult {
     Artist { provider: ProviderId, id: String, name: String },
 }
 
+/// Полка рекомендаций домашней ленты. Элементы переиспользуют
+/// [`SearchResult`]: виды ровно те же, что в поиске, и панель/remember()
+/// уже работают с ними.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CatalogShelf {
+    pub title: String,
+    #[serde(default)]
+    pub subtitle: Option<String>,
+    pub items: Vec<SearchResult>,
+}
+
 /// Режим повтора. Единый для всех провайдеров: очередь смешанная.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
