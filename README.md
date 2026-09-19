@@ -185,8 +185,9 @@ Current/Up Next удалены — сейчас играет и что даль�
 |---|---|
 | `tmus` | TUI |
 | `tmus toggle \| next \| prev \| pause \| stop` | для медиа-клавиш |
-| `tmus play [<provider>:<id>]` | играть трек (по умолчанию — текущий/первый из очереди) |
+| `tmus play [<provider>:<id>]` | играть трек; с id — однотрековый контекст (очередь заменяется), без id — текущий/первый из очереди |
 | `tmus play-playlist <id> [--start N]` | играть плейлист с начала или с позиции |
+| `tmus play-context <p>:<id>,<p>:<id>,… [--start N]` | играть список как контекст: очередь заменяется целиком, старт с позиции (панель шлёт выдачу поиска/полку) |
 | `tmus seek +15 \| seek 90` | относительно или абсолютно |
 | `tmus vol +5 \| vol 40` | со знаком — от текущей, без — абсолютная (0..100) |
 | `tmus loop none\|track\|queue`, `tmus shuffle on\|off\|toggle` | режимы |
@@ -196,6 +197,7 @@ Current/Up Next удалены — сейчас играет и что даль�
 | `tmus home [--provider P] [--json]` | полки рекомендаций (`FEmusic_home`); кэш в демоне 600 с + single-flight |
 | `tmus library [--provider P]` | библиотека |
 | `tmus library-tracks <playlist_id>` | треки плейлиста |
+| `tmus library-tracks-more <playlist_id>` | следующая страница треков от курсора догрузки (пустой ответ — дочитано) |
 | `tmus liked` | лайки провайдера |
 | `tmus search <запрос> [--kind all\|tracks\|artists\|playlists] [--provider P]` | поиск; по умолчанию tracks, `all` склеивает три запроса на клиенте |
 | `tmus rate <p>:<id> like\|dislike\|none` | оценка (дизлайк играющего скипает) |
