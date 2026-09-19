@@ -228,8 +228,10 @@ local function cyclePreset(step)
       break
     end
   end
+  -- preset-on, а не preset: выбор пресета включает эквалайзер —
+  -- «листаю пресеты, а он всё равно Off» ломал приёмку 19.09.
   local idx = ((at - 1 + step) % #EQ_PRESET_NAMES) + 1
-  poke("eq", "preset:" .. EQ_PRESET_NAMES[idx])
+  poke("eq", "preset-on:" .. EQ_PRESET_NAMES[idx])
 end
 
 -- Мини-бар полосы: 15 позиций от центра (8-я), усиление ±15 дБ → до
@@ -993,10 +995,12 @@ local function activate(row)
   selected = row
   if row.kind == "eq-preset" then
     -- Имя берём из живого snapshot: между рендером строки и нажатием
-    -- пресет мог смениться (h/l листает соседний).
+    -- пресет мог смениться (h/l листает соседний). preset-on, а не
+    -- preset: Enter на пресете не просто «применяет» — он включает
+    -- эквалайзер, иначе «выбрал пресет, а он всё ещё Off».
     local eq = snapshot.equalizer
     if type(eq) == "table" then
-      poke("eq", "preset:" .. tostring(eq.preset or ""))
+      poke("eq", "preset-on:" .. tostring(eq.preset or ""))
     end
     return
   end
@@ -1809,14 +1813,17 @@ end
 local function handleViewKeys(key)
   if view == "eq" then
     -- h/l в eq не меняют вид: на полосе — ±1 дБ (кламп ±15, панель
-    -- шлёт абсолютное значение), на Preset — соседний пресет, на
-    -- Power — ничего. Перерисовку делает round-trip состояния.
+    -- шлёт абсолютное значение), на Preset — соседний пресет (с
+    -- включением), на Power — вкл/выкл. Перерисовку делает
+    -- round-trip состояния.
     local row = rows()[cursor]
     if row and row.kind == "eq-band" then
       local gain = math.max(-EQ_GAIN_LIMIT, math.min(EQ_GAIN_LIMIT, row.gain + (key == "l" and 1 or -1)))
       poke("eq", string.format("band:%d:%g", row.index, gain))
     elseif row and row.kind == "eq-preset" then
       cyclePreset(key == "l" and 1 or -1)
+    elseif row and row.kind == "eq-power" then
+      poke("eq", key == "l" and "on" or "off")
     end
     return false
   end

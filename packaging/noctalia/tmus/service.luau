@@ -695,8 +695,10 @@ function onIpc(event, payload)
       poke({ "eq", "--off" })
     elseif what == "flat" then
       poke({ "eq", "--preset", "Flat" })
-    elseif string.sub(what, 1, 7) == "preset:" then
-      poke({ "eq", "--preset", string.sub(what, 8) })
+    elseif string.sub(what, 1, 10) == "preset-on:" then
+      -- Выбор пресета включает эквалайзер (приёмка 19.09): один CLI-вызов
+      -- несёт оба флага, демон применяет их атомарным Equalizer-кадром.
+      poke({ "eq", "--on", "--preset", string.sub(what, 11) })
     elseif string.sub(what, 1, 5) == "band:" then
       local n, g = what:match("^band:(%d+):(.-)$")
       if n and g ~= "" then
