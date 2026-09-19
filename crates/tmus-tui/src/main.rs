@@ -32,10 +32,18 @@ enum CliCmd {
     Stop,
     Next,
     Prev,
-    /// Позиция в секундах: со знаком — относительный сдвиг.
-    Seek { seconds: String },
-    /// Громкость 0..100: со знаком — от текущей.
-    Vol { value: String },
+    /// Позиция в секундах: со знаком — относительный сдвиг; минус —
+    /// значение, не флаг (см. Vol).
+    Seek {
+        #[arg(allow_hyphen_values = true)]
+        seconds: String,
+    },
+    /// Громкость 0..100: со знаком — от текущей. Минус обязан
+    /// разбираться как значение, а не флаг: панель шлёт `vol -5`.
+    Vol {
+        #[arg(allow_hyphen_values = true)]
+        value: String,
+    },
     /// Эквалайзер: без флагов печатает состояние, с флагами правит.
     /// Флаги комбинируются, каждый заданный — применяется; один
     /// `--band` за вызов.
@@ -804,6 +812,17 @@ mod tests {
         assert!(matches!(parse_vol("+5", 99.0).expect("ok"), Cmd::SetVolume { volume } if volume == 100.0));
         assert!(matches!(parse_vol("-5", 3.0).expect("ok"), Cmd::SetVolume { volume } if volume == 0.0));
         assert!(matches!(parse_vol("40", 10.0).expect("ok"), Cmd::SetVolume { volume } if volume == 40.0));
+    }
+
+    #[test]
+    fn vol_and_seek_negative_values_are_values_not_flags() {
+        // Регрессия 19.09: `tmus vol -5` падал «unexpected argument»,
+        // потому что clap разбирал минус как флаг — vol-down панели
+        // был мёртв, громкость росла, но не падала.
+        let vol = Cli::try_parse_from(["tmus", "vol", "-5"]).expect("минус — значение, не флаг");
+        assert!(matches!(vol.cmd, Some(CliCmd::Vol { value }) if value == "-5"));
+        let seek = Cli::try_parse_from(["tmus", "seek", "-30"]).expect("минус — значение, не флаг");
+        assert!(matches!(seek.cmd, Some(CliCmd::Seek { seconds }) if seconds == "-30"));
     }
 
     #[test]
