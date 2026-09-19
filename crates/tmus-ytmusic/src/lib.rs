@@ -31,7 +31,7 @@ use tmus_core::model::{
     StreamSource, Track, TrackId,
 };
 use tmus_provider::ytdlp::{YtDlp, YtDlpRequest};
-use tmus_provider::{Account, Catalog, Provider, ProviderError, Resolver, Result};
+use tmus_provider::{Account, Catalog, Provider, ProviderError, Resolver, Result, TrackPage};
 
 use crate::auth::YtmAuth;
 use crate::innertube::InnerTube;
@@ -251,6 +251,70 @@ impl Catalog for YtMusic {
         }
         let entries = self.refresh_playlist_entries(&playlist.id).await?;
         Ok(entries.into_iter().map(|(track, _)| track).collect())
+    }
+
+    /// Страница треков плейлиста. Первая (`cursor: None`) идёт через
+    /// `refresh_playlist_entries`-подобный путь: она перезаписывает карту
+    /// `setVideoId` целиком, как перечисление и обязано — устаревшие
+    /// записи выцветают. Продолжение (`Some(token)`) карту только
+    /// пополняет: `retain` по плейлисту стёр бы уже догруженные
+    /// страницы, и хвост снова оказался бы недоступен для удаления.
+    async fn playlist_tracks_page(
+        &self,
+        playlist: &PlaylistId,
+        cursor: Option<&str>,
+    ) -> Result<TrackPage> {
+        if playlist.provider != self.id {
+            return Err(ProviderError::NoSuchPlaylist(playlist.clone()));
+        }
+        let (entries, next) = match cursor {
+            None => {
+                // Префикс `VL` обязателен: browse по сырому id плейлист
+                // не открывает (см. refresh_playlist_entries).
+                let browse_id = parse::playlist_browse_id(&playlist.id);
+                let (page, next) = self.tube.browse_first(&browse_id).await?;
+                let entries: Vec<_> = parse::playlist_entries(&page);
+                {
+                    let mut map = self
+                        .set_video_ids
+                        .lock()
+                        .expect("карта setVideoId не может быть отравлена");
+                    map.retain(|(pl, _), _| pl != &playlist.id);
+                    for (track, set_video_id) in &entries {
+                        if let Some(set_video_id) = set_video_id {
+                            map.insert(
+                                (playlist.id.clone(), track.id.id.clone()),
+                                set_video_id.clone(),
+                            );
+                        }
+                    }
+                }
+                (entries, next)
+            }
+            Some(token) => {
+                let (page, next) = self.tube.browse_continue(token).await?;
+                let entries: Vec<_> = parse::playlist_entries(&page);
+                {
+                    let mut map = self
+                        .set_video_ids
+                        .lock()
+                        .expect("карта setVideoId не может быть отравлена");
+                    // Без retain: только новые записи, прежние страницы
+                    // остаются в карте.
+                    for (track, set_video_id) in &entries {
+                        if let Some(set_video_id) = set_video_id {
+                            map.entry((playlist.id.clone(), track.id.id.clone()))
+                                .or_insert_with(|| set_video_id.clone());
+                        }
+                    }
+                }
+                (entries, next)
+            }
+        };
+        Ok(TrackPage {
+            tracks: entries.into_iter().map(|(track, _)| track).collect(),
+            next,
+        })
     }
 
 

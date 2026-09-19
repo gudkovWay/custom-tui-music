@@ -219,10 +219,38 @@ impl InnerTube {
         ensure_edit_succeeded("browse/edit_playlist", &value)
     }
 
+    /// Первая страница `browse` плейлиста и токен продолжения.
+    ///
+    /// Ленивая пагинация нужна потому, что LM у хозяина больше тысячи
+    /// треков, а [`MAX_PAGES`] тянет лишь ~1000: хвост плейлиста должен
+    /// дозагружаться по требованию, а не выбрасываться вместе с токеном.
+    pub async fn browse_first(&self, browse_id: &str) -> Result<(Value, Option<String>)> {
+        let page = self.browse(browse_id).await?;
+        let next = parse::continuation_token(&page);
+        Ok((page, next))
+    }
+
+    /// Одна страница `browse` по токену продолжения и токен следующей.
+    pub async fn browse_continue(&self, token: &str) -> Result<(Value, Option<String>)> {
+        let page = self.post("browse", json!({ "continuation": token })).await?;
+        let next = parse::continuation_token(&page);
+        Ok((page, next))
+    }
+
     /// Страница `browse` со всеми продолжениями, но не глубже [`MAX_PAGES`].
     pub async fn browse_pages(&self, browse_id: &str) -> Result<Vec<Value>> {
-        let first = self.browse(browse_id).await?;
-        self.continuations("browse", first).await
+        let (first, mut token) = self.browse_first(browse_id).await?;
+        let mut pages = vec![first];
+
+        while pages.len() < MAX_PAGES {
+            let Some(current) = token.take() else {
+                break;
+            };
+            let (page, next) = self.browse_continue(&current).await?;
+            token = next;
+            pages.push(page);
+        }
+        Ok(pages)
     }
 
     /// Поиск со всеми продолжениями, но не глубже [`MAX_PAGES`].
@@ -698,5 +726,55 @@ mod tests {
             .expect("expire есть");
         assert_eq!(at, UNIX_EPOCH + Duration::from_secs(1_893_456_000));
         assert_eq!(expire_from_url("https://gv/audio140"), None);
+    }
+
+    /// Фейк страницы `browse` плейлиста: одна запись с `setVideoId` и,
+    /// по желанию, токен продолжения. Пропорции полей — как в живом
+    /// ответе (`singleColumnBrowseResultsRenderer` →
+    /// `musicPlaylistShelfRenderer`), значения — свои.
+    fn playlist_page_json(continuation: Option<&str>) -> Value {
+        let mut page = json!({
+            "contents": { "singleColumnBrowseResultsRenderer": { "contents": [
+                { "musicPlaylistShelfRenderer": { "contents": [
+                    { "musicResponsiveListItemRenderer": {
+                        "playlistItemData": {
+                            "videoId": "vid1",
+                            "playlistSetVideoId": "SVabc123"
+                        },
+                        "flexColumns": [
+                            { "musicResponsiveListItemFlexColumnRenderer": { "text": {
+                                "runs": [{ "text": "Трек" }]
+                            } } }
+                        ]
+                    } }
+                ] } }
+            ] } }
+        });
+        if let Some(token) = continuation {
+            page["continuationItemRenderer"] = json!({
+                "continuationEndpoint": { "continuationCommand": { "token": token } }
+            });
+        }
+        page
+    }
+
+    #[test]
+    fn browse_first_fixture_yields_entry_and_token() {
+        // Контракт `browse_first`: страница разбирается `playlist_entries`
+        // вместе с `playlistSetVideoId`, токен продолжения выживает.
+        let (page, next) = (playlist_page_json(Some("tok-2")), Some("tok-2".to_owned()));
+        let entries = parse::playlist_entries(&page);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.as_deref(), Some("SVabc123"));
+        assert_eq!(parse::continuation_token(&page), next);
+    }
+
+    #[test]
+    fn browse_continue_fixture_ends_without_token() {
+        // Последняя страница токена не несёт: пагинация обязана
+        // остановиться именно на этом сигнале, а не на счётчике страниц.
+        let page = playlist_page_json(None);
+        assert!(parse::playlist_entries(&page).len() == 1);
+        assert_eq!(parse::continuation_token(&page), None);
     }
 }

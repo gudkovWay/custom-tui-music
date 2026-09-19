@@ -82,10 +82,14 @@ CREATE TABLE IF NOT EXISTS audio (
 );
 
 -- Метка свежести состава плейлиста: читать из кэша, пока не протухла.
+-- `continuation`/`fetched` — курсор ленивой догрузки: срез треков в
+-- `playlist_tracks` может быть частичным, пока токен не пуст.
 CREATE TABLE IF NOT EXISTS playlist_sync (
-    provider    TEXT    NOT NULL,
-    playlist    TEXT    NOT NULL,
-    updated_at  INTEGER NOT NULL,
+    provider     TEXT    NOT NULL,
+    playlist     TEXT    NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    continuation TEXT,
+    fetched      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (provider, playlist)
 );
 
@@ -104,6 +108,15 @@ CREATE TABLE IF NOT EXISTS ratings (
 -- gc ходит именно так: незакреплённые, самые старые первыми.
 CREATE INDEX IF NOT EXISTS audio_lru ON audio (pinned, accessed_at);
 ";
+
+/// Догрузка колонок для баз, созданных до ленивой пагинации плейлистов.
+/// `CREATE TABLE IF NOT EXISTS` старую таблицу не трогает, а пересоздание
+/// с переносом данных кэшу не нужно: все данные восстановимы повторным
+/// запросом к провайдеру.
+const MIGRATIONS: &[&str] = &[
+    "ALTER TABLE playlist_sync ADD COLUMN continuation TEXT",
+    "ALTER TABLE playlist_sync ADD COLUMN fetched INTEGER NOT NULL DEFAULT 0",
+];
 
 /// Колонки трека в том порядке, в котором их читает [`track_from_row`].
 /// Одна константа на все запросы: разъехавшийся порядок колонок — это
@@ -198,7 +211,16 @@ impl Cache {
         conn.busy_timeout(Duration::from_secs(5))
             .map_err(|source| CoreError::Database { path: db.clone(), source })?;
         conn.execute_batch(SCHEMA)
-            .map_err(|source| CoreError::Database { path: db, source })?;
+            .map_err(|source| CoreError::Database { path: db.clone(), source })?;
+        // Мягкая миграция: каждая правка идемпотентна по ошибке
+        // «колонка уже есть» — открытие происходит на каждом старте.
+        for statement in MIGRATIONS {
+            if let Err(source) = conn.execute_batch(statement) {
+                if !source.to_string().contains("duplicate column") {
+                    return Err(CoreError::Database { path: db, source });
+                }
+            }
+        }
 
         Ok(Self {
             conn,
@@ -384,6 +406,101 @@ impl Cache {
             )
             .map_err(|e| self.db_error(e))?;
         Ok(())
+    }
+
+    /// Дописать страницу треков в конец плейлиста, продолжив позиции с
+    /// `MAX(position)+1`. Полная перезапись ([`Self::put_playlist_tracks`])
+    /// для догрузки не годится: она стирает уже загруженные страницы.
+    pub fn append_playlist_tracks(
+        &self,
+        provider: &str,
+        playlist: &PlaylistId,
+        tracks: &[Track],
+    ) -> Result<()> {
+        let updated_at = now_secs();
+        let tx = self.transaction()?;
+        let mut max: i64 = tx
+            .query_row(
+                "SELECT IFNULL(MAX(position), -1) FROM playlist_tracks
+                 WHERE provider = ?1 AND playlist = ?2",
+                params![provider, playlist.id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|e| self.db_error(e))?;
+
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO playlist_tracks
+                         (provider, playlist, position, track_provider, track_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )
+                .map_err(|e| self.db_error(e))?;
+            let mut upsert = tx.prepare(TRACK_UPSERT).map_err(|e| self.db_error(e))?;
+            for track in tracks {
+                max += 1;
+                self.upsert_track(&mut upsert, track, updated_at)?;
+                insert
+                    .execute(params![
+                        provider,
+                        playlist.id.as_str(),
+                        max,
+                        track.id.provider.as_str(),
+                        track.id.id.as_str(),
+                    ])
+                    .map_err(|e| self.db_error(e))?;
+            }
+        }
+        tx.commit().map_err(|e| self.db_error(e))?;
+        Ok(())
+    }
+
+    /// Сохранить курсор догрузки и число уже подтянутых треков.
+    /// `updated_at` намеренно не трогается: это метка свежести среза
+    /// ([`Self::playlist_tracks_if_fresh`]), а догрузка меняет лишь
+    /// полноту среза, не его возраст.
+    pub fn put_playlist_continuation(
+        &self,
+        provider: &str,
+        playlist: &PlaylistId,
+        continuation: Option<&str>,
+        fetched: usize,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO playlist_sync (provider, playlist, updated_at, continuation, fetched)
+                 VALUES (?1, ?2, 0, ?3, ?4)
+                 ON CONFLICT (provider, playlist) DO UPDATE SET
+                     continuation = excluded.continuation,
+                     fetched = excluded.fetched",
+                params![
+                    provider,
+                    playlist.id.as_str(),
+                    continuation,
+                    fetched as i64,
+                ],
+            )
+            .map_err(|e| self.db_error(e))?;
+        Ok(())
+    }
+
+    /// Текущий курсор догрузки: нет строки, NULL или пустая строка —
+    /// плейлист дочитан.
+    pub fn playlist_continuation(
+        &self,
+        provider: &str,
+        playlist: &PlaylistId,
+    ) -> Result<Option<String>> {
+        let cursor: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT continuation FROM playlist_sync WHERE provider = ?1 AND playlist = ?2",
+                params![provider, playlist.id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| self.db_error(e))?;
+        Ok(cursor.flatten().filter(|token| !token.is_empty()))
     }
 
     /// Сохранить оценку трека. `Rating::None` удаляет строку: отсутствие
@@ -1046,6 +1163,98 @@ mod tests {
         // Чтение одной записи тоже не поднимает мусорную строку.
         let bad = TrackId::new(ProviderId::YTMUSIC, "bad");
         assert_eq!(cache.get_rating(&bad).expect("get"), None);
+    }
+
+    #[test]
+    fn append_continues_positions_after_max() {
+        let (_dir, cache) = bench(u64::MAX);
+        let provider = "ytmusic";
+        let playlist = PlaylistId::new(ProviderId::YTMUSIC, "LM");
+        let first: Vec<Track> = (0..3)
+            .map(|i| track(ProviderId::YTMUSIC, &format!("a{i}"), &format!("Страница {i}")))
+            .collect();
+        cache
+            .put_playlist_tracks(&playlist, &first)
+            .expect("put first");
+
+        // Догрузка второй страницы: позиции обязаны продолжиться с
+        // MAX+1, а не с нуля — иначе порядок плейлиста перемешается.
+        let second = vec![
+            track(ProviderId::YTMUSIC, "b0", "Догрузка 0"),
+            track(ProviderId::YTMUSIC, "b1", "Догрузка 1"),
+        ];
+        cache
+            .append_playlist_tracks(provider, &playlist, &second)
+            .expect("append");
+
+        let mut expected = first.clone();
+        expected.extend(second.clone());
+        assert_eq!(cache.playlist_tracks(&playlist).expect("get"), expected);
+
+        // Повторное чтение MAX внутри другой страницы плейлиста не
+        // должно зацепить чужие позиции.
+        let other = PlaylistId::new(ProviderId::YTMUSIC, "PLother");
+        cache
+            .put_playlist_tracks(&other, &first[..1])
+            .expect("put other");
+        cache
+            .append_playlist_tracks(provider, &other, &second[..1])
+            .expect("append other");
+        assert_eq!(cache.playlist_tracks(&other).expect("get other").len(), 2);
+    }
+
+    #[test]
+    fn continuation_cursor_survives_write_and_read() {
+        let (_dir, cache) = bench(u64::MAX);
+        let provider = "ytmusic";
+        let playlist = PlaylistId::new(ProviderId::YTMUSIC, "LM");
+
+        // Строки sync нет — дочитывать нечего.
+        assert_eq!(
+            cache
+                .playlist_continuation(provider, &playlist)
+                .expect("no row"),
+            None
+        );
+
+        cache
+            .put_playlist_continuation(provider, &playlist, Some("tok-2"), 100)
+            .expect("put cursor");
+        assert_eq!(
+            cache.playlist_continuation(provider, &playlist).expect("get"),
+            Some("tok-2".to_owned())
+        );
+
+        // Финальная страница: курсор пуст — плейлист дочитан.
+        cache
+            .put_playlist_continuation(provider, &playlist, None, 1100)
+            .expect("clear cursor");
+        assert_eq!(
+            cache.playlist_continuation(provider, &playlist).expect("get"),
+            None
+        );
+    }
+
+    #[test]
+    fn forget_playlist_sync_clears_the_cursor_too() {
+        let (_dir, cache) = bench(u64::MAX);
+        let provider = "ytmusic";
+        let id = PlaylistId::new(ProviderId::YTMUSIC, "LM");
+        cache
+            .put_playlist_tracks(&id, &[track(ProviderId::YTMUSIC, "t1", "Трек")])
+            .expect("put");
+        cache
+            .put_playlist_continuation(provider, &id, Some("tok-2"), 100)
+            .expect("put cursor");
+
+        // forget удаляет строку целиком: вместе с меткой свежести
+        // сбрасывается и курсор, состав перечитывается с нуля.
+        cache.forget_playlist_sync(&id).expect("forget");
+        assert_eq!(
+            cache.playlist_continuation(provider, &id).expect("get"),
+            None,
+            "курсор обязан сброситься вместе со строкой sync"
+        );
     }
 
     #[test]

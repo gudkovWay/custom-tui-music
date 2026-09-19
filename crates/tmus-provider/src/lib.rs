@@ -77,6 +77,16 @@ pub trait Account: Send + Sync {
     async fn refresh(&self) -> Result<AuthStatus>;
 }
 
+/// Страница треков плейлиста с курсором продолжения.
+///
+/// `next: None` — плейлист дочитан. Провайдер без пагинации отдаёт весь
+/// состав одним куском и всегда `None`: вызывающий обязан работать с
+/// курсором опционально, а не требовать его.
+pub struct TrackPage {
+    pub tracks: Vec<Track>,
+    pub next: Option<String>,
+}
+
 /// Каталог: всё, что читается, но не играет.
 #[async_trait]
 pub trait Catalog: Send + Sync {
@@ -95,6 +105,21 @@ pub trait Catalog: Send + Sync {
     async fn playlists(&self) -> Result<Vec<Playlist>>;
 
     async fn playlist_tracks(&self, playlist: &PlaylistId) -> Result<Vec<Track>>;
+
+    /// Ленивая страница треков плейлиста. `cursor: None` — первый кусок,
+    /// `Some(token)` — продолжение по токену от прошлого вызова.
+    ///
+    /// Дефолт — полный [`Catalog::playlist_tracks`] одним куском,
+    /// `next: None`: провайдеры без пагинации и моки не ломаются, а
+    /// дозагрузку хвоста реализует только тот, у кого она есть.
+    async fn playlist_tracks_page(
+        &self,
+        playlist: &PlaylistId,
+        _cursor: Option<&str>,
+    ) -> Result<TrackPage> {
+        let tracks = self.playlist_tracks(playlist).await?;
+        Ok(TrackPage { tracks, next: None })
+    }
 
     /// Лайкнутое. У YouTube Music это плейлист `LM`, у других — своё;
     /// вызывающего это не касается.
