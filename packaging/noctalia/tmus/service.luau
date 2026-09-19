@@ -8,6 +8,7 @@ local TMUS = noctalia.commandExists("tmus") and "tmus"
 local RETRY_MS = 3000
 local CALL_MS = 15000
 local LIBRARY_MS = 300000
+local HOME_MS = 300000
 
 local data = {
   linked = false,
@@ -72,6 +73,14 @@ local artDirty = false
 -- пустая работа (аудит 18.09). Тяжёлый и лёгкий ключи публикуются
 -- всегда парой, кроме ветки position — там достаточно лёгкого.
 local NOW_KEY = "tmus.now"
+local HOME_KEY = "tmus.home"
+local homeState = { status = "idle", shelves = {} }
+local homeAt = 0
+local homeDirty = false
+
+local function publishHome()
+  noctalia.state.set(HOME_KEY, homeState)
+end
 
 local function publishNow()
   data.at = os.time()
@@ -176,6 +185,33 @@ local function decorateArt(category, obj)
     if obj.art_url == url then
       obj.art_path = local_path or ""
       artDirty = true
+    end
+  end)
+end
+
+-- Асинхронные арты ленты Home идут в отдельный ключ tmus.home;
+-- republish тяжёлого ключа ради них не нужен — homeDirty
+-- обрабатывает update(). Сам decorateArt не трогаем: им живут
+-- очередь, поиск и библиотека.
+local function decorateHomeArt(category, obj)
+  if type(obj) ~= "table" then
+    return
+  end
+  local url = type(obj.art_url) == "string" and obj.art_url or ""
+  if url == "" then
+    obj.art_path = ""
+    return
+  end
+  local path = objectArtFile(category, obj)
+  if not path then
+    obj.art_path = ""
+    return
+  end
+  obj.art_path = noctalia.fileExists(path) and path or ""
+  ensureArt(url, path, function(local_path)
+    if obj.art_url == url then
+      obj.art_path = local_path or ""
+      homeDirty = true
     end
   end)
 end
@@ -312,6 +348,38 @@ local function pullLibrary()
   end)
 end
 
+local function pullHome()
+  homeAt = noctalia.nowMs()
+  homeState.status = "loading"
+  publishHome()
+  call({ "home", "--provider", data.source, "--json" }, function(got)
+    local shelves = type(got) == "table" and got or {}
+    for _, shelf in ipairs(shelves) do
+      -- Панель рендерит ленту полками; качать арты всей полки —
+      -- лишний трафик, достаточно окна первых карточек.
+      local items = type(shelf.items) == "table" and shelf.items or {}
+      for i, item in ipairs(items) do
+        if i > 14 then
+          break
+        end
+        if item.kind == "track" then
+          decorateHomeArt("track", item)
+        elseif item.kind == "playlist" then
+          decorateHomeArt("playlist", item)
+        end
+      end
+    end
+    homeState = { status = "ok", shelves = shelves, at = os.time() }
+  end, function()
+    -- onDone дёргается и после успешного onOk: ошибкой считаем
+    -- только случай, когда статус остался "loading".
+    if homeState.status == "loading" then
+      homeState.status = "error"
+    end
+    publishHome()
+  end)
+end
+
 local function pullRatings()
   -- Payload::Ratings — массив пар [{provider,id},"liked"|...]; "none"
   -- в список не попадает: отсутствие оценки ключа не имеет.
@@ -445,6 +513,7 @@ local function refreshAll()
   pullSource()
   pullQueue()
   pullRatings()
+  pullHome()
 end
 
 function update()
@@ -469,9 +538,18 @@ function update()
   if sourceReady and noctalia.nowMs() - libraryAt >= LIBRARY_MS then
     pullLibrary()
   end
+  if sourceReady and noctalia.nowMs() - homeAt >= HOME_MS then
+    pullHome()
+  end
   if artDirty then
     artDirty = false
     publish()
+  end
+  if homeDirty then
+    -- Арты ленты дозагрузились: перевыпускаем только её ключ,
+    -- тяжёлый tmus не трогаем.
+    homeDirty = false
+    publishHome()
   end
   -- GC каталога art (аудит 18.09): API перечисления файлов у noctalia
   -- нет (только fileExists/removeFile) — дисковую очистку написать нечем.
@@ -558,7 +636,9 @@ function onIpc(event, payload)
     local index, id = tostring(payload):match("^(%d+)|(.+)$")
     poke({ "play-playlist", id or "", "--start", tostring(math.max(0, tonumber(index) or 0)) })
   elseif event == "queue-goto" and payload then
-    poke({ "play", payload })
+    -- Payload панели — 0-базный индекс очереди; CLI понимает
+    -- `tmus queue-goto <n>` напрямую.
+    poke({ "queue-goto", tostring(payload) })
   elseif event == "search" and payload then
     local rawKind, rawQuery = tostring(payload):match("^([^|]+)|(.*)$")
     if rawKind == nil then
