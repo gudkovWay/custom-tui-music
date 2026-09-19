@@ -75,6 +75,11 @@ local LAYOUT = {
   Cyrillic_PE = "g", Cyrillic_ER = "h", Cyrillic_O = "j", Cyrillic_EL = "k",
   Cyrillic_DE = "l", Cyrillic_TE = "n", Cyrillic_SHCHA = "o", Cyrillic_ZE = "p",
   Cyrillic_KA = "r", Cyrillic_YERU = "s",
+  -- f/d — оценка играющего трека; на ЙЦУКЕН это Cyrillic_a/ve (замер
+  -- xkbcli), заглавные двойники — по образцу PE/SHA выше.
+  F = "f", D = "d",
+  Cyrillic_a = "f", Cyrillic_A = "f",
+  Cyrillic_ve = "d", Cyrillic_VE = "d",
 }
 
 -- Ввод в поиске ведётся ЗДЕСЬ, а не в ui.input: захваченные клавиши
@@ -212,6 +217,8 @@ local searchKind = "all"
 local lastSearchSerial = nil
 local doSearch -- defined below; used by chips and submitSearch
 local rows -- defined below; used by rateSelected (cursor row lookup)
+local activate -- defined below; used by trackRow onClick (клик = Enter)
+local maybeLoadMore -- defined below; used by move/g-jumps (догрузка хвоста)
 
 local function poke(event, payload)
   local argv = { "noctalia", "msg", "plugin", SERVICE, "all", event }
@@ -440,45 +447,52 @@ local function hiddenByRating(s, idstr)
   return ratingOf(s, idstr) == "disliked"
 end
 
--- Оценка трека под курсором; на home (Now-Playing) — текущего трека.
+-- Оценка играющего трека (решение хозяина: цель f/d/a — играющий, не
+-- курсор). Фолбэк на строку курсора — только когда ничего не играет.
 -- Повторное f/d на той же оценке снимает её: шлём "none". Панель
 -- сверяется со своим snapshot: актуальность гарантирует событие
 -- rating_changed, обновляющее snapshot.ratings раньше клавиши.
 local function rateSelected(want)
-  local idstr
-  if view == "home" then
-    -- Карточка-трек под курсором home-ленты; если под курсором не
-    -- трек (или лента пуста) — фолбэк на текущий трек.
-    local shelf = homeShelves()[homeShelf]
-    local c = shelf and shelf.cards[homeItem]
-    if c and c.kind == "track" then
-      idstr = c.id
+  local idstr = tostring(snapshot.trackId or "")
+  if idstr == "" then
+    if view == "home" then
+      local shelf = homeShelves()[homeShelf]
+      local c = shelf and shelf.cards[homeItem]
+      if c and c.kind == "track" then
+        idstr = c.id
+      end
     else
-      idstr = tostring(snapshot.trackId or "")
-    end
-  else
-    local row = rows()[cursor]
-    if row and row.kind == "track" and row.id then
-      idstr = row.id
+      local row = rows()[cursor]
+      if row and row.kind == "track" and row.id then
+        idstr = row.id
+      end
     end
   end
-  if idstr == nil or idstr == "" then
-    return
-  end
-  local send = (ratingOf(snapshot, idstr) == want) and "none" or want
-  poke("rate", send .. ":" .. idstr)
-end
-
--- Оценка трека очереди под курсором (буфер 3): та же логика, что у
--- rateSelected, но строка берётся из snapshot.queue по queueCursor.
--- Повторное f/d на той же оценке снимает её — шлём "none".
-local function rateQueueRow(want)
-  local t = (snapshot.queue or {})[queueCursor]
-  local idstr = t and idOf(t) or ""
   if idstr == "" then
     return
   end
-  local send = (ratingOf(snapshot, idstr) == want) and "none" or want
+  -- В протоколе демон ждёт like|dislike|none: "liked"/"disliked" — это
+  -- сериализация рейтинга в снапшоте, не payload (сервис фильтр
+  -- расширен, но шлём каноническое).
+  local word = (want == "liked") and "like" or "dislike"
+  local send = (ratingOf(snapshot, idstr) == want) and "none" or word
+  poke("rate", send .. ":" .. idstr)
+end
+
+-- Оценка в буфере очереди (буфер 3): та же семантика, что у
+-- rateSelected — играющий трек первым, фолбэк строка курсора очереди.
+-- Повторное f/d на той же оценке снимает её — шлём "none".
+local function rateQueueRow(want)
+  local idstr = tostring(snapshot.trackId or "")
+  if idstr == "" then
+    local t = (snapshot.queue or {})[queueCursor]
+    idstr = t and idOf(t) or ""
+  end
+  if idstr == "" then
+    return
+  end
+  local word = (want == "liked") and "like" or "dislike"
+  local send = (ratingOf(snapshot, idstr) == want) and "none" or word
   poke("rate", send .. ":" .. idstr)
 end
 
@@ -771,7 +785,13 @@ local function trackRow(i, t, opts)
       cursor = i
       selected = o
       if o.event then
-        poke(o.event, o.payload)
+        -- Клик по треку поиска — тот же контекстный запуск, что и
+        -- Enter (activate), иначе клик и клавиша играют по-разному.
+        if view == "search" and o.kind == "track" then
+          activate(o)
+        else
+          poke(o.event, o.payload)
+        end
       end
       draw()
     end,
@@ -816,9 +836,6 @@ local function searchRows(s)
       local hidden = row.kind == "track" and hiddenByRating(s, row.id or "")
       if not hidden then
         table.insert(out, row)
-        if #out >= 200 then
-          break
-        end
       end
     end
   end
@@ -826,10 +843,10 @@ local function searchRows(s)
 end
 
 -- Мемо строк вью: rows() зовётся из draw() на каждом кадре (до 8 Гц),
--- а перебирает до 1000 треков. Кэш живёт, пока не сменились вид,
--- плейлист, показ скрытых, серийный номер поиска И сам snapshot —
--- ссылка на таблицу (refresh() подменяет её целиком; точечные патчи
--- "tmus.now" и спектр её не трогают).
+-- а с ленивой догрузкой перебирает весь плейлист без капа. Кэш живёт,
+-- пока не сменились вид, плейлист, показ скрытых, серийный номер
+-- поиска И сам snapshot — ссылка на таблицу (refresh() подменяет её
+-- целиком; точечные патчи "tmus.now" и спектр её не трогают).
 local rowsCache = nil
 local rowsCacheKey = nil
 local rowsCacheSnap = nil
@@ -861,9 +878,6 @@ function rows()
   elseif view == "playlist" then
     if tostring(s.tracksId or "") == playlistId then
       for i, t in ipairs(s.tracks or {}) do
-        if i > 200 then
-          break
-        end
         local idstr = idOf(t)
         if not hiddenByRating(s, idstr) then
           table.insert(out, {
@@ -878,6 +892,11 @@ function rows()
             time = durationLabel(t.duration),
           })
         end
+      end
+      -- Приглашение хвоста: пока сервис не сказал «дочитано», под
+      -- списком живёт приглушённая строка — не активная, без event.
+      if s.hasMore ~= false then
+        table.insert(out, { kind = "more", title = "… догрузка" })
       end
     end
   elseif view == "search" then
@@ -1038,6 +1057,30 @@ local function homeMoveX(dx)
   return true
 end
 
+-- Контекстный запуск (решение хозяина 20.09): активация трека играет
+-- весь видимый список как новый контекст, а не одиночный трек в старую
+-- очередь. Сбор — только в момент активации: rows() строится на каждом
+-- кадре, а трогать его нельзя. items — уже отфильтрованный порядок
+-- отображения (rows() для поиска, shelf.cards для home). Возвращает
+-- payload "<start>|<id1>,<id2>,..." или nil, если активный трек в
+-- списке не найден (снапшот успел смениться) — вызывающий падает
+-- назад на одиночный play.
+local function contextPayload(activeId, items)
+  local ids, start = {}, nil
+  for _, it in ipairs(items) do
+    if it.kind == "track" and it.id ~= nil and it.id ~= "" then
+      if it.id == activeId then
+        start = #ids
+      end
+      table.insert(ids, it.id)
+    end
+  end
+  if start == nil or #ids == 0 then
+    return nil
+  end
+  return tostring(start) .. "|" .. table.concat(ids, ",")
+end
+
 local function homeActivate()
   local shelf = homeShelves()[homeShelf]
   local c = shelf and shelf.cards[homeItem]
@@ -1046,12 +1089,21 @@ local function homeActivate()
   end
   if c.kind == "playlist" then
     openPlaylist(c)
+  elseif c.kind == "track" then
+    -- Контекст всей текущей полки: трек-карточки в порядке отображения,
+    -- старт с выбранной карточки (зеркало поиска).
+    local payload = contextPayload(c.id, shelf.cards)
+    if payload then
+      poke("play-context", payload)
+    else
+      poke(c.event or "play", c.payload)
+    end
   else
     poke(c.event or "play", c.payload)
   end
 end
 
-local function activate(row)
+function activate(row)
   if row == nil then
     return
   end
@@ -1069,6 +1121,17 @@ local function activate(row)
   end
   if row.open then
     openPlaylist(row)
+  elseif row.event == "play" then
+    -- Трек-строка поиска (event "play" ставит только resultRow):
+    -- играем контекст всей видимой выдачи в порядке rows(), стартуя
+    -- с активированной строки. Плейлистные ("playlist") и вью
+    -- playlist ("playlist-at") строки не трогаем.
+    local payload = contextPayload(row.id, rows())
+    if payload then
+      poke("play-context", payload)
+    else
+      poke(row.event, row.payload)
+    end
   elseif row.event then
     poke(row.event, row.payload)
   end
@@ -1087,6 +1150,7 @@ local function move(delta)
   end
   clampCursor(items)
   selected = items[cursor]
+  maybeLoadMore()
 end
 
 -- Курсор очереди (буфер 3): кламп 1..#snapshot.queue без wrap —
@@ -1100,6 +1164,33 @@ local function moveQueue(delta)
   followPlaying = false
   queueCursor = math.max(1, math.min(#queue, queueCursor + delta))
   clampQueue(queue)
+end
+
+-- Ленивая догрузка хвоста плейлиста: курсор подошёл ближе 20 строк к
+-- концу — просим сервис следующую страницу. Шторм гасят три слоя:
+-- in-flight у сервиса, hasMore=false после пустой страницы и локальный
+-- дебаунс — повторные poke ближе 500 мс (и повторители удержания j)
+-- схлопываются без таймеров.
+local MORE_MARGIN = 20
+local MORE_DEBOUNCE_MS = 500
+local lastMoreAt = 0
+maybeLoadMore = function()
+  if view ~= "playlist" then
+    return
+  end
+  local s = snapshot
+  if tostring(s.tracksId or "") ~= playlistId or s.hasMore == false then
+    return
+  end
+  if cursor < #rows() - MORE_MARGIN then
+    return
+  end
+  local now = noctalia.nowMs()
+  if now - lastMoreAt < MORE_DEBOUNCE_MS then
+    return
+  end
+  lastMoreAt = now
+  poke("tracks-more", playlistId)
 end
 
 -- Горизонтальный/вертикальный ход по сетке Library (буфер 2):
@@ -1282,6 +1373,14 @@ local function listChildren(slice, first)
         lbl(row.title, { key = "client-title" .. i, grow = 1, color = COLORS.text }),
         lbl(row.subtitle, { key = "client-sub" .. i, color = COLORS.muted }),
         lbl("Connected", { key = "client-state" .. i, color = COLORS.muted }),
+      }))
+    elseif row.kind == "more" then
+      -- Приглашение догрузки: приглушённая, без onClick и event —
+      -- курсор на неё может встать, активация ничего не делает.
+      table.insert(children, lbl(row.title, {
+        key = "more" .. i,
+        size = 12,
+        color = COLORS.muted,
       }))
     else
       table.insert(children, trackRow(i, row, {
@@ -1626,19 +1725,18 @@ local function submitPlNaming()
   end
 end
 
--- Трек для «a — в плейлист»: на home — играющий, иначе строка под
--- курсором (нужна kind=="track" и составной id "prov:id").
+-- Трек для «a — в плейлист»: играющий трек (решение хозяина), фолбэк —
+-- строка под курсором (нужна kind=="track" и составной id "prov:id").
 local function trackForAdd()
+  local idstr = tostring(snapshot.trackId or "")
+  if idstr ~= "" then
+    return idstr
+  end
   if view == "home" then
-    -- Карточка-трек под курсором home-ленты; иначе играющий трек.
     local shelf = homeShelves()[homeShelf]
     local c = shelf and shelf.cards[homeItem]
     if c and c.kind == "track" then
       return c.id
-    end
-    local idstr = tostring(snapshot.trackId or "")
-    if idstr ~= "" then
-      return idstr
     end
     return nil
   end
@@ -1656,7 +1754,9 @@ end
 local function playlistPickerNode(s)
   local items = { { title = "+ New playlist…" } }
   for _, p in ipairs(s.playlists or {}) do
-    table.insert(items, { ref = plRef(p), title = tostring(p.title or "") })
+    local ref = plRef(p)
+    local bare = ref:match(":(.+)$") or ref
+    table.insert(items, { ref = ref, title = tostring(p.title or ""), lm = bare == "LM" })
   end
   if plPicker.cursor > #items then
     plPicker.cursor = #items
@@ -1680,7 +1780,9 @@ local function playlistPickerNode(s)
         draw()
       end,
     }, {
-      lbl(shorten(item.title, 34), {
+      -- LM управляется лайками (edit_playlist туда не пишет) — помечаем
+      -- пункт, чтобы выбор читался как лайк, а не добавление.
+      lbl(item.lm and (shorten(item.title, 26) .. " · ♥ лайк") or shorten(item.title, 34), {
         key = "plpick-t" .. i,
         grow = 1,
         color = active and COLORS.accent or COLORS.text,
@@ -1715,7 +1817,7 @@ local function helpNode()
     helpRow("enter", "Return · Space", "открыть · играть · тумблер eq; пауза"),
     helpRow("track", "n/p · r · s", "трек · repeat · shuffle"),
     helpRow("vol", "< · >", "громкость"),
-    helpRow("rate", "f · d", "лайк · дизлайк (строка, очередь)"),
+    helpRow("rate", "f · d", "лайк · дизлайк играющего"),
     helpRow("pl", "a · D", "в плейлист · удалить трек"),
     helpRow("flat", "0", "eq: обнулить полосы (Flat)"),
     helpRow("misc", "o · ctrl+d", "терминал TUI · скрытые плейлисты"),
@@ -2155,7 +2257,16 @@ function onKey(chord, pressed)
       else
         local pl = (snapshot.playlists or {})[plPicker.cursor - 1]
         if pl then
-          poke("pl", "add:" .. plRef(pl) .. ":" .. plPicker.track)
+          local ref = plRef(pl)
+          local bare = ref:match(":(.+)$") or ref
+          if bare == "LM" then
+            -- Liked Music нельзя править через edit_playlist — он
+            -- целиком выводится из лайков; подтверждение на LM = лайк
+            -- трека, ради которого и открыт пикер.
+            poke("rate", "like:" .. plPicker.track)
+          else
+            poke("pl", "add:" .. ref .. ":" .. plPicker.track)
+          end
         end
         plPicker = nil
       end
@@ -2296,6 +2407,7 @@ function onKey(chord, pressed)
       elseif key == "g" then
         local count = #rows()
         cursor = cursor == 1 and count or 1
+        maybeLoadMore()
       elseif chord == "BackSpace" or chord == "Backspace" then
         -- Назад на home — зеркало Esc; захват остаётся, чтобы
         -- клавиша не утекала под панель.
@@ -2338,8 +2450,12 @@ function onKey(chord, pressed)
     elseif key == "d" then
       rateQueueRow("disliked")
     elseif chord == "A" or chord == "Cyrillic_f" then
-      -- a: трек очереди под курсором — в поповер «в плейлист».
-      local track = idOf((snapshot.queue or {})[queueCursor])
+      -- a: играющий трек — в поповер «в плейлист»; фолбэк — строка
+      -- курсора очереди (решение хозяина: цель f/d/a — играющий).
+      local track = tostring(snapshot.trackId or "")
+      if track == "" then
+        track = idOf((snapshot.queue or {})[queueCursor])
+      end
       if track ~= "" then
         plPicker = { track = track, cursor = 1 }
       end
@@ -2452,6 +2568,7 @@ function onKey(chord, pressed)
     else
       local count = #rows()
       cursor = cursor == 1 and count or 1
+      maybeLoadMore()
     end
   elseif key == "r" then
     poke("repeat", REPEAT_CYCLE[tostring(snapshot.loop or "none")] or "none")

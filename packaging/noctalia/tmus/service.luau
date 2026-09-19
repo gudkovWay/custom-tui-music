@@ -36,6 +36,10 @@ local data = {
   results = {},
   tracks = {},
   tracksId = "",
+  -- Хвост плейлиста: true/nil — догрузка возможна, false — демон
+  -- отдал пустую страницу (дочитано). Начальное true: пока не
+  -- доказано обратное, за потолком первой страницы могут быть треки.
+  hasMore = true,
   tracksTitle = "",
   searchSerial = 0,
   at = 0,
@@ -45,6 +49,9 @@ local streaming = false
 local retryAt = 0
 local libraryAt = 0
 local sourceReady = false
+-- Летящая догрузка хвоста плейлиста: повторный tracks-more, пока не
+-- вернулся предыдущий call, игнорируется. Сбрасывается в cb и onDone.
+local tracksMoreInFlight = false
 
 -- Метка жизни потока `tmus events`: любая строка (включая keepalive)
 -- двигает её. У runStream нет onClose, поэтому единственный след
@@ -578,11 +585,24 @@ function onIpc(event, payload)
     poke({ "vol", tostring(payload) })
   elseif event == "play" and payload then
     poke({ "play", payload })
+  elseif event == "play-context" and payload then
+    -- Панель шлёт "<start>|<prov:id>,<prov:id>,..."; CLI —
+    -- `tmus play-context <ids-через-запятую> --start <n>`. Разбор по
+    -- образцу "playlist-at"; ответ не нужен — демон разошлёт state.
+    local index, ids = tostring(payload):match("^(%d+)|(.+)$")
+    if ids and ids ~= "" then
+      poke({ "play-context", ids, "--start", tostring(math.max(0, tonumber(index) or 0)) })
+    end
   elseif event == "rate" and payload then
     -- Панель шлёт "like|dislike|none:<provider>:<id>"; argv CLI —
     -- `tmus rate <provider>:<id> like|dislike|none`. Ответ не нужен:
     -- демон разошлёт rating_changed, и запись обновится сама.
     local want, id = tostring(payload):match("^([%a]+):(.+)$")
+    -- Защита в глубину: панель шлёт канонические like|dislike, но
+    -- принимаем и snapshot-формы "liked"/"disliked" — молчаливый
+    -- дроп события хуже лишней нормализации.
+    if want == "liked" then want = "like" end
+    if want == "disliked" then want = "dislike" end
     if (want == "like" or want == "dislike" or want == "none") and id and id ~= "" then
       poke({ "rate", id, want })
     end
@@ -674,10 +694,47 @@ function onIpc(event, payload)
     call({ "library-tracks", tostring(payload), "--json" }, function(got)
       data.tracks = type(got) == "table" and got or {}
       data.tracksId = tostring(payload)
+      -- Полный список мог прийти неполным: демон режет выдачу
+      -- потолком batch — хвост добираем ленивой догрузкой.
+      data.hasMore = true
       for _, tr in ipairs(data.tracks) do
         decorateArt("track", tr)
       end
     end)
+  elseif event == "tracks-more" and payload then
+    -- Ленивая догрузка хвоста: панель стучится, когда курсор подошёл
+    -- к концу списка. Повторный запрос, пока летит предыдущий,
+    -- схлопываем флагом — cb/onDone его снимут.
+    if tracksMoreInFlight then
+      return
+    end
+    tracksMoreInFlight = true
+    local want = tostring(payload)
+    call({ "library-tracks-more", want, "--json" }, function(got)
+      tracksMoreInFlight = false
+      -- Пока летел запрос, открыли другой плейлист: страница чужая —
+      -- дописывать её в текущий список нельзя.
+      if data.tracksId ~= want then
+        return
+      end
+      local page = type(got) == "table" and got or {}
+      local pageTracks = type(page.tracks) == "table" and page.tracks or {}
+      if #pageTracks > 0 then
+        for _, tr in ipairs(pageTracks) do
+          table.insert(data.tracks, tr)
+          decorateArt("track", tr)
+        end
+        -- Курсор продолжения живёт только в демоне: есть next — есть хвост.
+        data.hasMore = page.next ~= nil and page.next ~= ""
+      else
+        -- Пустая страница = дочитано: панель перестаёт стучаться.
+        data.hasMore = false
+      end
+    end, function()
+      tracksMoreInFlight = false
+    end)
+    -- publish() здесь не нужен: call() публикует сам в onDone (так же
+    -- живёт ветка "tracks" выше).
   elseif event == "source" and payload then
     local want = tostring(payload)
     if want ~= data.source then
