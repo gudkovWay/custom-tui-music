@@ -735,18 +735,27 @@ fn rate_toggle(current: Option<Rating>, want: Rating) -> Rating {
     }
 }
 
-/// Трек под курсором активного списка — тот же, которого касается
+/// Трек-цель f/d/a/пикера: сначала играющий (`state.track`, зеркало
+/// фика панели — оценка и «добавить в плейлист» относятся к тому, что
+/// звучит, а не к тому, где курсор); когда ничего не играет — трек под
+/// курсором активного списка, тот же, которого касается
 /// Space/Return: плейлист (через фильтр), очередь (единственный
 /// видимый трек — текущий) или результат поиска. Курсор вне трека
 /// (плейлисты библиотеки, плейлист/артист в поиске) — ничего.
 fn selected_track(app: &App) -> Option<TrackId> {
+    if let Some(t) = app.state.track.as_ref() {
+        return Some(t.id.clone());
+    }
     if app.nav.focus == Focus::Tracks {
         let idx = app.nav.playlist_sel.selected()?;
         let idx = *app.track_view.get(idx)?;
         return app.playlist_tracks.get(idx).map(|t| t.id.clone());
     }
     match app.nav.panel {
-        Panel::Queue => app.state.track.as_ref().map(|t| t.id.clone()),
+        Panel::Queue => {
+            // Играющий уже проверен выше; в тишине в очереди цели нет.
+            None
+        }
         Panel::Search => {
             let idx = app.nav.search_sel.selected()?;
             match app.search_results.get(idx) {
@@ -804,14 +813,25 @@ async fn play_selected(app: &mut App) {
             }
         }
         Panel::Search => {
-            let Some(idx) = app.nav.search_sel.selected() else { return };
-            let idx = match app.search_view.get(idx) {
-                Some(&i) => i,
-                None => return,
-            };
-            if let Some(SearchResult::Track(track)) = app.search_results.get(idx) {
-                fire(app, Cmd::PlayTrack { track: track.id.clone() });
-            }
+            let Some(sel) = app.nav.search_sel.selected() else { return };
+            let Some(&sel) = app.search_view.get(sel) else { return };
+            let Some(SearchResult::Track(track)) = app.search_results.get(sel) else { return };
+            let selected = track.id.clone();
+            // Контекстный запуск: Enter играет весь видимый список
+            // результатов (тот же search_view, по которому ходит курсор
+            // и рендер), стартуя с выбранного, — плейлист целиком
+            // заменяется, а не дописывается (решение хозяина).
+            let tracks: Vec<TrackId> = app
+                .search_view
+                .iter()
+                .filter_map(|&i| app.search_results.get(i))
+                .filter_map(|r| match r {
+                    SearchResult::Track(t) => Some(t.id.clone()),
+                    _ => None,
+                })
+                .collect();
+            let start = tracks.iter().position(|id| id == &selected).unwrap_or(0);
+            fire(app, Cmd::PlayContext { tracks, start });
         }
     }
 }

@@ -99,6 +99,13 @@ enum CliCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Следующая страница треков плейлиста (ленивая догрузка от
+    /// сохранённого курсора; пустой ответ — «дочитано»).
+    LibraryTracksMore {
+        playlist_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Домашняя лента рекомендаций (полки).
     Home {
         #[arg(long)]
@@ -129,6 +136,13 @@ enum CliCmd {
         provider: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+    /// Играть контекст: список составных id "prov:id" через запятую,
+    /// начиная с `--start` (замена очереди целиком).
+    PlayContext {
+        tracks: String,
+        #[arg(long)]
+        start: usize,
     },
     /// Играть плейлист с начала или с `--start`.
     PlayPlaylist {
@@ -310,6 +324,12 @@ async fn main() -> Result<()> {
             let cmd = Cmd::LibraryTracks { playlist: parse_playlist_id(&playlist_id)? };
             return print_payload(client.call(cmd).await?, json);
         }
+        CliCmd::LibraryTracksMore { playlist_id, json } => {
+            // Тот же Cmd, что и первая страница: курсор догрузки хранит
+            // демон, клиенту достаточно составного id плейлиста.
+            let cmd = Cmd::LibraryTracksPage { playlist: parse_playlist_id(&playlist_id)? };
+            return print_payload(client.call(cmd).await?, json);
+        }
         CliCmd::Loop { mode } => Cmd::SetLoop { mode: parse_loop(&mode)? },
         CliCmd::Shuffle { mode } => match parse_shuffle(&mode)? {
             Some(shuffle) => Cmd::SetShuffle { shuffle },
@@ -328,6 +348,20 @@ async fn main() -> Result<()> {
         CliCmd::Search { query, kind, provider, json } => {
             let provider = resolve_provider(&mut client, provider.as_deref()).await?;
             return run_search(&mut client, &query, kind, provider, json).await;
+        }
+        CliCmd::PlayContext { tracks, start } => {
+            // По запятым, с обрезкой пробелов: строку собирает сервис
+            // плагина через table.concat, а человек может вписать руками.
+            // Пустой сегмент/битый id отдаём parse_track_id — те же
+            // сообщения, что и у одиночного `play`.
+            let ids = tracks
+                .split(',')
+                .map(|s| parse_track_id(s.trim()))
+                .collect::<Result<Vec<_>>>()?;
+            if ids.is_empty() {
+                bail!("пустой список треков: укажите хотя бы один prov:id");
+            }
+            Cmd::PlayContext { tracks: ids, start }
         }
         CliCmd::PlayPlaylist { playlist_id, start } => Cmd::PlayPlaylist {
             playlist: parse_playlist_id(&playlist_id)?,
@@ -569,6 +603,18 @@ fn format_payload(payload: &Payload) -> String {
             .map(|(id, r)| format!("{id}: {r:?}"))
             .collect::<Vec<_>>()
             .join("\n"),
+        // Страница плейлиста (ленивая догрузка): тот же вид, что у
+        // полного Tracks, хвост помечаем курсором продолжения.
+        Payload::TracksPage { tracks, next } => {
+            let mut lines: Vec<String> = tracks
+                .iter()
+                .map(|t| format!("{}: {} — {}", t.id, t.artist_line(), t.title))
+                .collect();
+            if let Some(next) = next {
+                lines.push(format!("… продолжение: {next}"));
+            }
+            lines.join("\n")
+        }
         // Содержательный вид нужен только CLI `pl new`, который
         // разворачивает payload сам; здесь — просто id.
         Payload::PlaylistCreated { playlist } => playlist.to_string(),
