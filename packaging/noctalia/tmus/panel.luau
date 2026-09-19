@@ -542,6 +542,62 @@ local function artNode(path, size, glyph)
   })
 end
 
+-- Уровень громкости (0..100) → имя глифа: 0 — volume-zero, до 30 —
+-- volume-low, до 70 — volume-2, выше — volume-high.
+local function volumeGlyph(v)
+  if v <= 0 then
+    return "volume-zero"
+  elseif v < 30 then
+    return "volume-low"
+  elseif v < 70 then
+    return "volume-2"
+  end
+  return "volume-high"
+end
+
+-- Черновик громкости на время перетаскивания слайдера: onChange
+-- держит его локально (демона не дёргаем), onDragEnd вызывается
+-- БЕЗ аргумента (std::function<void()>), поэтому берём черновик —
+-- и один раз шлём poke("vol-set", абсолютное значение строкой).
+-- nil — значение берётся из s.volume.
+local volDraft = nil
+
+-- Компактный контрол громкости: глиф-тир + слайдер 0..100 шагом 5.
+-- tooltip в host/API 24 нет ни у глифов/слайдеров, ни у контейнеров
+-- (проба: prop ignored) — значение и бинды читаются с самого
+-- контрола и модала подсказок (?).
+local function volumeNode(s)
+  local current = volDraft or math.max(0, math.min(100, math.floor(tonumber(s.volume) or 0)))
+  return ui.row({
+    key = "np-volume",
+    gap = 6,
+    align = "center",
+  }, {
+    ui.glyph({
+      key = "np-volume-glyph",
+      name = volumeGlyph(current),
+      size = 14,
+      color = COLORS.muted,
+    }),
+    ui.slider({
+      key = "np-volume-slider",
+      min = 0,
+      max = 100,
+      step = 5,
+      value = current,
+      width = 96,
+      onChange = function(v)
+        volDraft = math.max(0, math.min(100, math.floor(tonumber(v) or 0)))
+      end,
+      onDragEnd = function()
+        local final = volDraft or current
+        volDraft = nil
+        poke("vol-set", tostring(math.max(0, math.min(100, math.floor(tonumber(final) or 0)))))
+      end,
+    }),
+  })
+end
+
 -- Нижний now-playing: одна карточка на каждый вид, последний ребёнок
 -- workspace-колонки. Кнопки/прогресс/спектр живут только здесь —
 -- хиро home-вида остаётся чистой типографикой.
@@ -561,8 +617,6 @@ local function npNode(s)
     if (s.loop or "none") ~= "none" then
       table.insert(marks, REPEAT_LABEL[tostring(s.loop)] or tostring(s.loop))
     end
-    -- Громкость приезжает по лёгкому ключу "tmus.now", так что чип живой.
-    table.insert(marks, "vol " .. math.floor(tonumber(s.volume) or 0) .. "%")
     local controls = {
       ui.button({
         key = "prev",
@@ -620,6 +674,7 @@ local function npNode(s)
         color = COLORS.muted,
       }))
     end
+    table.insert(controls, volumeNode(s))
     table.insert(children, ui.row({ key = "np-top", gap = 12, align = "center" }, {
       artNode(s.artPath, 48),
       ui.column({ key = "np-text", gap = 2, flexGrow = 1 }, {
@@ -2491,6 +2546,9 @@ end
 
 function onClose()
   endHold()
+  -- Страховка: закрытие посреди drag слайдера не должно оставлять
+  -- устаревший черновик громкости следующему открытию панели.
+  volDraft = nil
 end
 
 function doSearch()

@@ -572,6 +572,10 @@ function onIpc(event, payload)
     -- Скролл виджета шлёт одно агрегированное событие ("+15"/"-10");
     -- tmus vol понимает знак.
     poke({ "vol", tostring(payload) })
+  elseif event == "vol-set" and payload then
+    -- Ползунок панели шлёт абсолютное значение ("70"); tmus vol
+    -- принимает и его.
+    poke({ "vol", tostring(payload) })
   elseif event == "play" and payload then
     poke({ "play", payload })
   elseif event == "rate" and payload then
