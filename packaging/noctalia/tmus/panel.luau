@@ -180,6 +180,11 @@ local plName = ""
 local plAddAfterCreate = nil
 -- Поповер выбора плейлиста для трека: { track = "prov:id", cursor = n }.
 local plPicker = nil
+-- Модал подсказок: ? (Shift+7 на ЙЦУКЕН — keysym question в обеих
+-- раскладках) раскрывает карту клавиш вместо центрального вида,
+-- любая клавиша закрывает. Паттерн plPicker — перекрытие центра без
+-- нового API.
+local helpShown = false
 local query = ""
 local lastSearched = nil
 -- Home-лента ("tmus.home"): курсор (полка/карточка), верхнее окно
@@ -1099,6 +1104,7 @@ local function setView(id)
   plName = ""
   plAddAfterCreate = nil
   plPicker = nil
+  helpShown = false
   -- Home-лента всегда открывается с начала: курсор и окна в ноль.
   if id == "home" then
     homeShelf = 1
@@ -1618,6 +1624,48 @@ local function playlistPickerNode(s)
   return ui.column({ key = "pl-picker", gap = 6, flexGrow = 3 }, out)
 end
 
+-- Строка карты подсказок: клавиша акцентом, действие приглушённым.
+local function helpRow(id, keys, text)
+  return ui.row({ key = "help-" .. id, gap = 10, align = "center" }, {
+    lbl(keys, { key = "help-k-" .. id, width = 190, size = 12, color = COLORS.accent }),
+    lbl(text, { key = "help-t-" .. id, grow = 1, size = 12, color = COLORS.muted }),
+  })
+end
+
+-- Модал подсказок: перекрывает центральные виды (паттерн plPicker),
+-- rail/очередь/now-playing остаются на месте — спектр живёт и под
+-- модалом. Статичен: одна страница, без скролла и курсора.
+local function helpNode()
+  local col1 = ui.column({ key = "help-col-nav", gap = 5 }, {
+    helpRow("buf", "Tab · ctrl+h/l", "буфер центр ↔ очередь (д · р)"),
+    helpRow("views", "ctrl+j/k · 1–5", "секции (о · л)"),
+    helpRow("move", "j/k · h/l", "ход: список, сетка; в eq — полоса, ±дБ"),
+    helpRow("ends", "g", "первый/последний"),
+    helpRow("back", "BackSpace · Esc", "назад: плейлист → Library, поиск → Home, буфер 3 → 2"),
+    helpRow("search", "/ · i", "поиск: insert; jj/Esc — normal"),
+    helpRow("killword", "ctrl+BackSpace", "удалить слово в запросе"),
+  })
+  local col2 = ui.column({ key = "help-col-act", gap = 5 }, {
+    helpRow("enter", "Return · Space", "открыть · играть · тумблер eq; пауза"),
+    helpRow("track", "n/p · r · s", "трек · repeat · shuffle"),
+    helpRow("vol", "< · >", "громкость"),
+    helpRow("rate", "f · d", "лайк · дизлайк (строка, очередь)"),
+    helpRow("pl", "a · D", "в плейлист · удалить трек"),
+    helpRow("flat", "0", "eq: обнулить полосы (Flat)"),
+    helpRow("misc", "o · ctrl+d", "терминал TUI · скрытые плейлисты"),
+    helpRow("help", "?", "этот модал (ЙЦУКЕН: Shift+7); закрыть — любая клавиша"),
+  })
+  return ui.column({ key = "help-modal", gap = GAP, flexGrow = 1 }, {
+    lbl("Keymap", { key = "help-title", size = 18, color = COLORS.text }),
+    ui.row({ key = "help-cols", gap = GAP, flexGrow = 1 }, { col1, col2 }),
+    lbl("любая клавиша — закрыть · медиа-клавиши работают", {
+      key = "help-close",
+      size = 11,
+      color = COLORS.muted,
+    }),
+  })
+end
+
 function draw()
   local s = snapshot
   local items = rows()
@@ -1720,7 +1768,6 @@ function draw()
       ui.column({ key = "ws-body", gap = GAP, flexGrow = 1 }, body),
     }
   elseif view == "playlist" then
-    local state = stateNode(s, items)
     local body = {}
     if state then
       table.insert(body, state)
@@ -1763,6 +1810,12 @@ function draw()
     }
   end
 
+  -- Модал подсказок перекрывает центральные виды в любом буфере —
+  -- до npNode: спектр и контролы добавятся ниже и живут под модалом.
+  if helpShown then
+    wsChildren = { helpNode() }
+  end
+
   -- Нижний now-playing — последний ребёнок workspace-колонки в КАЖДОМ
   -- виде: управление и спектр всегда в одном и том же месте экрана.
   table.insert(wsChildren, npNode(s))
@@ -1789,12 +1842,10 @@ function draw()
     }, { context }),
   })
 
+  -- Полная карта клавиш переехала в модал ? (приёмка 19.09: строка
+  -- на весь этаж читалась плохо); футер оставляет только два якоря.
   local footer = lbl(
-    view == "eq"
-      and "Tab/ctrl+h·l буферы · j/k полоса · h/l ±дБ · Return тумблер · 0 flat · 1–5 секции"
-      or "Tab/ctrl+h·l буферы · ctrl+j/k секции · 1–5 секции · j/k/h/l ход · Return открыть/играть · "
-        .. "BackSpace назад · Space пауза · / поиск (i · jj/Esc normal · ctrl+BS слово) · n/p · r · s · "
-        .. "</> vol · f/d · ctrl+d скрытые · o терминал · g концы · a в плейлист · D удалить",
+    "? — подсказки · Tab · ctrl+h/l — буферы",
     { key = "footer", size = 11, color = COLORS.muted }
   )
 
@@ -2047,6 +2098,23 @@ function onKey(chord, pressed)
     elseif key == "k" or chord == "Up" then
       plPicker.cursor = (plPicker.cursor - 2) % count + 1
     end
+    draw()
+    return
+  end
+
+  -- Модал подсказок (? — вопросик в обеих раскладках: ЙЦУКЕН —
+  -- Shift+7, keysym question). Открываем только из normal: в insert
+  -- поиска ввод есть ввод. Закрытие — любая клавиша (до карт ниже,
+  -- чтобы j/k не листали список за модалом); медиа-клавиши и
+  -- ctrl+j/k секций обрабатываются выше и работают сквозь модал,
+  -- смена вида закрывает его в setView.
+  if helpShown then
+    helpShown = false
+    draw()
+    return
+  end
+  if chord == "question" and not typing then
+    helpShown = true
     draw()
     return
   end
