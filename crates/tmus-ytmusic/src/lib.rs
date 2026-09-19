@@ -27,8 +27,8 @@ use tmus_core::CoreError;
 use tmus_core::config::Config;
 use tmus_core::cookies::CookieSource;
 use tmus_core::model::{
-    AuthStatus, Playlist, PlaylistId, ProviderId, Rating, SearchKind, SearchResult, StreamSource,
-    Track, TrackId,
+    AuthStatus, CatalogShelf, Playlist, PlaylistId, ProviderId, Rating, SearchKind, SearchResult,
+    StreamSource, Track, TrackId,
 };
 use tmus_provider::ytdlp::{YtDlp, YtDlpRequest};
 use tmus_provider::{Account, Catalog, Provider, ProviderError, Resolver, Result};
@@ -42,6 +42,10 @@ const DISPLAY_NAME: &str = "YouTube Music";
 
 /// Раздел библиотеки с плейлистами. Замерено: HTTP 200, 18 плейлистов.
 const LIKED_PLAYLISTS_BROWSE: &str = "FEmusic_liked_playlists";
+
+/// Лента рекомендаций на главной. Замерено 19.09: HTTP 200, карусели
+/// `musicCarouselShelfRenderer` с шапками `musicCarouselShelfBasicHeaderRenderer`.
+const HOME_BROWSE: &str = "FEmusic_home";
 
 /// Служебный плейлист «Мне нравится». Для модели это обычный плейлист:
 /// вызывающий не должен знать, что у YouTube Music лайки — плейлист.
@@ -253,6 +257,13 @@ impl Catalog for YtMusic {
     async fn liked(&self) -> Result<Vec<Track>> {
         self.playlist_tracks(&PlaylistId::new(self.id, LIKED_PLAYLIST))
             .await
+    }
+
+    async fn home(&self) -> Result<Vec<CatalogShelf>> {
+        // Одна страница: продолжения удваивают латентность ради внеэкранных
+        // полок (см. browse_pages, если понадобится глубже).
+        let page = self.tube.browse(HOME_BROWSE).await?;
+        Ok(parse::home(&page))
     }
 
     async fn rate(&self, track: &TrackId, rating: Rating) -> Result<()> {

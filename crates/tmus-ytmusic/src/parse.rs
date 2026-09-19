@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use serde_json::Value;
-use tmus_core::model::{Playlist, PlaylistId, ProviderId, SearchResult, Track, TrackId};
+use tmus_core::model::{CatalogShelf, Playlist, PlaylistId, ProviderId, SearchResult, Track, TrackId};
 
 const PROVIDER: ProviderId = ProviderId::YTMUSIC;
 
@@ -180,29 +180,86 @@ pub(crate) fn search_results(page: &Value) -> Vec<SearchResult> {
         let Some(row) = two_row(item) else {
             continue;
         };
-        let artist = row.page_type.as_deref().is_some_and(|page| page.contains("ARTIST"));
-        let album = row.page_type.as_deref().is_some_and(|page| page.contains("ALBUM"));
-
-        if artist {
-            if !row.browse_id.is_empty() {
-                results.push(SearchResult::Artist {
-                    provider: PROVIDER,
-                    id: row.browse_id,
-                    name: row.title,
-                });
-            }
-        } else if album {
-            if let Some(album) = album_of(row) {
-                results.push(SearchResult::Playlist(album));
-            }
-        } else if is_playlist(&row) {
-            if let Some(playlist) = playlist_of(row) {
-                results.push(SearchResult::Playlist(playlist));
-            }
+        // Ветвление общее с лентой Home — вынесено в two_row_result.
+        if let Some(result) = two_row_result(row) {
+            results.push(result);
         }
     }
 
     results
+}
+
+/// Карточка `musicTwoRowItemRenderer` → результат поиска: артист, альбом
+/// или плейлист по pageType. Битая карточка (нет адреса/имени) — `None`,
+/// а не ошибка: одна мёртвая строка не должна ронять выдачу.
+fn two_row_result(row: TwoRow) -> Option<SearchResult> {
+    let artist = row.page_type.as_deref().is_some_and(|page| page.contains("ARTIST"));
+    let album = row.page_type.as_deref().is_some_and(|page| page.contains("ALBUM"));
+
+    if artist {
+        if row.browse_id.is_empty() {
+            return None;
+        }
+        Some(SearchResult::Artist {
+            provider: PROVIDER,
+            id: row.browse_id,
+            name: row.title,
+        })
+    } else if album {
+        album_of(row).map(SearchResult::Playlist)
+    } else if is_playlist(&row) {
+        playlist_of(row).map(SearchResult::Playlist)
+    } else {
+        None
+    }
+}
+
+/// Лента Home: карусели `musicCarouselShelfRenderer` одной страницы.
+///
+/// Одна страница, а не browse_pages: продолжения удваивают латентность
+/// ради полок, которые всё равно за пределами экрана. Артистов (и видео)
+/// выбрасываем — поверхность артиста в плеере нет, мёртвая карточка хуже
+/// отсутствующей. Полка без заголовка или без элементов не нужна вызывающему.
+pub(crate) fn home(page: &Value) -> Vec<CatalogShelf> {
+    renderers(page, "musicCarouselShelfRenderer")
+        .iter()
+        .filter_map(|shelf| {
+            let header = shelf.pointer("/header/musicCarouselShelfBasicHeaderRenderer")?;
+            let title = runs_text(header.get("title")?);
+            if title.is_empty() {
+                return None;
+            }
+            let subtitle = header.get("strapline").map(runs_text).filter(|text| !text.is_empty());
+
+            let items: Vec<SearchResult> = shelf
+                .get("contents")?
+                .as_array()?
+                .iter()
+                .filter_map(|item| {
+                    if let Some(entry) = item.get("musicResponsiveListItemRenderer") {
+                        track_from_responsive(entry).map(SearchResult::Track)
+                    } else if let Some(entry) = item.get("musicTwoRowItemRenderer") {
+                        // Оставляем только плейлисты (включая альбомы в их
+                        // представлении): остальное — мёртвые карточки.
+                        let row = two_row(entry)?;
+                        match two_row_result(row) {
+                            Some(result @ SearchResult::Playlist(_)) => Some(result),
+                            _ => None,
+                        }
+                    } else {
+                        // Прочие ключи (continuationItemRenderer и т.п.) — мимо.
+                        None
+                    }
+                })
+                .collect();
+
+            if items.is_empty() {
+                None
+            } else {
+                Some(CatalogShelf { title, subtitle, items })
+            }
+        })
+        .collect()
 }
 
 /// Подсказки поиска. Пустой ответ сервиса — пустой вектор, а не ошибка.
@@ -910,5 +967,192 @@ mod tests {
             .count();
         assert_eq!(playlists, 1, "плейлист ровно один: {found:?}");
         assert_eq!(tracks, 1, "трек ровно один: {found:?}");
+    }
+
+    // Фикстуры ниже кодируют ДОГОВОРНУЮ форму ответа FEmusic_home, а не
+    // живой снимок: обёртки (singleColumnBrowseResultsRenderer и т.п.)
+    // опущены — renderers() ходит по всему дереву. Форма сверяется живым
+    // снимком FEmusic_home при интеграции: фикстура ≠ доказательство
+    // контракта (урок KB).
+
+    /// Карточка `musicTwoRowItemRenderer` с плейлистом.
+    fn two_row_playlist() -> Value {
+        json!({
+            "musicTwoRowItemRenderer": {
+                "title": { "runs": [{ "text": "Микс дня" }] },
+                "subtitle": { "runs": [{ "text": "Playlist" }, { "text": " • " }, { "text": "25 songs" }] },
+                "navigationEndpoint": { "browseEndpoint": {
+                    "browseId": "VLPLhome1",
+                    "browseEndpointContextSupportedConfigs": {
+                        "browseEndpointContextMusicConfig": { "pageType": "MUSIC_PAGE_TYPE_PLAYLIST" }
+                    }
+                } },
+                "thumbnailRenderer": { "musicThumbnailRenderer": { "thumbnail": { "thumbnails": [
+                    { "url": "https://img.example/mix.jpg", "width": 226, "height": 226 }
+                ] } } }
+            }
+        })
+    }
+
+    /// Карточка `musicTwoRowItemRenderer` с альбомом: pageType ALBUM,
+    /// адрес треков — аудиоплейлист из play-кнопки (browse-id `MPREb_…`
+    /// под `VL` не открывается).
+    fn two_row_album() -> Value {
+        json!({
+            "musicTwoRowItemRenderer": {
+                "title": { "runs": [{ "text": "Альбом" }] },
+                "subtitle": { "runs": [{ "text": "Artist" }, { "text": " • " }, { "text": "2024" }] },
+                "navigationEndpoint": { "browseEndpoint": {
+                    "browseId": "MPREb_album1",
+                    "browseEndpointContextSupportedConfigs": {
+                        "browseEndpointContextMusicConfig": { "pageType": "MUSIC_PAGE_TYPE_ALBUM" }
+                    }
+                } },
+                "thumbnailOverlay": { "musicItemThumbnailOverlayRenderer": { "content":
+                    { "musicPlayButtonRenderer": { "playNavigationEndpoint":
+                        { "watchPlaylistEndpoint": { "playlistId": "RDAMVMalbum1" } } } } } },
+                "thumbnailRenderer": { "musicThumbnailRenderer": { "thumbnail": { "thumbnails": [
+                    { "url": "https://img.example/album.jpg", "width": 226, "height": 226 }
+                ] } } }
+            }
+        })
+    }
+
+    /// Карточка `musicTwoRowItemRenderer` с артистом.
+    fn two_row_artist() -> Value {
+        json!({
+            "musicTwoRowItemRenderer": {
+                "title": { "runs": [{ "text": "Aphex Twin" }] },
+                "subtitle": { "runs": [{ "text": "Artist" }] },
+                "navigationEndpoint": { "browseEndpoint": {
+                    "browseId": "UCartist1",
+                    "browseEndpointContextSupportedConfigs": {
+                        "browseEndpointContextMusicConfig": { "pageType": "MUSIC_PAGE_TYPE_ARTIST" }
+                    }
+                } }
+            }
+        })
+    }
+
+    /// Карусель с шапкой и элементами — договорённая форма полки Home.
+    fn carousel(title: &str, subtitle: Option<&str>, items: Value) -> Value {
+        let mut header = json!({
+            "musicCarouselShelfBasicHeaderRenderer": {
+                "title": { "runs": [{ "text": title }] }
+            }
+        });
+        if let Some(text) = subtitle {
+            header["musicCarouselShelfBasicHeaderRenderer"]["strapline"] =
+                json!({ "runs": [{ "text": text }] });
+        }
+        json!({
+            "musicCarouselShelfRenderer": {
+                "header": header,
+                "contents": items
+            }
+        })
+    }
+
+    #[test]
+    fn home_parses_carousel_shelves() {
+        // Две полки: треки responsive-списком и карточки twoRow
+        // (плейлист + альбом). Заголовки, подписи и состав проверяются
+        // по полям контракта CatalogShelf.
+        let page = json!({
+            "contents": [
+                carousel("Слушайте снова", Some("Для вас"), json!([song_renderer()])),
+                carousel("Плейлисты", None, json!([two_row_playlist(), two_row_album()]))
+            ]
+        });
+
+        let shelves = home(&page);
+        assert_eq!(shelves.len(), 2, "{shelves:?}");
+
+        assert_eq!(shelves[0].title, "Слушайте снова");
+        assert_eq!(shelves[0].subtitle.as_deref(), Some("Для вас"));
+        assert_eq!(shelves[0].items.len(), 1);
+        assert!(matches!(&shelves[0].items[0], SearchResult::Track(track) if track.title == "Заголовок"));
+
+        assert_eq!(shelves[1].title, "Плейлисты");
+        assert_eq!(shelves[1].subtitle, None);
+        let ids: Vec<_> = shelves[1]
+            .items
+            .iter()
+            .map(|result| match result {
+                SearchResult::Playlist(playlist) => playlist.id.id.clone(),
+                other => panic!("ожидался плейлист, получено: {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, ["PLhome1", "RDAMVMalbum1"]);
+    }
+
+    #[test]
+    fn home_drops_artists_and_empty_shelves() {
+        // Артист — мёртвая карточка (поверхности артиста в плеере нет):
+        // из живой полки выбрасывается запись, полка из одних артистов
+        // выбрасывается целиком, как и полка без элементов вовсе.
+        let page = json!({
+            "contents": [
+                carousel("Смешанная", None, json!([two_row_artist(), two_row_playlist()])),
+                carousel("Одни артисты", None, json!([two_row_artist()])),
+                carousel("Пустая", None, json!([]))
+            ]
+        });
+
+        let shelves = home(&page);
+        assert_eq!(shelves.len(), 1, "{shelves:?}");
+        assert_eq!(shelves[0].title, "Смешанная");
+        assert_eq!(shelves[0].items.len(), 1);
+    }
+
+    #[test]
+    fn home_skips_unnamed_shelf() {
+        // Полка без шапки (или с пустым заголовком) не показывается:
+        // заголовок — единственное, чем полка адресуется в UI.
+        let page = json!({
+            "contents": [
+                carousel("Безымянная", None, json!([two_row_playlist()])),
+                { "musicCarouselShelfRenderer": { "contents": [two_row_playlist()] } }
+            ]
+        });
+        let empty_title = json!({
+            "contents": [
+                { "musicCarouselShelfRenderer": {
+                    "header": { "musicCarouselShelfBasicHeaderRenderer": {
+                        "title": { "runs": [{ "text": "  " }] }
+                    } },
+                    "contents": [two_row_playlist()]
+                } }
+            ]
+        });
+
+        assert_eq!(home(&page).len(), 1);
+        assert_eq!(home(&empty_title).len(), 0);
+    }
+
+    #[test]
+    fn home_ignores_immersive_and_continuation() {
+        // Промо-блок главной (musicImmersiveTopShelfRenderer) — не карусель
+        // и полкой не собирается; continuationItemRenderer внутри contents
+        // пропускается, соседние записи разбираются дальше.
+        let page = json!({
+            "contents": [
+                { "musicImmersiveTopShelfRenderer": {
+                    "header": { "musicImmersiveHeaderRenderer": {
+                        "title": { "runs": [{ "text": "Промо" }] }
+                    } }
+                } },
+                carousel("Слушайте снова", None, json!([
+                    { "continuationItemRenderer": { "continuationEndpoint":
+                        { "continuationCommand": { "token": "tok" } } } },
+                    song_renderer()
+                ]))
+            ]
+        });
+
+        let shelves = home(&page);
+        assert_eq!(shelves.len(), 1, "{shelves:?}");
+        assert_eq!(shelves[0].title, "Слушайте снова");
+        assert_eq!(shelves[0].items.len(), 1);
     }
 }
