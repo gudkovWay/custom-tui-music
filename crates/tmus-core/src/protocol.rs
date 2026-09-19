@@ -170,8 +170,11 @@ pub enum Payload {
     Tracks(Vec<Track>),
     /// Страница ленивой догрузки состава: свежие треки и курсор
     /// следующей страницы. `next: None` — плейлист дочитан. Безопасно
-    /// после `Tracks`: объект с обязательным `next` не декодируется как
-    /// массив треков.
+    /// после `Tracks` (объект ≠ массив) и после `Queue`: у `QueueView`
+    /// стоит `deny_unknown_fields`, поэтому поле `next` не даёт ответу
+    /// догрузки задекодироваться как зеркало очереди — без этого
+    /// untagged-перебор молча съедал страницу в `Queue` (замер 20.09:
+    /// клиент видел `index` вместо `next`).
     TracksPage { tracks: Vec<Track>, next: Option<String> },
     Playlists(Vec<crate::model::Playlist>),
     // Полка домашней ленты безопасна после Playlists: {title, subtitle,
@@ -224,6 +227,7 @@ pub struct PlayerState {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueueView {
     pub tracks: Vec<Track>,
     #[serde(default)]
@@ -612,5 +616,42 @@ mod tests {
             other => panic!("plain tracks degraded to {other:?}"),
         }
         assert_eq!(line(&Payload::Tracks(vec![track("c")])), wire, "wire shape is unchanged");
+    }
+
+    /// Страница догрузки обязана переживать untagged-перебор вариантов:
+    /// `QueueView` стоит раньше и без `deny_unknown_fields` съедал её
+    /// молча (клиент видел `index` вместо `next` — живой замер 20.09).
+    #[test]
+    fn tracks_page_survives_untagged_and_queue_stays_queue() {
+        let page = Payload::TracksPage {
+            tracks: vec![track("x")],
+            next: Some("tok".into()),
+        };
+        match serde_json::from_str::<Payload>(&line(&page)).expect("parse page") {
+            Payload::TracksPage { tracks, next } => {
+                assert_eq!(tracks.len(), 1);
+                assert_eq!(next.as_deref(), Some("tok"));
+            }
+            other => panic!("страница догрузки деградировала до {other:?}"),
+        }
+
+        let exhausted = Payload::TracksPage { tracks: Vec::new(), next: None };
+        match serde_json::from_str::<Payload>(&line(&exhausted)).expect("parse empty page") {
+            Payload::TracksPage { tracks, next } => {
+                assert!(tracks.is_empty());
+                assert_eq!(next, None);
+            }
+            other => panic!("пустая страница деградировала до {other:?}"),
+        }
+        // Зеркало очереди при этом остаётся собой: strict-режим не
+        // обязан резать собственную форму.
+        let queue = Payload::Queue(QueueView { tracks: vec![track("q")], index: Some(3) });
+        match serde_json::from_str::<Payload>(&line(&queue)).expect("parse queue") {
+            Payload::Queue(view) => {
+                assert_eq!(view.index, Some(3));
+                assert_eq!(view.tracks.len(), 1);
+            }
+            other => panic!("зеркало очереди деградировало до {other:?}"),
+        }
     }
 }
