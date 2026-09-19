@@ -506,11 +506,14 @@ function onIpc(event, payload)
     end
   elseif event == "pl" and payload then
     -- Кастомные плейлисты: панель шлёт "new:<title>" |
-    -- "newadd:<title>:<prov>:<id>" | "add:<pl>:<prov>:<id>" |
-    -- "rm:<pl>:<prov>:<id>" | "del:<pl>". После успешного вызова
-    -- перечитываем библиотеку целиком: демон шлёт только сигнал
-    -- (playlists_changed), полный список дешевле инкрементальных правок
-    -- на 18 плейлистов.
+    -- "newadd:<title>:<trackProv>:<trackId>" |
+    -- "add:<plProv>:<plId>:<trackComposite>" |
+    -- "rm:<plProv>:<plId>:<trackComposite>" | "del:<plProv>:<plId>".
+    -- Идентификатор плейлиста СОСТАВНОЙ — CLI парсит первый аргумент
+    -- как <provider>:<id> и голый id отвергает (живой замер 19.09).
+    -- После успешного вызова перечитываем библиотеку целиком: демон
+    -- шлёт только сигнал (playlists_changed), полный список дешевле
+    -- инкрементальных правок на 18 плейлистов.
     local op, rest = tostring(payload):match("^([%a]+):(.*)$")
     if op == "new" then
       call({ "pl", "new", rest }, nil, function() pullLibrary() end)
@@ -538,11 +541,15 @@ function onIpc(event, payload)
         end)
       end
     elseif op == "add" or op == "rm" then
-      local plId, prov, tid = rest:match("^([^:]+):([^:]+):(.+)$")
-      if plId and prov and tid then
-        call({ "pl", op, plId, prov .. ":" .. tid }, nil, function() pullLibrary() end)
+      -- Первые два сегмента без ':' — провайдер и голый id плейлиста,
+      -- жадный хвост (.+) — составной id трека "prov:id": двоеточия
+      -- в нём расколу не мешают.
+      local plProv, plBare, track = rest:match("^([^:]+):([^:]+):(.+)$")
+      if plProv and plBare and track then
+        call({ "pl", op, plProv .. ":" .. plBare, track }, nil, function() pullLibrary() end)
       end
     elseif op == "del" and rest ~= "" then
+      -- rest уже составной "<prov>:<id>" — CLI принимает как есть.
       call({ "pl", "del", rest }, nil, function() pullLibrary() end)
     end
   elseif event == "playlist" and payload then

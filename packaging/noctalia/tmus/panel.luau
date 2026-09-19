@@ -289,13 +289,21 @@ local function idOf(row)
   return tostring(id.provider or "") .. ":" .. tostring(id.id or "")
 end
 
--- Ссылка на плейлист для IPC "pl": БЕЗ двоеточий. Сервис разбирает
--- add/rm как "^([^:]+):([^:]+):(.+)$" — составной idOf вида "prov:id"
--- сломал бы разбор, поэтому передаём голый id (CLI находит плейлист
--- сам). По той же причине имя плейлиста после create чистим от ':'.
+-- Ссылка на плейлист для IPC "pl": СОСТАВНАЯ "provider:id". CLI
+-- (`tmus pl add/rm/del`) парсит первый аргумент как TrackId-подобный
+-- составной идентификатор и голый id отвергает (живой замер 19.09:
+-- «ожидался идентификатор вида <provider>:<id>»). Сервис разбирает
+-- payload "^prov:plid:trackComposite$" — первые два сегмента без ':'
+-- это плейлист, жадный хвост с двоеточием — трек, коллизий нет.
+-- Имя плейлиста после create всё равно чистим от ':'.
 local function plRef(p)
   if type(p.id) == "table" then
-    return tostring(p.id.id or "")
+    local prov = tostring(p.id.provider or "")
+    local bare = tostring(p.id.id or "")
+    if prov ~= "" and bare ~= "" then
+      return prov .. ":" .. bare
+    end
+    return bare ~= "" and bare or prov
   end
   return tostring(p.id or "")
 end
