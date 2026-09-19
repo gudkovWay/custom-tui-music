@@ -1481,10 +1481,16 @@ local function queueContextNode(s)
       lbl(queueCursor .. "/" .. #queue, { key = "q-count", size = 11, color = COLORS.muted, grow = 1 }),
     }),
   }
+  -- Заголовок фиксирован; строки и пустое состояние живут в скролле,
+  -- чтобы длинная очередь не распирала колонку.
+  local body
   if #queue == 0 then
-    table.insert(children, ui.glyph({ key = "q-empty-glyph", name = "playlist", color = COLORS.muted }))
-    table.insert(children, lbl("Queue is empty", { key = "q-empty", color = COLORS.muted }))
+    body = ui.column({ key = "q-empty-wrap", gap = GAP }, {
+      ui.glyph({ key = "q-empty-glyph", name = "playlist", color = COLORS.muted }),
+      lbl("Queue is empty", { key = "q-empty", color = COLORS.muted }),
+    })
   else
+    local rowsOut = {}
     local last = math.min(queueWindowTop + QUEUE_WINDOW - 1, #queue)
     for i = queueWindowTop, last do
       local t = queue[i]
@@ -1496,7 +1502,7 @@ local function queueContextNode(s)
       local rating = ratingOf(s, idOf(t))
       -- Маркер рейтинга перед названием: ♥ лайк, × дизлайк; нет — ничего.
       local marker = rating == "liked" and "♥ " or (rating == "disliked" and "× " or "")
-      table.insert(children, ui.row({
+      table.insert(rowsOut, ui.row({
         key = "q" .. i,
         gap = 8,
         paddingH = 8,
@@ -1530,7 +1536,9 @@ local function queueContextNode(s)
         lbl(durationLabel(t.duration) or "", { key = "q-dur" .. i, width = 44, color = COLORS.muted }),
       }))
     end
+    body = ui.column({ key = "q-rows", gap = GAP }, rowsOut)
   end
+  table.insert(children, ui.scroll({ key = "q-scroll", flexGrow = 1 }, { body }))
   return ui.column({ key = "queue-context", gap = GAP, flexGrow = 3 }, children)
 end
 
