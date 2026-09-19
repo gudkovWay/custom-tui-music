@@ -15,6 +15,7 @@ mod catalog;
 mod control;
 mod filler;
 mod mpris;
+mod orphan_sweep;
 mod persist;
 mod rpc;
 mod tray;
@@ -59,6 +60,15 @@ async fn main() -> anyhow::Result<()> {
     let cache = Arc::new(std::sync::Mutex::new(
         Cache::open(&paths, config.cache.limit_bytes).context("кэш не открылся")?,
     ));
+
+    // Подметаем осиротевшие mpv ДО поднятия своего плеера: инцидент
+    // 19.09 — после гибели демона без штатного завершения (kill -9, OOM)
+    // накопилось 72 осиротевших mpv на ~3.4 ГБ RSS. KillMode=control-group
+    // тут не спасает: он работает, только когда юнит гасит сам свой cgroup,
+    // а при жёсткой смерти демон не успевает никого убить — убирать должно
+    // следующее включение. Свои дети (запущенные уже после этой точки)
+    // живут в нашем cgroup и подметальщику не трогают их.
+    orphan_sweep::sweep_orphan_mpv();
 
     // Резолв каждого провайдера оборачивается прослойкой кэша: есть
     // файл на диске — в сеть не идём вовсе. Иначе кэш был бы
