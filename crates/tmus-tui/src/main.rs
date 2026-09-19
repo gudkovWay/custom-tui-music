@@ -91,6 +91,15 @@ enum CliCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Домашняя лента рекомендаций (полки).
+    Home {
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Перейти к треку очереди по индексу (0-базный) и играть.
+    QueueGoto { index: usize },
     Loop {
         mode: String,
     },
@@ -270,6 +279,10 @@ async fn main() -> Result<()> {
             let provider = resolve_provider(&mut client, provider.as_deref()).await?;
             return print_payload(client.call(Cmd::Library { provider }).await?, json);
         }
+        CliCmd::Home { provider, json } => {
+            let provider = resolve_provider(&mut client, provider.as_deref()).await?;
+            return print_payload(client.call(Cmd::Home { provider }).await?, json);
+        }
         CliCmd::Liked { json } => return print_payload(client.call(Cmd::Liked { provider: None }).await?, json),
         CliCmd::Rate { track, rating } => Cmd::Rate {
             track: parse_track_id(&track)?,
@@ -301,6 +314,9 @@ async fn main() -> Result<()> {
             }
         },
         CliCmd::Queue { json } => return print_payload(client.call(Cmd::Queue).await?, json),
+        CliCmd::QueueGoto { index } => {
+            return print_payload(client.call(Cmd::QueueGoto { index }).await?, false)
+        }
         CliCmd::Search { query, kind, provider, json } => {
             let provider = resolve_provider(&mut client, provider.as_deref()).await?;
             return run_search(&mut client, &query, kind, provider, json).await;
@@ -505,15 +521,7 @@ fn format_payload(payload: &Payload) -> String {
             .join("\n"),
         Payload::Results(results) => results
             .iter()
-            .map(|r| match r {
-                tmus_core::model::SearchResult::Track(t) => {
-                    format!("{}: {} — {}", t.id, t.artist_line(), t.title)
-                }
-                tmus_core::model::SearchResult::Playlist(p) => format!("{}: {}", p.id, p.title),
-                tmus_core::model::SearchResult::Artist { provider, id, name } => {
-                    format!("{provider}:{id}: {name}")
-                }
-            })
+            .map(format_search_result)
             .collect::<Vec<_>>()
             .join("\n"),
         Payload::Playlists(playlists) => playlists
@@ -521,6 +529,19 @@ fn format_payload(payload: &Payload) -> String {
             .map(|p| format!("{}: {}", p.id, p.title))
             .collect::<Vec<_>>()
             .join("\n"),
+        Payload::Home(shelves) => shelves
+            .iter()
+            .map(|shelf| {
+                let head = match &shelf.subtitle {
+                    Some(s) => format!("▌{} — {}", shelf.title, s),
+                    None => format!("▌{}", shelf.title),
+                };
+                let items =
+                    shelf.items.iter().map(format_search_result).collect::<Vec<_>>().join("\n  ");
+                format!("{head}\n  {items}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n"),
         Payload::Providers(providers) => providers
             .iter()
             .map(|p| format!("{} ({}): {:?}", p.id, p.name, p.auth))
@@ -543,6 +564,20 @@ fn format_payload(payload: &Payload) -> String {
         // Содержательный вид нужен только CLI `pl new`, который
         // разворачивает payload сам; здесь — просто id.
         Payload::PlaylistCreated { playlist } => playlist.to_string(),
+    }
+}
+
+/// Формат одного элемента полки/выдачи: общий у `Results` и полок `Home`,
+/// чтобы лента выглядела как продолжение поиска.
+fn format_search_result(r: &tmus_core::model::SearchResult) -> String {
+    match r {
+        tmus_core::model::SearchResult::Track(t) => {
+            format!("{}: {} — {}", t.id, t.artist_line(), t.title)
+        }
+        tmus_core::model::SearchResult::Playlist(p) => format!("{}: {}", p.id, p.title),
+        tmus_core::model::SearchResult::Artist { provider, id, name } => {
+            format!("{provider}:{id}: {name}")
+        }
     }
 }
 
@@ -781,6 +816,38 @@ mod tests {
     fn provider_flag_maps_all_to_none_else_provider() {
         assert_eq!(parse_provider_flag("all"), None);
         assert_eq!(parse_provider_flag("soundcloud"), Some("soundcloud".to_owned()));
+    }
+
+    /// Контракт `home`: провайдер и json — флаги, оба по умолчанию пусты.
+    #[test]
+    fn home_subcommand_parses_flags() {
+        match Cli::try_parse_from(["tmus", "home"]).expect("valid").cmd {
+            Some(CliCmd::Home { provider, json }) => {
+                assert_eq!(provider, None);
+                assert!(!json);
+            }
+            _ => panic!("ожидалась подкоманда home"),
+        }
+        match Cli::try_parse_from(["tmus", "home", "--provider", "ytmusic", "--json"])
+            .expect("valid")
+            .cmd
+        {
+            Some(CliCmd::Home { provider, json }) => {
+                assert_eq!(provider.as_deref(), Some("ytmusic"));
+                assert!(json);
+            }
+            _ => panic!("ожидалась подкоманда home с флагами"),
+        }
+    }
+
+    /// Контракт `queue-goto`: индекс позиционный, 0-базный, без флагов.
+    #[test]
+    fn queue_goto_parses_index() {
+        match Cli::try_parse_from(["tmus", "queue-goto", "3"]).expect("valid").cmd {
+            Some(CliCmd::QueueGoto { index }) => assert_eq!(index, 3),
+            _ => panic!("ожидалась подкоманда queue-goto"),
+        }
+        assert!(Cli::try_parse_from(["tmus", "queue-goto", "x"]).is_err());
     }
 
     #[test]
