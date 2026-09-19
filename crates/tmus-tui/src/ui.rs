@@ -990,8 +990,12 @@ fn track_line(track: &Track, current: Option<&TrackId>, rating: Option<&Rating>)
     let item = ListItem::new(Line::from(text));
     if playing {
         item.style(
+            // ANSI 0 (normal.black) и ANSI 11 (bright.yellow) темятся терминалом:
+            // noctalia генерит тему alacritty (normal.black = тёплый подъём над
+            // фоном), поэтому строка следует теме без хардкода. Курсор остаётся
+            // REVERSED — играющая обязана отличаться от курсорной.
             Style::new()
-                .bg(Color::Rgb(44, 30, 24))
+                .bg(Color::Black)
                 .fg(Color::LightYellow)
                 .add_modifier(Modifier::BOLD),
         )
