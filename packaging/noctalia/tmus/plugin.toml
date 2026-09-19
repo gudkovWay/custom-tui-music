@@ -1,12 +1,12 @@
 id = "q/tmus"
 name = "Музыка"
-version = "0.5.0"
+version = "0.6.0"
 plugin_api = 24
 author = "q"
 license = "MIT"
 dependencies = []
 icon = "music"
-description = "Что играет в tmusd и пульт: библиотека, плейлисты, очередь, поиск, клиенты."
+description = "Пульт tmusd: буферная навигация, лента рекомендаций, очередь и спектр в панели."
 tags = ["multimedia"]
 
 [[widget]]
@@ -35,10 +35,16 @@ height = 760
 # в panel.luau) — захваченный Enter до ui.input не доходит, и родной
 # submit мёртв. Имена кейсимов сняты `xkbcli how-to-type --layout ru`,
 # латиница приходит одним аккордом в верхнем регистре (сглаживает хост).
+# Tab/ctrl+l/h = переключение буферов 2↔3 (центральный список ↔
+# очередь); кириллические двойники — физические L/H = д/р на ЙЦУКЕН.
+# ctrl+BackSpace = удалить слово в поиске. Имена по канону xkb:
+# голые «</» хост отвергает весь плагин — только канонические кейсимы.
 capture_keys = [
   "Left", "Right", "Up", "Down", "Return", "Escape", "Space", "slash",
   "period", "comma", "minus", "apostrophe", "BackSpace", "less", "greater",
   "ctrl+j", "ctrl+k", "ctrl+Cyrillic_o", "ctrl+Cyrillic_el",
+  "Tab", "ctrl+l", "ctrl+h", "ctrl+Cyrillic_de", "ctrl+Cyrillic_er",
+  "ctrl+BackSpace",
   "XF86AudioNext", "XF86AudioPrev",
   "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
   "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",

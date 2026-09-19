@@ -9,17 +9,20 @@ local SERVICE = "q/tmus:watch"
 -- surface/surface_variant/hover/surface_container_high/
 -- secondary_container/tertiary/on_surface/on_surface_variant/outline/
 -- primary/error рендерятся, а primary_container валиден, но НЕ
--- рисуется (невидим) — его здесь сознательно нет. Играющая строка
--- (playing) и курсорная (selected) могут численно совпасть
--- (surface_container_high ≈ hover) — их различие держит не заливка, а
--- маркер ▶ и accent-цвет текста играющего трека.
+-- рисуется (невидим) — его здесь сознательно нет. Три различимых
+-- заливки строк: фон=surface, курсор=hover, играет=secondary_container;
+-- курсор НА играющей — заливка playing плюс рамка border 1px, иначе
+-- было бы неразличимо, чей цвет сильнее.
 local COLORS = {
   bg = "surface",
   surface = "surface_variant",
   -- Курсорная строка обязана читаться с одного взгляда: проба 18.09
   -- показала, что прежний хозяин не видел её.
   selected = "hover",
-  playing = "surface_container_high",
+  playing = "secondary_container",
+  -- Фон нижнего now-playing-блока: раньше численно совпадал с
+  -- playing (surface_container_high) — теперь роль свободна.
+  npbg = "surface_container_high",
   text = "on_surface",
   muted = "on_surface_variant",
   border = "outline",
@@ -35,13 +38,23 @@ local RAIL = 64
 local GAP = 12
 local PAD = 16
 local LIST_WINDOW = 10
-local CARD_WINDOW = 12
+local CARD_WINDOW = 8
+-- Карточек в ряду сетки Library (см. playlistCards): шаг moveY.
+local GRID_COLS = 4
+local QUEUE_WINDOW = 15
+local NP_SPEC_BARS = 56
+-- Home-лента рекомендаций: видимых полок по Y и карточек в
+-- горизонтальном окне полки. Карточек в полке рендерим не больше
+-- HOME_CARD_CAP — окно двигается, хвост не держим (счётчик честный:
+-- shelf.count хранит число карточек до капа).
+local SHELF_WINDOW = 2
+local HOME_CARD_WINDOW = 6
+local HOME_CARD_CAP = 20
 
 local VIEWS = {
   { id = "home", title = "Home", glyph = "home" },
   { id = "search", title = "Search", glyph = "search" },
   { id = "library", title = "Library", glyph = "library" },
-  { id = "queue", title = "Queue", glyph = "playlist" },
   { id = "clients", title = "Clients", glyph = "server" },
   { id = "eq", title = "Equalizer", glyph = "sliders" },
 }
@@ -97,6 +110,18 @@ local TEXT_CHARS = {
   Cyrillic_HARDSIGN = "Ъ", Cyrillic_YERU = "Ы", Cyrillic_SOFTSIGN = "Ь",
   Cyrillic_E = "Э", Cyrillic_YU = "Ю", Cyrillic_YA = "Я",
 }
+-- ctrl+BackSpace в поиске: удалить слово слева от курсора, модель
+-- readline/VSCode — срезать хвостовые разделители, затем слово, затем
+-- снова разделители. ASCII-классы %s/%p не пересекаются с байтами
+-- кириллицы (все ≥0x80), поэтому «слово» = буквы+цифры+мультибайт.
+-- Автоповтор для ctrl+BackSpace сознательно не подключён: лаг одного
+-- кадра съел бы полстроки.
+local function killWord(s)
+  s = string.gsub(s, "[%s%p]+$", "")
+  s = string.gsub(s, "[^%s%p]+$", "")
+  return (string.gsub(s, "[%s%p]+$", ""))
+end
+
 local inputMode = false
 
 local REPEAT_CYCLE = { none = "track", track = "queue", queue = "none" }
@@ -131,6 +156,13 @@ local snapshot = {}
 local view = "home"
 local cursor = 1
 local windowTop = 1
+-- Фокус панели-буфера: 2 — центральный список, 3 — правая колонка
+-- очереди. Клавиатуру подключит волна 2, рендер уже подсвечивает
+-- заголовок колонки.
+local focusBuf = 2
+local queueCursor = 1
+local queueWindowTop = 1
+local followPlaying = true
 local selected = nil
 local playlistId = ""
 local playlistTitle = ""
@@ -150,6 +182,17 @@ local plAddAfterCreate = nil
 local plPicker = nil
 local query = ""
 local lastSearched = nil
+-- Home-лента ("tmus.home"): курсор (полка/карточка), верхнее окно
+-- полок и левые индексы горизонтальных окон по полке. homeFeed —
+-- payload лёгкого ключа; рендер-модель полок кэшируется
+-- (homeShelfCache) и перевычисляется ТОЛЬКО в watch-колбэке — draw
+-- ходит до 8 Гц, перебор полок на каждом кадре недопустим.
+local homeShelf = 1
+local homeItem = 1
+local homeTop = 1
+local homeLeft = {}
+local homeFeed = nil
+local homeShelfCache = {}
 -- Вим-модальность поля поиска: typing=true — insert (буквы идут в
 -- запрос), false — normal (j/k листают, Enter активирует). Выход из
 -- insert: Esc или пары jj/jk/oo на физических клавишах (о/л на
@@ -211,7 +254,7 @@ end
 -- панель просто рисует последнее присланное значение. Значения вне
 -- [0..1] клампятся: бар высотой value*maxHeight, минимум 1 px, чтобы
 -- нулевая полоса оставляла базовую линию.
-local function spectrumBars(count, maxHeight, barWidth, gap)
+local function spectrumBars(count, maxHeight, barWidth, gap, fillColor)
   local values = {}
   local at = 1
   for num in string.gmatch(tostring(spectrum or ""), "([^,]+)") do
@@ -230,7 +273,7 @@ local function spectrumBars(count, maxHeight, barWidth, gap)
       width = barWidth or 6,
       height = math.max(1, math.floor(v * maxHeight + 0.5)),
       radius = 1,
-      fill = COLORS.accent,
+      fill = fillColor or COLORS.accent,
     })
   end
   return ui.row({ key = "spec-bars", gap = gap or 2, align = "center" }, bars)
@@ -308,6 +351,65 @@ local function plRef(p)
   return tostring(p.id or "")
 end
 
+-- Рендер-модель home-ленты: массив полок {title, subtitle, count,
+-- cards} из homeFeed. count — ЧЕСТНОЕ число элементов полки до капа
+-- (счётчик окна показывает его), cards капятся HOME_CARD_CAP —
+-- рендерим окно, хвост не держим. Пустые полки выбрасываются.
+-- Перевычисляется только в watch-колбэке (rebuildHomeShelves) — draw
+-- до 8 Гц не должен перебирать полки.
+local function rebuildHomeShelves()
+  local out = {}
+  if type(homeFeed) == "table" and homeFeed.status == "ok" then
+    for _, shelf in ipairs(homeFeed.shelves or {}) do
+      local items = shelf.items or {}
+      local cards = {}
+      for _, it in ipairs(items) do
+        if #cards >= HOME_CARD_CAP then
+          break
+        end
+        local kind = tostring(it.kind or "")
+        if kind == "track" then
+          table.insert(cards, {
+            kind = "track",
+            id = idOf(it),
+            title = tostring(it.title or ""),
+            subtitle = type(it.artists) == "table" and table.concat(it.artists, ", ") or "",
+            art = tostring(it.art_path or ""),
+            time = durationLabel(it.duration),
+            event = "play",
+            payload = idOf(it),
+          })
+        elseif kind == "playlist" then
+          table.insert(cards, {
+            kind = "playlist",
+            id = idOf(it),
+            title = tostring(it.title or ""),
+            subtitle = tostring(it.subtitle or ""),
+            art = tostring(it.art_path or ""),
+            open = idOf(it),
+            openTitle = tostring(it.title or ""),
+            openArt = tostring(it.art_path or ""),
+          })
+        end
+      end
+      if #cards > 0 then
+        table.insert(out, {
+          title = tostring(shelf.title or ""),
+          subtitle = tostring(shelf.subtitle or ""),
+          count = #items,
+          cards = cards,
+        })
+      end
+    end
+  end
+  homeShelfCache = out
+end
+
+-- Кэш рендер-модели home-ленты; наполняется только watch-колбэком.
+local function homeShelves()
+  return homeShelfCache
+end
+
 -- Оценка трека из snapshot.ratings (map "provider:id" →
 -- "liked"/"disliked"); nil — оценки нет.
 local function ratingOf(s, idstr)
@@ -335,7 +437,15 @@ end
 local function rateSelected(want)
   local idstr
   if view == "home" then
-    idstr = tostring(snapshot.trackId or "")
+    -- Карточка-трек под курсором home-ленты; если под курсором не
+    -- трек (или лента пуста) — фолбэк на текущий трек.
+    local shelf = homeShelves()[homeShelf]
+    local c = shelf and shelf.cards[homeItem]
+    if c and c.kind == "track" then
+      idstr = c.id
+    else
+      idstr = tostring(snapshot.trackId or "")
+    end
   else
     local row = rows()[cursor]
     if row and row.kind == "track" and row.id then
@@ -343,6 +453,19 @@ local function rateSelected(want)
     end
   end
   if idstr == nil or idstr == "" then
+    return
+  end
+  local send = (ratingOf(snapshot, idstr) == want) and "none" or want
+  poke("rate", send .. ":" .. idstr)
+end
+
+-- Оценка трека очереди под курсором (буфер 3): та же логика, что у
+-- rateSelected, но строка берётся из snapshot.queue по queueCursor.
+-- Повторное f/d на той же оценке снимает её — шлём "none".
+local function rateQueueRow(want)
+  local t = (snapshot.queue or {})[queueCursor]
+  local idstr = t and idOf(t) or ""
+  if idstr == "" then
     return
   end
   local send = (ratingOf(snapshot, idstr) == want) and "none" or want
@@ -374,7 +497,7 @@ local function card(children, props)
   return ui.column({
     key = p.key,
     gap = p.gap or 10,
-    padding = PAD,
+    padding = p.padding or PAD,
     radius = p.radius or 10,
     fill = p.fill or COLORS.surface,
     border = p.border,
@@ -409,126 +532,142 @@ local function artNode(path, size, glyph)
   })
 end
 
-local function currentTrack(s)
-  if not s.linked or (s.title or "") == "" then
-    return nil
-  end
+-- Нижний now-playing: одна карточка на каждый вид, последний ребёнок
+-- workspace-колонки. Кнопки/прогресс/спектр живут только здесь —
+-- хиро home-вида остаётся чистой типографикой.
+local function npNode(s)
+  local hasTrack = s.linked and (s.title or "") ~= ""
   local dur = tonumber(s.duration) or 0
   local pos = tonumber(s.position) or 0
-  local time = dur > 0 and (clock(pos) .. " / " .. clock(dur)) or clock(pos)
-  local marks = {}
-  if s.offline then
-    table.insert(marks, "Cached")
-  end
-  if s.shuffle then
-    table.insert(marks, "Shuffled")
-  end
-  if (s.loop or "none") ~= "none" then
-    table.insert(marks, REPEAT_LABEL[tostring(s.loop)] or tostring(s.loop))
-  end
-  local rows = {
-    ui.row({ key = "ct-top", gap = 10, align = "center" }, {
-      artNode(s.artPath, 48),
-      ui.column({ key = "ct-text", gap = 2, flexGrow = 1 }, {
-        lbl(shorten(tostring(s.title or ""), 34), { key = "ct-title", size = 14, color = COLORS.accent }),
-        lbl(shorten(tostring(s.artist or ""), 34), { key = "ct-artist", color = COLORS.muted }),
+  local children = {}
+  if hasTrack then
+    local marks = {}
+    if s.offline then
+      table.insert(marks, "Cached")
+    end
+    if s.shuffle then
+      table.insert(marks, "Shuffled")
+    end
+    if (s.loop or "none") ~= "none" then
+      table.insert(marks, REPEAT_LABEL[tostring(s.loop)] or tostring(s.loop))
+    end
+    -- Громкость приезжает по лёгкому ключу "tmus.now", так что чип живой.
+    table.insert(marks, "vol " .. math.floor(tonumber(s.volume) or 0) .. "%")
+    local controls = {
+      ui.button({
+        key = "prev",
+        glyph = "player-skip-back",
+        controlSize = "sm",
+        variant = "ghost",
+        onClick = function()
+          poke("prev")
+        end,
       }),
-    }),
-    lbl(time .. (#marks > 0 and ("  ·  " .. table.concat(marks, " · ")) or ""), {
-      key = "ct-time",
-      color = COLORS.muted,
-    }),
-  }
-  if dur > 0 then
-    table.insert(rows, ui.progress({
-      key = "ct-progress",
-      progress = math.max(0, math.min(1, pos / dur)),
-      flexGrow = 1,
-      height = 4,
-      radius = 2,
+      ui.button({
+        key = "toggle",
+        glyph = s.status == "playing" and "player-pause" or "player-play",
+        controlSize = "sm",
+        variant = "primary",
+        onClick = function()
+          poke("toggle")
+        end,
+      }),
+      ui.button({
+        key = "next",
+        glyph = "player-skip-forward",
+        controlSize = "sm",
+        variant = "ghost",
+        onClick = function()
+          poke("next")
+        end,
+      }),
+      ui.button({
+        key = "shuffle",
+        glyph = "arrows-shuffle",
+        controlSize = "sm",
+        variant = s.shuffle and "primary" or "ghost",
+        onClick = function()
+          poke("shuffle", "toggle")
+        end,
+      }),
+      ui.button({
+        key = "repeat",
+        -- Три различимых состояния: track — «repeat-once», queue —
+        -- «repeat», оба primary; none — тусклый ghost.
+        glyph = (tostring(s.loop or "none")) == "track" and "repeat-once" or "repeat",
+        controlSize = "sm",
+        variant = (tostring(s.loop or "none")) ~= "none" and "primary" or "ghost",
+        onClick = function()
+          poke("repeat", REPEAT_CYCLE[tostring(s.loop or "none")] or "none")
+        end,
+      }),
+    }
+    local loopMode = tostring(s.loop or "none")
+    if loopMode ~= "none" then
+      table.insert(controls, ui.label(REPEAT_SHORT[loopMode] or loopMode, {
+        key = "np-repeat-short",
+        size = 11,
+        color = COLORS.muted,
+      }))
+    end
+    table.insert(children, ui.row({ key = "np-top", gap = 12, align = "center" }, {
+      artNode(s.artPath, 48),
+      ui.column({ key = "np-text", gap = 2, flexGrow = 1 }, {
+        lbl(shorten(tostring(s.title or ""), 48), { key = "np-title", size = 15, color = COLORS.text }),
+        lbl(shorten(tostring(s.artist or ""), 48), { key = "np-artist", size = 12, color = COLORS.muted }),
+        lbl(#marks > 0 and table.concat(marks, " · ") or "", {
+          key = "np-marks",
+          size = 11,
+          color = COLORS.muted,
+        }),
+      }),
+      lbl(clock(pos) .. (dur > 0 and (" / " .. clock(dur)) or ""), {
+        key = "np-time",
+        size = 12,
+        color = COLORS.muted,
+      }),
+      ui.row({ key = "np-controls", gap = 6, align = "center" }, controls),
+    }))
+    if dur > 0 then
+      table.insert(children, ui.progress({
+        key = "np-progress",
+        progress = math.max(0, math.min(1, pos / dur)),
+        flexGrow = 1,
+        height = 4,
+        radius = 2,
+      }))
+    end
+  else
+    -- Без трека геометрия та же: карточка с текстом вместо кнопок —
+    -- соседние вью не прыгают при старте/остановке демона.
+    table.insert(children, ui.row({ key = "np-top", gap = 12, align = "center" }, {
+      ui.glyph({
+        key = "np-state-glyph",
+        name = s.linked and "music" or "plug-off",
+        color = COLORS.muted,
+      }),
+      ui.column({ key = "np-text", gap = 2, flexGrow = 1 }, {
+        lbl(s.linked and "Nothing playing" or "tmusd is not responding", {
+          key = "np-state-title",
+          size = 15,
+          color = COLORS.text,
+        }),
+        s.linked and nil or lbl("start it with: systemctl --user start tmusd", {
+          key = "np-state-hint",
+          size = 12,
+          color = COLORS.muted,
+        }),
+      }),
     }))
   end
-  local loopMode = tostring(s.loop or "none")
-  local controls = {
-    ui.button({
-      key = "prev",
-      glyph = "player-skip-back",
-      controlSize = "sm",
-      variant = "ghost",
-      onClick = function()
-        poke("prev")
-      end,
-    }),
-    ui.button({
-      key = "toggle",
-      glyph = s.status == "playing" and "player-pause" or "player-play",
-      controlSize = "sm",
-      variant = "primary",
-      onClick = function()
-        poke("toggle")
-      end,
-    }),
-    ui.button({
-      key = "next",
-      glyph = "player-skip-forward",
-      controlSize = "sm",
-      variant = "ghost",
-      onClick = function()
-        poke("next")
-      end,
-    }),
-    ui.button({
-      key = "shuffle",
-      glyph = "arrows-shuffle",
-      controlSize = "sm",
-      variant = s.shuffle and "primary" or "ghost",
-      onClick = function()
-        poke("shuffle", "toggle")
-      end,
-    }),
-    ui.button({
-      key = "repeat",
-      -- Три различимых состояния: track — «repeat-once», queue — «repeat»,
-      -- оба с подсветкой primary; none — тусклый «repeat».
-      glyph = loopMode == "track" and "repeat-once" or "repeat",
-      controlSize = "sm",
-      variant = loopMode ~= "none" and "primary" or "ghost",
-      onClick = function()
-        poke("repeat", REPEAT_CYCLE[tostring(s.loop or "none")] or "none")
-      end,
-    }),
-  }
-  if loopMode ~= "none" then
-    table.insert(controls, ui.label(REPEAT_SHORT[loopMode] or loopMode, {
-      key = "ct-repeat-short",
-      size = 11,
-      color = COLORS.muted,
-    }))
-  end
-  table.insert(rows, ui.row({ key = "ct-controls", gap = 8, align = "center" }, controls))
-  return card(rows, { key = "current-card" })
-end
-
-local function sourcePill(p, active)
-  return ui.button({
-    key = "src-" .. p.id,
-    text = p.title,
-    controlSize = "sm",
-    variant = active and "primary" or "ghost",
-    onClick = function()
-      poke("source", p.id)
-    end,
-  })
-end
-
-local function sourceSelector(s)
-  local pills = {
-    sourcePill({ id = "all", title = "All" }, tostring(s.source or "all") == "all"),
-  }
-  for _, p in ipairs(s.providers or {}) do
-    table.insert(pills, sourcePill({ id = p.id, title = p.name }, tostring(s.source or "all") == p.id))
-  end
-  return ui.row({ key = "sources", gap = 8, align = "center" }, pills)
+  -- Полоса спектра ВСЕГДА присутствует: без живого спектра или на
+  -- паузе — «спящая» базовая линия 1 px цветом border, чтобы высота
+  -- карточки не прыгала на каждом кадре.
+  local specColor = (spectrum and s.status == "playing") and COLORS.accent or COLORS.border
+  table.insert(children, ui.row({ key = "np-spec", height = 18, align = "center" }, {
+    spectrumBars(NP_SPEC_BARS, 14, 5, 2, specColor),
+  }))
+  return card(children, { key = "np-block", fill = COLORS.npbg, gap = 8, padding = 12 })
 end
 
 local function trackRow(i, t, opts)
@@ -553,14 +692,6 @@ local function trackRow(i, t, opts)
     lbl(shorten(o.subtitle, 32), { key = "sub" .. i, color = COLORS.muted, maxWidth = 220 }),
     lbl(o.time or "", { key = "time" .. i, color = COLORS.muted, width = 56 }),
   }
-  -- Мини-спектр у играющей строки: 7 полос до 8 px в блоке ~44 px.
-  -- Только для current и только пока виден спектр — иначе строки
-  -- списков не меняют геометрию при скролле.
-  if current and spectrum then
-    table.insert(children, ui.box({ key = "spec-mini" .. i, width = 44 }, {
-      spectrumBars(7, 8, 4, 2),
-    }))
-  end
   return ui.row({
     key = "track" .. i,
     gap = 10,
@@ -629,8 +760,21 @@ local function searchRows(s)
   return out
 end
 
+-- Мемо строк вью: rows() зовётся из draw() на каждом кадре (до 8 Гц),
+-- а перебирает до 1000 треков. Кэш живёт, пока не сменились вид,
+-- плейлист, показ скрытых, серийный номер поиска И сам snapshot —
+-- ссылка на таблицу (refresh() подменяет её целиком; точечные патчи
+-- "tmus.now" и спектр её не трогают).
+local rowsCache = nil
+local rowsCacheKey = nil
+local rowsCacheSnap = nil
+
 function rows()
   local s = snapshot
+  local key = view .. "|" .. playlistId .. "|" .. tostring(showHidden) .. "|" .. tostring(s.searchSerial or "")
+  if rowsCache ~= nil and rowsCacheKey == key and rowsCacheSnap == s then
+    return rowsCache
+  end
   local out = {}
 
   if view == "library" then
@@ -671,30 +815,8 @@ function rows()
         end
       end
     end
-  elseif view == "queue" then
-    local index = tonumber(s.queueIndex)
-    for i, t in ipairs(s.queue or {}) do
-      if i > 200 then
-        break
-      end
-      local idstr = idOf(t)
-      if not hiddenByRating(s, idstr) then
-        table.insert(out, {
-          kind = "track",
-          id = idstr,
-          rating = ratingOf(s, idstr),
-          title = tostring(t.title or ""),
-          subtitle = type(t.artists) == "table" and table.concat(t.artists, ", ") or "",
-          art = tostring(t.art_path or ""),
-          event = "play",
-          payload = idstr,
-          time = durationLabel(t.duration),
-          current = index ~= nil and i == index + 1 or false,
-        })
-      end
-    end
   elseif view == "search" then
-    return searchRows(s)
+    out = searchRows(s)
   elseif view == "clients" then
     table.insert(out, {
       kind = "client",
@@ -738,6 +860,9 @@ function rows()
     end
   end
 
+  rowsCacheKey = key
+  rowsCacheSnap = s
+  rowsCache = out
   return out
 end
 
@@ -745,32 +870,41 @@ local function windowSize()
   return view == "library" and CARD_WINDOW or LIST_WINDOW
 end
 
-local function clampCursor(items)
-  local count = #items
+-- Общая арифметика окна списка: держит курсор в границах, окно —
+-- за курсором. Возвращает пару (cursor, windowTop), чтобы одну
+-- функцию использовали и центральный список, и правая очередь.
+local function clampScroll(cur, top, count, window)
   if count == 0 then
-    cursor = 1
-    windowTop = 1
-    return
+    return 1, 1
   end
-  if cursor < 1 then
-    cursor = 1
-  elseif cursor > count then
-    cursor = count
+  if cur < 1 then
+    cur = 1
+  elseif cur > count then
+    cur = count
   end
-  local maxTop = math.max(1, count - windowSize() + 1)
-  if windowTop < 1 then
-    windowTop = 1
-  elseif windowTop > maxTop then
-    windowTop = maxTop
+  local maxTop = math.max(1, count - window + 1)
+  if top < 1 then
+    top = 1
+  elseif top > maxTop then
+    top = maxTop
   end
-  if cursor < windowTop then
-    windowTop = cursor
-  elseif cursor >= windowTop + windowSize() then
-    windowTop = cursor - windowSize() + 1
+  if cur < top then
+    top = cur
+  elseif cur >= top + window then
+    top = cur - window + 1
   end
-  if windowTop > maxTop then
-    windowTop = maxTop
+  if top > maxTop then
+    top = maxTop
   end
+  return cur, top
+end
+
+local function clampCursor(items)
+  cursor, windowTop = clampScroll(cursor, windowTop, #items, windowSize())
+end
+
+local function clampQueue(queue)
+  queueCursor, queueWindowTop = clampScroll(queueCursor, queueWindowTop, #queue, QUEUE_WINDOW)
 end
 
 local function visibleWindow(items)
@@ -790,6 +924,66 @@ local function openPlaylist(row)
   cursor = 1
   windowTop = 1
   poke("tracks", row.open)
+end
+
+-- Навигация home-ленты: курсор (полка, карточка) и окна. Все ходы
+-- клампятся без wrap; пустых полок в модели нет (выбрасываются при
+-- построении), поэтому «пропуск пустых» — это кламп к границам.
+local function clampHomeCursor()
+  local shelves = homeShelves()
+  if #shelves == 0 then
+    homeShelf = 1
+    homeItem = 1
+    homeTop = 1
+    return
+  end
+  homeShelf, homeTop = clampScroll(homeShelf, homeTop, #shelves, SHELF_WINDOW)
+  local shelf = shelves[homeShelf]
+  local left = homeLeft[homeShelf] or 1
+  homeItem, left = clampScroll(homeItem, left, #shelf.cards, HOME_CARD_WINDOW)
+  homeLeft[homeShelf] = left
+end
+
+local function homeMoveY(dy)
+  local shelves = homeShelves()
+  if #shelves == 0 then
+    return false
+  end
+  local target = math.max(1, math.min(#shelves, homeShelf + dy))
+  if target == homeShelf then
+    return false
+  end
+  homeShelf = target
+  clampHomeCursor()
+  return true
+end
+
+local function homeMoveX(dx)
+  local shelves = homeShelves()
+  if #shelves == 0 then
+    return false
+  end
+  local shelf = shelves[homeShelf]
+  local target = math.max(1, math.min(#shelf.cards, homeItem + dx))
+  if target == homeItem then
+    return false
+  end
+  homeItem = target
+  clampHomeCursor()
+  return true
+end
+
+local function homeActivate()
+  local shelf = homeShelves()[homeShelf]
+  local c = shelf and shelf.cards[homeItem]
+  if c == nil then
+    return
+  end
+  if c.kind == "playlist" then
+    openPlaylist(c)
+  else
+    poke(c.event or "play", c.payload)
+  end
 end
 
 local function activate(row)
@@ -828,12 +1022,68 @@ local function move(delta)
   selected = items[cursor]
 end
 
+-- Курсор очереди (буфер 3): кламп 1..#snapshot.queue без wrap —
+-- очередь до 1000 треков, прыжок с конца в начало на зажатой j
+-- дезориентирует. Ручной ход выключает автоскролл за играющим.
+local function moveQueue(delta)
+  local queue = snapshot.queue or {}
+  if #queue == 0 then
+    return
+  end
+  followPlaying = false
+  queueCursor = math.max(1, math.min(#queue, queueCursor + delta))
+  clampQueue(queue)
+end
+
+-- Горизонтальный/вертикальный ход по сетке Library (буфер 2):
+-- карточки лежат рядами по GRID_COLS, поэтому строка = ±GRID_COLS.
+-- Без wrap: l на краю не прыгает, как в vim. Возвращают needsDraw —
+-- так же, как move/handleViewKeys, их используют повторители
+-- onFrameTick. home — нейтральный no-op: полки — волна home-feed.
+local function moveX(dx)
+  if view == "library" then
+    local items = rows()
+    if #items == 0 then
+      return false
+    end
+    cursor = math.max(1, math.min(#items, cursor + dx))
+    clampCursor(items)
+    selected = items[cursor]
+    return true
+  elseif view == "home" then
+    -- Горизонтальный ход по карточкам полки home-ленты.
+    return homeMoveX(dx)
+  end
+  return false
+end
+
+local function moveY(dy)
+  if view == "library" then
+    local items = rows()
+    if #items == 0 then
+      return false
+    end
+    cursor = math.max(1, math.min(#items, cursor + dy * GRID_COLS))
+    clampCursor(items)
+    selected = items[cursor]
+    return true
+  elseif view == "home" then
+    -- Вертикальный ход по полкам home-ленты.
+    return homeMoveY(dy)
+  end
+  return false
+end
+
 local function setView(id)
   view = id
   cursor = 1
   windowTop = 1
   selected = nil
   searching = false
+  -- Смена вида — явный жест пользователя: автоскролл очереди за
+  -- играющим снова включён (выключает его ручное j/k в колонке,
+  -- подключит волна 2).
+  followPlaying = true
   -- Режим ввода живёт ровно пока открыт вид поиска: смена вида любым
   -- путём (Esc, ctrl+j/k, клик по рейлу) обязана вернуть бинды.
   -- Вход в поиск всегда начинает с insert-моды.
@@ -845,6 +1095,13 @@ local function setView(id)
   plName = ""
   plAddAfterCreate = nil
   plPicker = nil
+  -- Home-лента всегда открывается с начала: курсор и окна в ноль.
+  if id == "home" then
+    homeShelf = 1
+    homeItem = 1
+    homeTop = 1
+    homeLeft = {}
+  end
 end
 
 local function railNode()
@@ -887,9 +1144,7 @@ local function stateNode(s, items)
     return nil
   end
   local text
-  if view == "home" then
-    text = "Nothing playing"
-  elseif view == "library" then
+  if view == "library" then
     text = "No playlists yet"
   elseif view == "playlist" then
     if tostring(s.tracksId or "") ~= playlistId then
@@ -897,8 +1152,6 @@ local function stateNode(s, items)
     else
       text = "No tracks in this playlist"
     end
-  elseif view == "queue" then
-    text = "Queue is empty"
   elseif view == "clients" then
     text = "No connected clients"
   elseif searching then
@@ -979,9 +1232,13 @@ local function listChildren(slice, first)
   return children
 end
 
+-- Хиро home-вида: только типографика и арт — кнопки, прогресс и
+-- спектр переехали в npNode, чтобы не дублировать управление в двух
+-- местах одного экрана.
 local function homeWorkspace(s)
   if not s.linked or (s.title or "") == "" then
-    return stateNode(s, {})
+    -- Полки/состояния рисует волна 3; без данных вид валиден и пуст.
+    return nil
   end
   local dur = tonumber(s.duration) or 0
   local pos = tonumber(s.position) or 0
@@ -995,95 +1252,96 @@ local function homeWorkspace(s)
   if (s.loop or "none") ~= "none" then
     table.insert(marks, REPEAT_LABEL[tostring(s.loop)] or tostring(s.loop))
   end
-  -- Громкость приезжает по лёгкому ключу "tmus.now", так что чип живой.
-  table.insert(marks, "vol " .. math.floor(tonumber(s.volume) or 0) .. "%")
-  local children = {
-    ui.row({ key = "np-hero", gap = 20, align = "center" }, {
-      artNode(s.artPath, 200),
-      ui.column({ key = "np-text", gap = 8, flexGrow = 1 }, {
-        lbl("Now Playing", { key = "np-over", size = 12, color = COLORS.muted }),
-        lbl(shorten(tostring(s.title or ""), 34), { key = "np-title", size = 26, color = COLORS.text }),
-        lbl(shorten(tostring(s.artist or ""), 40), { key = "np-artist", size = 16, color = COLORS.accent }),
-        -- Спектр в хиро: ~20 полос до 28 px, рисуется только пока
-        -- виджет публикует "tmus.spectrum" (nil — тихо пропускаем).
-        spectrum and spectrumBars(20, 28) or nil,
-        lbl((tostring(s.album or "") ~= "" and shorten(s.album, 40) .. "  ·  " or "")
-          .. clock(pos) .. (dur > 0 and (" / " .. clock(dur)) or "")
-          .. (#marks > 0 and ("  ·  " .. table.concat(marks, " · ")) or ""), {
-          key = "np-meta",
-          color = COLORS.muted,
-        }),
+  return ui.row({ key = "np-hero", gap = 16, align = "center" }, {
+    artNode(s.artPath, 64),
+    ui.column({ key = "np-text", gap = 4, flexGrow = 1 }, {
+      lbl("Now Playing", { key = "np-over", size = 11, color = COLORS.muted }),
+      lbl(shorten(tostring(s.title or ""), 40), { key = "np-title", size = 18, color = COLORS.text }),
+      lbl(shorten(tostring(s.artist or ""), 40), { key = "np-artist", size = 13, color = COLORS.accent }),
+      lbl(
+        (tostring(s.album or "") ~= "" and shorten(s.album, 40) .. " · " or "")
+          .. clock(pos) .. (dur > 0 and ("/" .. clock(dur)) or "")
+          .. (#marks > 0 and (" · " .. table.concat(marks, " · ")) or ""),
+        { key = "np-meta", size = 11, color = COLORS.muted }
+      ),
+    }),
+  })
+end
+
+-- Карточка-состояние home-ленты: nil/loading, error, empty.
+local function homeStateNode(glyph, text)
+  return card({
+    ui.glyph({ key = "hf-glyph", name = glyph, color = COLORS.muted }),
+    lbl(text, { key = "hf-title", color = COLORS.muted }),
+  }, { key = "hf-state" })
+end
+
+local function homeCardNode(shelfIndex, cardIndex, c)
+  local active = shelfIndex == homeShelf and cardIndex == homeItem
+  return ui.column({
+    key = "hf-card-" .. shelfIndex .. "-" .. cardIndex,
+    width = 150,
+    gap = 6,
+    padding = 8,
+    radius = 6,
+    fill = active and COLORS.selected or COLORS.surface,
+    onClick = function()
+      homeShelf = shelfIndex
+      homeItem = cardIndex
+      draw()
+    end,
+  }, {
+    artNode(c.art, 110),
+    lbl(shorten(c.title, 18), { key = "t", color = COLORS.text }),
+    lbl(shorten(c.subtitle, 22), { key = "s", color = COLORS.muted }),
+  })
+end
+
+-- Тело home-ленты: состояние по статусу ключа, иначе видимые полки
+-- homeTop..+SHELF_WINDOW-1, каждая — заголовок с честным счётчиком
+-- окна и ряд карточек окна homeLeft[полка]..+HOME_CARD_WINDOW-1.
+local function homeFeedNode()
+  local status = type(homeFeed) == "table" and tostring(homeFeed.status or "") or ""
+  if homeFeed == nil or status == "loading" then
+    return homeStateNode("loader", "Loading recommendations…")
+  end
+  if status == "error" then
+    local err = type(homeFeed) == "table" and tostring(homeFeed.error or "") or ""
+    return homeStateNode("alert", err ~= "" and err or "Recommendations unavailable")
+  end
+  local shelves = homeShelves()
+  if #shelves == 0 then
+    return homeStateNode("music", "No recommendations")
+  end
+  clampHomeCursor()
+  local shelfNodes = {}
+  local last = math.min(homeTop + SHELF_WINDOW - 1, #shelves)
+  for i = homeTop, last do
+    local shelf = shelves[i]
+    local left = homeLeft[i] or 1
+    local header = ui.row({ key = "hf-head-" .. i, gap = 8, align = "center" }, {
+      lbl(shelf.title, { key = "hf-shelf-title-" .. i, size = 13, color = COLORS.text }),
+      shelf.subtitle ~= "" and lbl(shelf.subtitle, { key = "hf-shelf-sub-" .. i, size = 11, color = COLORS.muted }) or nil,
+      lbl("", { key = "hf-spacer-" .. i, grow = 1 }),
+      lbl("◄ " .. left .. "–" .. (left + HOME_CARD_WINDOW - 1) .. "/" .. shelf.count .. " ►", {
+        key = "hf-range-" .. i,
+        size = 10,
+        color = COLORS.muted,
       }),
-    }),
-  }
-  local npButtons = {
-    ui.button({
-      key = "prev",
-      glyph = "player-skip-back",
-      controlSize = "md",
-      variant = "ghost",
-      onClick = function()
-        poke("prev")
-      end,
-    }),
-    ui.button({
-      key = "toggle",
-      glyph = s.status == "playing" and "player-pause" or "player-play",
-      controlSize = "md",
-      variant = "primary",
-      onClick = function()
-        poke("toggle")
-      end,
-    }),
-    ui.button({
-      key = "next",
-      glyph = "player-skip-forward",
-      controlSize = "md",
-      variant = "ghost",
-      onClick = function()
-        poke("next")
-      end,
-    }),
-    ui.button({
-      key = "shuffle",
-      glyph = "arrows-shuffle",
-      controlSize = "md",
-      variant = s.shuffle and "primary" or "ghost",
-      onClick = function()
-        poke("shuffle", "toggle")
-      end,
-    }),
-    ui.button({
-      key = "repeat",
-      -- Три различимых состояния, как в карточке current: track —
-      -- «repeat-once», queue — «repeat», оба primary; none — ghost.
-      glyph = (tostring(s.loop or "none")) == "track" and "repeat-once" or "repeat",
-      controlSize = "md",
-      variant = (tostring(s.loop or "none")) ~= "none" and "primary" or "ghost",
-      onClick = function()
-        poke("repeat", REPEAT_CYCLE[tostring(s.loop or "none")] or "none")
-      end,
-    }),
-  }
-  if tostring(s.loop or "none") ~= "none" then
-    table.insert(npButtons, ui.label(REPEAT_SHORT[tostring(s.loop or "none")] or tostring(s.loop), {
-      key = "np-repeat-short",
-      size = 11,
-      color = COLORS.muted,
+    })
+    local cards = {}
+    local clast = math.min(left + HOME_CARD_WINDOW - 1, #shelf.cards)
+    for j = left, clast do
+      table.insert(cards, homeCardNode(i, j, shelf.cards[j]))
+    end
+    table.insert(shelfNodes, ui.column({ key = "hf-shelf-" .. i, gap = 8 }, {
+      header,
+      ui.row({ key = "hf-cards-" .. i, gap = GAP }, cards),
     }))
   end
-  local controls = ui.row({ key = "np-controls", gap = 10, align = "center" }, npButtons)
-  if dur > 0 then
-    table.insert(children, ui.progress({
-      key = "np-progress",
-      progress = math.max(0, math.min(1, pos / dur)),
-      flexGrow = 1,
-      height = 5,
-      radius = 2,
-    }))
-  end
-  table.insert(children, controls)
-  return card(children, { key = "now-playing", grow = 1, gap = 16 })
+  return ui.scroll({ key = "hf-scroll", flexGrow = 1 }, {
+    ui.column({ key = "hf-body", gap = GAP }, shelfNodes),
+  })
 end
 
 local function playlistCards(slice, first)
@@ -1103,7 +1361,7 @@ local function playlistCards(slice, first)
         draw()
       end,
     }, {
-      artNode(row.art, 144),
+      artNode(row.art, 120),
       lbl(shorten(row.title, 20), { key = "pl-title" .. i, color = COLORS.text }),
       lbl(shorten(row.subtitle, 24), { key = "pl-sub" .. i, color = COLORS.muted }),
     }))
@@ -1120,159 +1378,86 @@ local function playlistCards(slice, first)
   return grid
 end
 
-local function homeContext(s)
-  local children = {
-    ui.button({
-      key = "home-search",
-      glyph = "search",
-      text = "Search",
-      controlSize = "sm",
-      variant = "ghost",
-      onClick = function()
-        -- Раньше это было ui.input, но Enter перехватывается хостом
-        -- (capture_keys) и до submit не доходил — поле было мёртвым.
-        -- Ввод живёт в виде поиска.
-        setView("search")
-      end,
-    }),
-    contextTitle("Queue"),
-  }
-  local queue = snapshot.queue or {}
+-- Автоскролл очереди за играющим треком: зовётся из refresh() при
+-- каждой подмене snapshot. Ручное j/k по колонке (волна 2) выключит
+-- followPlaying; Enter на строке и setView вернут его в true.
+local lastQueueIndex = nil
+local function followQueue()
   local index = tonumber(snapshot.queueIndex)
-  local shown = 0
-  for i, t in ipairs(queue) do
-    if shown >= 5 then
-      break
-    end
-    if index == nil or i > index + 1 then
-      shown = shown + 1
+  if index == lastQueueIndex then
+    return
+  end
+  lastQueueIndex = index
+  if not followPlaying or index == nil then
+    return
+  end
+  queueCursor, queueWindowTop = clampScroll(index + 1, index + 1 - 2, #(snapshot.queue or {}), QUEUE_WINDOW)
+end
+
+-- Правая колонка-очередь: ЕДИНЫЙ context для всех видов. Рисуется
+-- напрямую из snapshot.queue (без фильтра дизлайкнутых — зеркало
+-- живой очереди) и со своим окном/курсором; счётчик берём из
+-- #snapshot.queue, а не queueLen: state-событие может обгонять массив.
+local function queueContextNode(s)
+  local queue = s.queue or {}
+  clampQueue(queue)
+  local index = tonumber(s.queueIndex)
+  local playingIdx = index ~= nil and index + 1 or nil
+  local children = {
+    ui.row({ key = "q-head", gap = 8, align = "center" }, {
+      lbl("Queue", {
+        key = "q-title",
+        size = 12,
+        color = focusBuf == 3 and COLORS.accent or COLORS.muted,
+      }),
+      lbl(queueCursor .. "/" .. #queue, { key = "q-count", size = 11, color = COLORS.muted, grow = 1 }),
+    }),
+  }
+  if #queue == 0 then
+    table.insert(children, ui.glyph({ key = "q-empty-glyph", name = "playlist", color = COLORS.muted }))
+    table.insert(children, lbl("Queue is empty", { key = "q-empty", color = COLORS.muted }))
+  else
+    local last = math.min(queueWindowTop + QUEUE_WINDOW - 1, #queue)
+    for i = queueWindowTop, last do
+      local t = queue[i]
+      local isPlaying = playingIdx ~= nil and i == playingIdx
+      local isCursor = i == queueCursor
+      local rating = ratingOf(s, idOf(t))
+      -- Маркер рейтинга перед названием: ♥ лайк, × дизлайк; нет — ничего.
+      local marker = rating == "liked" and "♥ " or (rating == "disliked" and "× " or "")
       table.insert(children, ui.row({
-        key = "home-q" .. i,
+        key = "q" .. i,
         gap = 8,
         paddingH = 8,
         paddingV = 4,
         radius = 6,
         align = "center",
+        fill = isPlaying and COLORS.playing or (isCursor and COLORS.selected or COLORS.bg),
+        border = (isCursor and isPlaying) and COLORS.border or nil,
+        borderWidth = (isCursor and isPlaying) and 1 or nil,
         onClick = function()
-          poke("play", idOf(t))
+          queueCursor = i
+          followPlaying = false
+          draw()
         end,
       }, {
-        lbl(shorten(tostring(t.title or ""), 26), { key = "home-qt" .. i, grow = 1, color = COLORS.text }),
-        lbl(durationLabel(t.duration) or "", { key = "home-qd" .. i, color = COLORS.muted }),
+        ui.box({ key = "q-mark" .. i, width = 24 }, {
+          lbl(isPlaying and "▶" or tostring(i), {
+            key = "q-idx" .. i,
+            color = isPlaying and COLORS.accent or COLORS.muted,
+          }),
+        }),
+        artNode(t.art_path, 28),
+        lbl(shorten(marker .. tostring(t.title or ""), 26), {
+          key = "q-title" .. i,
+          grow = 1,
+          color = isPlaying and COLORS.accent or (isCursor and COLORS.text or COLORS.muted),
+        }),
+        lbl(durationLabel(t.duration) or "", { key = "q-dur" .. i, width = 44, color = COLORS.muted }),
       }))
     end
   end
-  if shown == 0 then
-    table.insert(children, lbl("Queue is empty", { key = "home-q-empty", color = COLORS.muted }))
-  end
-  return ui.column({ key = "home-context", gap = GAP, flexGrow = 3 }, children)
-end
-
-local function searchContext(items)
-  local children = { contextTitle("Selected") }
-  local row = items[cursor] or selected
-  if row then
-    table.insert(children, card({
-      ui.row({ key = "sel-top", gap = 10, align = "center" }, {
-        artNode(row.art, 48, row.kind == "playlist" and "playlist" or (row.kind == "artist" and "user" or "music")),
-        ui.column({ key = "sel-text", gap = 2, flexGrow = 1 }, {
-          lbl(shorten(row.title, 34), { key = "sel-title", color = COLORS.text }),
-          lbl(GROUP_TITLES[row.kind] or row.kind, { key = "sel-kind", color = COLORS.muted }),
-        }),
-      }),
-      lbl(shorten(row.subtitle, 40), { key = "sel-sub", color = COLORS.muted }),
-    }, { key = "selected-card", fill = COLORS.selected, gap = 8 }))
-  else
-    table.insert(children, lbl("Nothing selected", { key = "sel-none", color = COLORS.muted }))
-  end
-  local current = currentTrack(snapshot)
-  if current then
-    table.insert(children, contextTitle("Current"))
-    table.insert(children, current)
-  end
-  return ui.column({ key = "search-context", gap = GAP, flexGrow = 37 }, children)
-end
-
-local function playlistContext(s)
-  local heroArt = playlistArtPath
-  for _, pl in ipairs(s.playlists or {}) do
-    if idOf(pl) == playlistId then
-      heroArt = tostring(pl.art_path or "")
-    end
-  end
-  local children = {
-    card({
-      ui.row({ key = "hero", gap = 12, align = "center" }, {
-        artNode(heroArt, 72, "playlist"),
-        ui.column({ key = "hero-text", gap = 2 }, {
-          lbl("Playlist", { key = "hero-over", size = 12, color = COLORS.muted }),
-          lbl(shorten(playlistTitle, 30), { key = "hero-title", size = 16, color = COLORS.text }),
-        }),
-      }),
-    }, { key = "hero-card", gap = 8 }),
-  }
-  local current = currentTrack(s)
-  if current then
-    table.insert(children, contextTitle("Current"))
-    table.insert(children, current)
-  end
-  local index = tonumber(s.queueIndex)
-  local upNext = 0
-  local list = { contextTitle("Up Next") }
-  for i, t in ipairs(s.queue or {}) do
-    if index == nil or i > index + 1 then
-      upNext = upNext + 1
-      if upNext <= 5 then
-        table.insert(list, ui.row({
-          key = "up" .. i,
-          gap = 8,
-          paddingH = 8,
-          paddingV = 4,
-          radius = 6,
-          align = "center",
-          onClick = function()
-            poke("play", idOf(t))
-          end,
-        }, {
-          lbl(shorten(tostring(t.title or ""), 26), { key = "up-t" .. i, grow = 1, color = COLORS.text }),
-          lbl(durationLabel(t.duration) or "", { key = "up-d" .. i, color = COLORS.muted }),
-        }))
-      end
-    end
-  end
-  if upNext > 0 then
-    for _, node in ipairs(list) do
-      table.insert(children, node)
-    end
-  end
-  return ui.column({ key = "playlist-context", gap = GAP, flexGrow = 3 }, children)
-end
-
-local function queueContext(s)
-  local children = { contextTitle("Current") }
-  local current = currentTrack(s)
-  if current then
-    table.insert(children, current)
-  else
-    table.insert(children, lbl("Nothing playing", { key = "q-none", color = COLORS.muted }))
-  end
   return ui.column({ key = "queue-context", gap = GAP, flexGrow = 3 }, children)
-end
-
-local function clientsContext(s)
-  local children = {
-    contextTitle("Current source"),
-    card({
-      lbl(tostring(s.source or "all") == "all" and "All clients" or tostring(s.source), {
-        key = "cl-source",
-        color = COLORS.text,
-      }),
-      lbl("Library and search use this source", { key = "cl-hint", color = COLORS.muted }),
-    }, { key = "cl-card", gap = 6 }),
-    contextTitle("Switch source"),
-  }
-  table.insert(children, sourceSelector(s))
-  return ui.column({ key = "clients-context", gap = GAP, flexGrow = 3 }, children)
 end
 
 -- Строки вью eq: курсорная — подсветка selected, как в списках.
@@ -1363,6 +1548,12 @@ end
 -- курсором (нужна kind=="track" и составной id "prov:id").
 local function trackForAdd()
   if view == "home" then
+    -- Карточка-трек под курсором home-ленты; иначе играющий трек.
+    local shelf = homeShelves()[homeShelf]
+    local c = shelf and shelf.cards[homeItem]
+    if c and c.kind == "track" then
+      return c.id
+    end
     local idstr = tostring(snapshot.trackId or "")
     if idstr ~= "" then
       return idstr
@@ -1421,19 +1612,27 @@ function draw()
   local s = snapshot
   local items = rows()
   clampCursor(items)
+  -- Окно правой колонки-очереди клампится вместе с центральным
+  -- списком, чтобы followPlaying/ручной курсор не вылезали за границы.
+  clampQueue(s.queue or {})
   local slice, first = visibleWindow(items)
 
-  local workspace = nil
-  local context = nil
+  local wsChildren = nil
+  -- Единая правая колонка очереди для всех видов; отдельные context
+  -- больше не дублируют её в каждой ветке.
+  local context = queueContextNode(s)
   local workspaceGrow = 7
   local contextGrow = 3
 
   if view == "home" then
-    workspace = ui.column({ key = "ws", gap = GAP, flexGrow = 7 }, {
-      sourceSelector(s),
-      homeWorkspace(s),
-    })
-    context = homeContext(s)
+    -- Хиро исчезает без трека; npNode внизу остаётся всегда.
+    wsChildren = {}
+    local hero = homeWorkspace(s)
+    if hero then
+      table.insert(wsChildren, hero)
+    end
+    -- Лента рекомендаций: состояния/полки, прокручиваемый скролл.
+    table.insert(wsChildren, homeFeedNode())
   elseif view == "search" then
     workspaceGrow = 63
     contextGrow = 37
@@ -1450,7 +1649,7 @@ function draw()
         ui.column({ key = "results-list", gap = 6 }, listChildren(slice, first)),
       }))
     end
-    workspace = ui.column({ key = "ws", gap = GAP, flexGrow = 63 }, {
+    wsChildren = {
       -- Поле поиска — витрина, а не ui.input: буфер ведёт onKey, а
       -- ui.input после первого рендера игнорирует обновления `value`
       -- (хозяин не видел набираемый текст реал-тайм). Label
@@ -1486,8 +1685,7 @@ function draw()
       }),
       ui.row({ key = "chips", gap = 8 }, chips),
       ui.column({ key = "ws-body", gap = GAP, flexGrow = 1 }, body),
-    })
-    context = searchContext(items)
+    }
   elseif view == "library" then
     local state = stateNode(s, items)
     local body = {}
@@ -1498,7 +1696,7 @@ function draw()
         ui.column({ key = "library-grid", gap = GAP }, playlistCards(slice, first)),
       }))
     end
-    workspace = ui.column({ key = "ws", gap = GAP, flexGrow = 7 }, {
+    wsChildren = {
       -- Во время ввода имени заголовок превращается в витрину буфера
       -- (клавиши захвачены, ui.input до них не доходит — грабля из
       -- поиска), подсказка объясняет Enter/Esc.
@@ -1510,7 +1708,7 @@ function draw()
         })
         or lbl("Library", { key = "ws-title", size = 18, color = COLORS.text }),
       ui.column({ key = "ws-body", gap = GAP, flexGrow = 1 }, body),
-    })
+    }
   elseif view == "playlist" then
     local state = stateNode(s, items)
     local body = {}
@@ -1521,26 +1719,10 @@ function draw()
         ui.column({ key = "playlist-list", gap = 4 }, listChildren(slice, first)),
       }))
     end
-    workspace = ui.column({ key = "ws", gap = GAP, flexGrow = 7 }, {
+    wsChildren = {
       lbl(shorten(playlistTitle, 40), { key = "ws-title", size = 18, color = COLORS.text }),
       ui.column({ key = "ws-body", gap = GAP, flexGrow = 1 }, body),
-    })
-    context = playlistContext(s)
-  elseif view == "queue" then
-    local state = stateNode(s, items)
-    local body = {}
-    if state then
-      table.insert(body, state)
-    else
-      table.insert(body, ui.scroll({ key = "queue-scroll-" .. first, flexGrow = 1 }, {
-        ui.column({ key = "queue-list", gap = 4 }, listChildren(slice, first)),
-      }))
-    end
-    workspace = ui.column({ key = "ws", gap = GAP, flexGrow = 7 }, {
-      lbl("Queue", { key = "ws-title", size = 18, color = COLORS.text }),
-      ui.column({ key = "ws-body", gap = GAP, flexGrow = 1 }, body),
-    })
-    context = queueContext(s)
+    }
   elseif view == "eq" then
     -- Не через stateNode: linked-демон без поля equalizer дал бы
     -- «Nothing found»; заглушку eq рисует сам eqWorkspace.
@@ -1551,10 +1733,10 @@ function draw()
     else
       table.insert(body, eqWorkspace(s))
     end
-    workspace = ui.column({ key = "ws", gap = GAP, flexGrow = 7 }, {
+    wsChildren = {
       lbl("Equalizer", { key = "ws-title", size = 18, color = COLORS.text }),
       ui.column({ key = "ws-body", gap = GAP, flexGrow = 1 }, body),
-    })
+    }
   else
     local state = stateNode(s, items)
     local body = {}
@@ -1565,12 +1747,16 @@ function draw()
         ui.column({ key = "clients-list", gap = 6 }, listChildren(slice, first)),
       }))
     end
-    workspace = ui.column({ key = "ws", gap = GAP, flexGrow = 7 }, {
+    wsChildren = {
       lbl("Clients", { key = "ws-title", size = 18, color = COLORS.text }),
       ui.column({ key = "ws-body", gap = GAP, flexGrow = 1 }, body),
-    })
-    context = clientsContext(s)
+    }
   end
+
+  -- Нижний now-playing — последний ребёнок workspace-колонки в КАЖДОМ
+  -- виде: управление и спектр всегда в одном и том же месте экрана.
+  table.insert(wsChildren, npNode(s))
+  local workspace = ui.column({ key = "ws", gap = GAP, flexGrow = workspaceGrow }, wsChildren)
 
   -- Поповер выбора плейлиста перекрывает обычный context в любом виде.
   if plPicker then
@@ -1595,10 +1781,10 @@ function draw()
 
   local footer = lbl(
     view == "eq"
-      and "j/k move · h/l adjust · Return toggle · 0 flat · 1-6 views"
-      or "ctrl+j/k views · 1–6 views · j/k move · Return open · Space play/pause · h/l back/deep · "
-        .. "/ search (i insert · jj/Esc normal) · n/p track · r repeat · s shuffle · < /> vol · "
-        .. "f/d rate · ctrl+d hidden · o terminal · g ends · a в плейлист · D удалить",
+      and "Tab/ctrl+h·l буферы · j/k полоса · h/l ±дБ · Return тумблер · 0 flat · 1–5 секции"
+      or "Tab/ctrl+h·l буферы · ctrl+j/k секции · 1–5 секции · j/k/h/l ход · Return открыть/играть · "
+        .. "BackSpace назад · Space пауза · / поиск (i · jj/Esc normal · ctrl+BS слово) · n/p · r · s · "
+        .. "</> vol · f/d · ctrl+d скрытые · o терминал · g концы · a в плейлист · D удалить",
     { key = "footer", size = 11, color = COLORS.muted }
   )
 
@@ -1614,9 +1800,12 @@ function draw()
   }))
 end
 
--- Возвращает true, только когда вид реально сменился (вход в плейлист
--- или выход из него): зажатые h/l в видах, где они ничего не делают,
--- не должны дёргать draw() каждые ~33 мс (аудит 18.09).
+-- Возвращает true, только когда реально изменилось состояние eq
+-- (клавиша отправлена демону): зажатые h/l в видах, где они ничего
+-- не делают, не должны дёргать draw() каждые ~33 мс (аудит 18.09).
+-- Вход в плейлист (l) и выход из него (h) больше не здесь: провал/
+-- назад — только Enter/BackSpace, а в сетке Library h/l — это ход
+-- moveX (см. onKey и runHeld).
 local function handleViewKeys(key)
   if view == "eq" then
     -- h/l в eq не меняют вид: на полосе — ±1 дБ (кламп ±15, панель
@@ -1630,20 +1819,6 @@ local function handleViewKeys(key)
       cyclePreset(key == "l" and 1 or -1)
     end
     return false
-  end
-  if key == "l" then
-    if view == "library" then
-      local row = rows()[cursor]
-      if row and row.open then
-        openPlaylist(row)
-        return true
-      end
-    end
-  elseif key == "h" then
-    if view == "playlist" then
-      setView("library")
-      return true
-    end
   end
   return false
 end
@@ -1685,9 +1860,19 @@ end
 local function runHeld()
   local action = held.action
   if action == "down" then
+    if view == "library" then
+      return moveY(1)
+    elseif view == "home" then
+      return homeMoveY(1)
+    end
     move(1)
     return true
   elseif action == "up" then
+    if view == "library" then
+      return moveY(-1)
+    elseif view == "home" then
+      return homeMoveY(-1)
+    end
     move(-1)
     return true
   elseif action == "delete" then
@@ -1700,7 +1885,23 @@ local function runHeld()
     plName = string.sub(plName, 1, -2)
     return true
   elseif action == "h" or action == "l" then
-    return handleViewKeys(action)
+    if view == "eq" then
+      -- Прежняя логика ±дБ / соседний пресет.
+      return handleViewKeys(action)
+    elseif view == "library" then
+      -- Горизонтальный ход по сетке карточек.
+      return moveX(action == "l" and 1 or -1)
+    elseif view == "home" then
+      -- Горизонтальный ход по карточкам полки home-ленты.
+      return homeMoveX(action == "l" and 1 or -1)
+    end
+    return false
+  elseif action == "q-down" then
+    moveQueue(1)
+    return true
+  elseif action == "q-up" then
+    moveQueue(-1)
+    return true
   elseif action == "next" then
     poke("next")
     return false
@@ -1837,12 +2038,32 @@ function onKey(chord, pressed)
     return
   end
 
+  -- Фокус буферов 2↔3: Tab и ctrl+h/ctrl+l — тумглер двух колонок
+  -- (центральный список ↔ очередь, в обе стороны). Смена фокуса гасит
+  -- insert тем же принципом, что setView — «смена контекста любым
+  -- путём обязана вернуть бинды». Фокус не трогает view/cursor/
+  -- windowTop: возврат в буфер 2 возвращает курсор на место.
+  -- Кириллические двойники ЙЦУКЕН: физическая l = Cyrillic_de («д»),
+  -- физическая h = Cyrillic_er («р») — зеркало ctrl+Cyrillic_o/el
+  -- для j/k. Хорды сравниваем после string.lower: хост отдаёт имена
+  -- в смешанном регистре (прецедент двойного написания BackSpace).
+  local lc = string.lower(chord)
+  if lc == "tab" or lc == "ctrl+l" or lc == "ctrl+h" or lc == "ctrl+cyrillic_de" or lc == "ctrl+cyrillic_er" then
+    typing = false
+    insertPending = nil
+    focusBuf = (focusBuf == 3) and 2 or 3
+    draw()
+    return
+  end
+
   -- Поиск: вим-модальность. typing=true — insert: буквы идут в
   -- запрос, Esc или быстрые пары jj/jk/oo (физические j/k/o; на
   -- ЙЦУКЕН это о/л/о/о) выходят в normal. typing=false — normal:
   -- j/k и стрелки листают выдачу, Enter активирует строку, i/слэш/
   -- точка возвращают insert. Медиа-клавиши работают в обеих.
-  if inputMode then
+  -- Поиск живёт только при фокусе буфера 2: в буфере 3 (очередь)
+  -- буквы и хорды идут в его карту, а не в запрос.
+  if inputMode and focusBuf == 2 then
     local isJ = chord == "J" or chord == "Cyrillic_o"
     local isK = chord == "K" or chord == "Cyrillic_el"
     local isO = chord == "O" or chord == "Cyrillic_shcha"
@@ -1864,14 +2085,21 @@ function onKey(chord, pressed)
       if chord == "Return" then
         -- Enter двоякий, как в каждом лаунчере: изменившийся запрос
         -- уходит в поиск, неизменный (выдача уже на экране) —
-        -- активирует выбранную строку.
+        -- активирует выбранную строку. Обе ветки выводят в normal:
+        -- витрина INSERT/NORMAL не должна рассинхронизироваться.
         if query ~= "" and query ~= lastSearched then
           doSearch()
         else
           activate(rows()[cursor])
         end
+        typing = false
+        insertPending = nil
       elseif chord == "Escape" then
         typing = false
+      elseif lc == "ctrl+backspace" then
+        -- Удалить слово (см. killWord). Без автоповтора сознательно:
+        -- лаг одного кадра съел бы полстроки.
+        query = killWord(query)
       elseif chord == "BackSpace" or chord == "Backspace" then
         query = string.sub(query, 1, -2)
         startHold(chord, "delete")
@@ -1897,6 +2125,10 @@ function onKey(chord, pressed)
     else
       if chord == "Return" then
         activate(rows()[cursor])
+        -- Активация выводит в normal (витрина не должна врать):
+        -- возврат в insert — только i/slash/period ниже.
+        typing = false
+        insertPending = nil
       elseif chord == "Escape" then
         setView("home")
       elseif key == "i" or chord == "slash" or chord == "period" then
@@ -1918,18 +2150,76 @@ function onKey(chord, pressed)
         local count = #rows()
         cursor = cursor == 1 and count or 1
       elseif chord == "BackSpace" or chord == "Backspace" then
-        -- Захвачена, чтобы не утекала под панель; в normal не делает
-        -- ничего.
+        -- Назад на home — зеркало Esc; захват остаётся, чтобы
+        -- клавиша не утекала под панель.
+        setView("home")
       end
     end
     draw()
     return
   end
+
+  -- Буфер 3 — правая колонка-очередь. Собственная карта хода/оценки/
+  -- активации; Escape и нераспознанные клавиши (n/p, r, s, </>,
+  -- ctrl+d, o, цифры) НЕ перехватываются — проваливаются в глобальную
+  -- карту ниже, как в буфере 2.
+  if focusBuf == 3 then
+    local handled = true
+    if key == "j" or chord == "Down" then
+      moveQueue(1)
+      startHold(chord, "q-down")
+    elseif key == "k" or chord == "Up" then
+      moveQueue(-1)
+      startHold(chord, "q-up")
+    elseif key == "g" then
+      local queue = snapshot.queue or {}
+      queueCursor = queueCursor == 1 and #queue or 1
+      clampQueue(queue)
+    elseif chord == "Return" then
+      -- Активация строки очереди: 0-базный индекс, сервис уже мапит
+      -- на CLI queue-goto. Жест пользователя — автоскролл за играющим
+      -- снова включён.
+      poke("queue-goto", tostring(queueCursor - 1))
+      followPlaying = true
+    elseif chord == "Space" then
+      poke("toggle")
+    elseif chord == "BackSpace" or chord == "Backspace" then
+      -- Назад в центральный буфер — зеркало фокус-тумглера выше.
+      focusBuf = 2
+    elseif key == "f" then
+      rateQueueRow("liked")
+    elseif key == "d" then
+      rateQueueRow("disliked")
+    elseif chord == "A" or chord == "Cyrillic_f" then
+      -- a: трек очереди под курсором — в поповер «в плейлист».
+      local track = idOf((snapshot.queue or {})[queueCursor])
+      if track ~= "" then
+        plPicker = { track = track, cursor = 1 }
+      end
+    elseif chord == "D" or chord == "Cyrillic_v" then
+      -- no-op: в протоколе нет удаления из очереди — глотаем, чтобы
+      -- не провалиться в глобальную карту (там D удаляет из плейлиста).
+    else
+      handled = false
+    end
+    if handled then
+      draw()
+      return
+    end
+    -- Нераспознанное — в глобальную карту ниже.
+  end
+
   if chord == "Escape" then
     panel.close()
     return
   elseif chord == "Return" then
-    activate(rows()[cursor])
+    -- home-лента: активация карточки под курсором (трек — play,
+    -- плейлист — открытие вида playlist). Прочие виды — строка списка.
+    if view == "home" and focusBuf == 2 then
+      homeActivate()
+    else
+      activate(rows()[cursor])
+    end
   elseif chord == "Space" then
     if view == "playlist" or view == "eq" then
       activate(rows()[cursor])
@@ -1941,13 +2231,32 @@ function onKey(chord, pressed)
   elseif key == "p" then
     poke("prev")
   elseif key == "j" then
-    move(1)
+    if view == "library" or view == "home" then
+      moveY(1)
+    else
+      move(1)
+    end
     startHold(chord, "down")
   elseif chord == "Down" then
-    move(1)
+    if view == "library" or view == "home" then
+      moveY(1)
+    else
+      move(1)
+    end
     startHold(chord, "down")
   elseif key == "k" then
-    move(-1)
+    if view == "library" or view == "home" then
+      moveY(-1)
+    else
+      move(-1)
+    end
+    startHold(chord, "up")
+  elseif chord == "Up" then
+    if view == "library" or view == "home" then
+      moveY(-1)
+    else
+      move(-1)
+    end
     startHold(chord, "up")
   elseif key == "less" then
     -- Громкость с автоповтором, как у j/k: service обслуживает
@@ -1964,17 +2273,39 @@ function onKey(chord, pressed)
     elseif chord == "Right" then
       key = "l"
     end
-    handleViewKeys(key)
+    if view == "eq" then
+      -- Прежняя логика eq: ±дБ / соседний пресет (handleViewKeys).
+      handleViewKeys(key)
+    else
+      -- Горизонтальный ход (сетка Library; в остальных видах —
+      -- клампнутый ±1 по rows()).
+      moveX(key == "l" and 1 or -1)
+    end
     startHold(chord, key)
   elseif chord == "1" or chord == "2" or chord == "3" or chord == "4" or chord == "5" or chord == "6" then
-    setView(VIEWS[tonumber(chord)].id)
+    -- Цифра за границей VIEWS (например «6» после удаления queue-вида)
+    -- не должна давать setView(nil).
+    local n = tonumber(chord)
+    if n and n >= 1 and n <= #VIEWS then
+      setView(VIEWS[n].id)
+    end
   elseif key == "0" and view == "eq" then
     -- Flat не трогает enabled: выключенный эквалайзер с обнулёнными
     -- полосами — ровно то, что ожидает «0».
     poke("eq", "flat")
   elseif key == "g" then
-    local count = #rows()
-    cursor = cursor == 1 and count or 1
+    -- g — «концы»: в списках прыжок первый/последний; в home-ленте —
+    -- полный сброс курсора и окон (g на полке-карточке списка не в
+    -- фокусе: home всегда буфер 2).
+    if view == "home" then
+      homeShelf = 1
+      homeItem = 1
+      homeTop = 1
+      homeLeft = {}
+    else
+      local count = #rows()
+      cursor = cursor == 1 and count or 1
+    end
   elseif key == "r" then
     poke("repeat", REPEAT_CYCLE[tostring(snapshot.loop or "none")] or "none")
   elseif key == "s" then
@@ -2038,8 +2369,17 @@ function onKey(chord, pressed)
     -- поиск и без переключения раскладки.
     setView("search")
   elseif chord == "BackSpace" then
-    -- Захвачена, чтобы не утекала в приложения под панелью; в поиске
-    -- обрабатывает поле, вне его — гасим.
+    -- Назад по иерархии видов: из плейлиста — в Library (бывший h),
+    -- из search-normal — на home (бывший no-op, зеркало Esc; в
+    -- search-insert BackSpace обслуживает поле в inputMode-блоке
+    -- выше, сюда попадает только не-input случай — ветка оставлена
+    -- как защита). Прочее — глотаем, чтобы не утекала в приложения
+    -- под панелью.
+    if view == "playlist" then
+      setView("library")
+    elseif view == "search" and not inputMode then
+      setView("home")
+    end
   end
 
   draw()
@@ -2050,10 +2390,17 @@ local function refresh(state)
   if lastSearchSerial == nil or snapshot.searchSerial ~= lastSearchSerial then
     searching = false
   end
+  followQueue()
   draw()
 end
 
 function onOpen()
+  -- Открытие панели — полный сброс навигации: фокус в центральный
+  -- список, очередь с начала, автоскролл за играющим включён.
+  focusBuf = 2
+  queueCursor = 1
+  queueWindowTop = 1
+  followPlaying = true
   poke("refresh")
   refresh(noctalia.state.get(KEY))
 end
@@ -2100,5 +2447,18 @@ refresh(noctalia.state.get(KEY))
 -- nil/пустая строка — бары пропадают до следующего значения.
 noctalia.state.watch("tmus.spectrum", function(v)
   spectrum = (type(v) == "string" and v ~= "") and v or nil
+  draw()
+end)
+-- Home-лента рекомендаций: лёгкий ключ "tmus.home" (сервис публикует
+-- status + полки; art_path декорирован у первых 14 карточек полки).
+-- Рендер-модель полок перевычисляется ТОЛЬКО здесь — draw до 8 Гц
+-- перебирать полки не должен. Сервис обязан быть обработчиком
+-- onUpdateState: обновляем кэш и перерисовываем.
+noctalia.state.watch("tmus.home", function(v)
+  homeFeed = type(v) == "table" and v or nil
+  rebuildHomeShelves()
+  if view == "home" then
+    clampHomeCursor()
+  end
   draw()
 end)
