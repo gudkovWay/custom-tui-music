@@ -5,24 +5,27 @@ local SERVICE = "q/tmus:watch"
 
 -- Цвета — ИМЕНА РОЛЕЙ палитры хоста, а не hex: хост сам резолвит их в
 -- актуальный Material-цвет, поэтому смена темы/обоев перекрашивает
--- панель без правок плагина. Роли проверены живой пробой 19.09:
--- surface/surface_variant/hover/surface_container_high/
--- secondary_container/tertiary/on_surface/on_surface_variant/outline/
--- primary/error рендерятся, а primary_container валиден, но НЕ
--- рисуется (невидим) — его здесь сознательно нет. Три различимых
--- заливки строк: фон=surface, курсор=hover, играет=secondary_container;
--- курсор НА играющей — заливка playing плюс рамка border 1px, иначе
--- было бы неразличимо, чей цвет сильнее.
+-- панель без правок плагина. Роли проверены живой пробой 19.09;
+-- для полупрозрачных заливок роль пишется с альфой "role/alpha".
+-- Здесь используются ТОЛЬКО проверенно рендерящиеся: surface,
+-- surface_variant, primary, primary/0.20, secondary, secondary/0.28,
+-- surface_variant/0.55, on_surface, on_surface_variant, outline,
+-- error (primary_container валиден, но НЕ рисуется — невидим).
+-- Три различимых
+-- заливки строк: фон=surface, курсор=primary/0.20, играет=
+-- secondary/0.28; курсор НА играющей — заливка playing плюс рамка
+-- border 1px, иначе было бы неразличимо, чей цвет сильнее.
 local COLORS = {
   bg = "surface",
   surface = "surface_variant",
   -- Курсорная строка обязана читаться с одного взгляда: проба 18.09
   -- показала, что прежний хозяин не видел её.
-  selected = "hover",
-  playing = "secondary_container",
+  selected = "primary/0.20",
+  playing = "secondary/0.28",
   -- Фон нижнего now-playing-блока: раньше численно совпадал с
-  -- playing (surface_container_high) — теперь роль свободна.
-  npbg = "surface_container_high",
+  -- playing — теперь surface_variant/0.55, приглушённый отличимый
+  -- фон.
+  npbg = "surface_variant/0.55",
   text = "on_surface",
   muted = "on_surface_variant",
   border = "outline",
@@ -56,7 +59,7 @@ local VIEWS = {
   { id = "search", title = "Search", glyph = "search" },
   { id = "library", title = "Library", glyph = "library" },
   { id = "clients", title = "Clients", glyph = "server" },
-  { id = "eq", title = "Equalizer", glyph = "sliders" },
+  { id = "eq", title = "Equalizer", glyph = "adjustments-horizontal" },
 }
 local VIEW_IDS = {}
 for i, v in ipairs(VIEWS) do
@@ -684,7 +687,7 @@ local function trackRow(i, t, opts)
   -- Маркер рейтинга перед названием: ♥ лайк, × дизлайк; нет — ничего.
   local marker = o.rating == "liked" and "♥ " or (o.rating == "disliked" and "× " or "")
   local children = {
-    ui.box({ key = "mark" .. i, width = 28 }, {
+    ui.row({ key = "mark" .. i, width = 28, align = "center" }, {
       lbl(current and "▶" or (o.index or tostring(i)), {
         key = "idx" .. i,
         color = current and COLORS.accent or COLORS.muted,
@@ -1457,7 +1460,7 @@ local function queueContextNode(s)
           draw()
         end,
       }, {
-        ui.box({ key = "q-mark" .. i, width = 24 }, {
+        ui.row({ key = "q-mark" .. i, width = 24, align = "center" }, {
           lbl(isPlaying and "▶" or tostring(i), {
             key = "q-idx" .. i,
             color = isPlaying and COLORS.accent or COLORS.muted,
