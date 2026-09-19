@@ -263,6 +263,11 @@ impl App {
         })?;
         match provider.catalog().playlist_add(playlist, track).await {
             Ok(()) => {
+                // Состав плейлиста изменился на сервере — TTL-кэш треков
+                // обязан умереть немедленно: иначе повторное открытие
+                // плейлиста до `PLAYLIST_TTL_SECS` показывает состав
+                // БЕЗ добавленного трека (живой замер 19.09).
+                self.with_cache(|c| c.forget_playlist_sync(playlist))?;
                 self.emit(Event::PlaylistsChanged);
                 Ok(())
             }
@@ -281,12 +286,16 @@ impl App {
         })?;
         match provider.catalog().playlist_remove(playlist, track).await {
             Ok(()) => {
+                // Симметрично add: удалённый трек не должен доживать
+                // свой TTL в кэше.
+                self.with_cache(|c| c.forget_playlist_sync(playlist))?;
                 self.emit(Event::PlaylistsChanged);
                 Ok(())
             }
             Err(err) => Err(self.report_playlist_error(provider, err).await),
         }
     }
+
 
     /// Удалить плейлист и разослать сигнал.
     pub(crate) async fn playlist_delete(&self, playlist: &PlaylistId) -> anyhow::Result<()> {
@@ -295,6 +304,9 @@ impl App {
         })?;
         match provider.catalog().playlist_delete(playlist).await {
             Ok(()) => {
+                // Плейлист исчез: его состав в кэше больше не отвечает
+                // реальности — сбрасываем метку свежести.
+                self.with_cache(|c| c.forget_playlist_sync(playlist))?;
                 self.emit(Event::PlaylistsChanged);
                 Ok(())
             }
