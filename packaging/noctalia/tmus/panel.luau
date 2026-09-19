@@ -1425,7 +1425,10 @@ local function queueContextNode(s)
     for i = queueWindowTop, last do
       local t = queue[i]
       local isPlaying = playingIdx ~= nil and i == playingIdx
-      local isCursor = i == queueCursor
+      -- Подсветка курсора — только при фокусе буфера 3: после
+      -- ctrl+h очередь остаётся зеркалом без «селекта-призрака»,
+      -- играющий трек подсвечен всегда.
+      local isCursor = focusBuf == 3 and i == queueCursor
       local rating = ratingOf(s, idOf(t))
       -- Маркер рейтинга перед названием: ♥ лайк, × дизлайк; нет — ничего.
       local marker = rating == "liked" and "♥ " or (rating == "disliked" and "× " or "")
@@ -1439,9 +1442,12 @@ local function queueContextNode(s)
         fill = isPlaying and COLORS.playing or (isCursor and COLORS.selected or COLORS.bg),
         border = (isCursor and isPlaying) and COLORS.border or nil,
         borderWidth = (isCursor and isPlaying) and 1 or nil,
+        -- Клик мышью по строке очереди = намерение работать с ней:
+        -- курсор и фокус буфера 3, иначе ввод уйдёт в центральный вид.
         onClick = function()
           queueCursor = i
           followPlaying = false
+          focusBuf = 3
           draw()
         end,
       }, {
