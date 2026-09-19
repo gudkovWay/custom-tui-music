@@ -132,6 +132,40 @@ impl YtMusic {
             expires_at,
         })
     }
+
+    /// Перечитать плейлист и наполнить карту `setVideoId`.
+    ///
+    /// Вызывается и листингом, и — при промахе карты — удалением трека:
+    /// демон кэширует треки плейлиста (TTL), свежий кэш отвечает БЕЗ
+    /// захода в провайдера, поэтому «сначала открой плейлист» —
+    /// ненадёжный инвариант (живой замер 19.09: rm падал сразу после
+    /// рестарта демона при тёплом кэше). Ленивый дозапрос дешевле
+    /// честной ошибки: один browse вместо пользовательского отказа.
+    /// Устаревшие записи выцветают — перечисление перезаписывает срез
+    /// плейлиста целиком.
+    async fn refresh_playlist_entries(
+        &self,
+        playlist_id: &str,
+    ) -> Result<Vec<(Track, Option<String>)>> {
+        // Префикс `VL` обязателен: browse по сырому id плейлист не открывает.
+        let browse_id = parse::playlist_browse_id(playlist_id);
+        let pages = self.tube.browse_pages(&browse_id).await?;
+        let entries: Vec<_> = pages.iter().flat_map(|page| parse::playlist_entries(page)).collect();
+
+        {
+            let mut map = self
+                .set_video_ids
+                .lock()
+                .expect("карта setVideoId не может быть отравлена");
+            map.retain(|(pl, _), _| pl != playlist_id);
+            for (track, set_video_id) in &entries {
+                if let Some(set_video_id) = set_video_id {
+                    map.insert((playlist_id.to_owned(), track.id.id.clone()), set_video_id.clone());
+                }
+            }
+        }
+        Ok(entries)
+    }
 }
 
 #[async_trait]
@@ -211,33 +245,10 @@ impl Catalog for YtMusic {
         if playlist.provider != self.id {
             return Err(ProviderError::NoSuchPlaylist(playlist.clone()));
         }
-        // Префикс `VL` обязателен: browse по сырому id плейлист не открывает.
-        let browse_id = parse::playlist_browse_id(&playlist.id);
-        let pages = self.tube.browse_pages(&browse_id).await?;
-        let entries: Vec<_> = pages.iter().flat_map(|page| parse::playlist_entries(page)).collect();
-
-        // Разбор заодно отдал `setVideoId` каждой записи — складываем
-        // сюда, чтобы `playlist_remove` смог убрать трек без повторного
-        // хода в сервис. Устаревшие записи выцветают: следующее
-        // перечисление перезаписывает карту целиком.
-        {
-            let mut map = self
-                .set_video_ids
-                .lock()
-                .expect("карта setVideoId не может быть отравлена");
-            map.retain(|(playlist_id, _), _| playlist_id != &playlist.id);
-            for (track, set_video_id) in &entries {
-                if let Some(set_video_id) = set_video_id {
-                    map.insert(
-                        (playlist.id.clone(), track.id.id.clone()),
-                        set_video_id.clone(),
-                    );
-                }
-            }
-        }
-
+        let entries = self.refresh_playlist_entries(&playlist.id).await?;
         Ok(entries.into_iter().map(|(track, _)| track).collect())
     }
+
 
     async fn liked(&self) -> Result<Vec<Track>> {
         self.playlist_tracks(&PlaylistId::new(self.id, LIKED_PLAYLIST))
@@ -286,23 +297,43 @@ impl Catalog for YtMusic {
         if track.provider != self.id {
             return Err(ProviderError::NoSuchTrack(track.clone()));
         }
-        // `setVideoId` негде взять, кроме перечисления плейлиста: пока
-        // плейлист не открывали (или после рестарта демона), убрать трек
-        // нельзя — честная ошибка вместо вслепую отправленного запроса.
-        let set_video_id = self
+        // `setVideoId` негде взять, кроме перечисления плейлиста. Карта
+        // — оптимизация: при промахе (рестарт демона, тёплый кэш
+        // треков, ни разу не открытый плейлист) перечитываем плейлист
+        // здесь же одним browse и продолжаем. Отказ — только когда
+        // трека действительно нет в свежем перечислении.
+        let mut set_video_id = self
             .set_video_ids
             .lock()
             .expect("карта setVideoId не может быть отравлена")
             .get(&(playlist.id.clone(), track.id.clone()))
             .cloned();
+        if set_video_id.is_none() {
+            let entries = self.refresh_playlist_entries(&playlist.id).await?;
+            let present = entries
+                .iter()
+                .any(|(t, svid)| t.id == *track && svid.is_some());
+            if !present {
+                return Err(ProviderError::NoSuchTrack(track.clone()));
+            }
+            set_video_id = self
+                .set_video_ids
+                .lock()
+                .expect("карта setVideoId не может быть отравлена")
+                .get(&(playlist.id.clone(), track.id.clone()))
+                .cloned();
+        }
         let Some(set_video_id) = set_video_id else {
+            // Перечисление знает трек, но setVideoId у записи нет —
+            // сервис отдаёт его не для всех типов записей; вслепую
+            // удалять нельзя.
             return Err(ProviderError::Format {
                 provider: self.id,
-                reason: "open the playlist first".into(),
+                reason: "у записи нет setVideoId".into(),
             });
         };
         self.tube
-            .playlist_edit_remove(&playlist.id, &track.id, &set_video_id)
+            .playlist_edit_remove(&playlist.id, &set_video_id)
             .await
     }
 

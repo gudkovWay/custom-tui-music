@@ -154,11 +154,23 @@ impl InnerTube {
     }
 
     /// Удалить плейлист аккаунта.
+    ///
+    /// В отличие от `edit_playlist`, эндпоинт не отвечает
+    /// `STATUS_SUCCEEDED`: живой замер 19.09 вернул HTTP 200 с телом-эхом
+    /// `commandExecutorCommand` — и плейлист реально исчез из библиотеки.
+    /// Поэтому успех — отсутствие `error`/признака разлогина в теле;
+    /// `ensure_edit_succeeded` здесь неприменим.
     pub async fn playlist_delete(&self, playlist_id: &str) -> Result<()> {
         let value = self
             .post("playlist/delete", json!({ "playlistId": playlist_id }))
             .await?;
-        ensure_edit_succeeded("playlist/delete", &value)
+        if value.get("error").is_none() && unauth_reason(&value).is_none() {
+            return Ok(());
+        }
+        Err(ProviderError::Format {
+            provider: PROVIDER,
+            reason: format!("playlist/delete: {}", snippet(&value.to_string())),
+        })
     }
 
     /// Добавить видео в плейлист (`browse/edit_playlist`).
@@ -185,7 +197,6 @@ impl InnerTube {
     pub async fn playlist_edit_remove(
         &self,
         playlist_id: &str,
-        video_id: &str,
         set_video_id: &str,
     ) -> Result<()> {
         let value = self
@@ -193,9 +204,13 @@ impl InnerTube {
                 "browse/edit_playlist",
                 playlist_edit_body(
                     playlist_id,
+                    // Тело сверено с youtubei.js (PlaylistManager.
+                    // removeVideos): ACTION_REMOVE_VIDEO несёт ТОЛЬКО
+                    // setVideoId — removedVideoId там нет. Живой замер
+                    // 19.09 не дошёл до валидного запроса (поле svid не
+                    // читалось), поэтому идём за проверенным клиентом.
                     json!([{
                         "action": "ACTION_REMOVE_VIDEO",
-                        "removedVideoId": video_id,
                         "setVideoId": set_video_id
                     }]),
                 ),
@@ -577,13 +592,15 @@ mod tests {
                 { "action": "ACTION_ADD_VIDEO", "addedVideoId": "vid1" }
             ]})
         );
+        // Удаление — ровно как у youtubei.js: только setVideoId,
+        // без removedVideoId (сверка 19.09).
         assert_eq!(
             playlist_edit_body(
                 "PLabc",
-                json!([{ "action": "ACTION_REMOVE_VIDEO", "removedVideoId": "vid1", "setVideoId": "sv1" }])
+                json!([{ "action": "ACTION_REMOVE_VIDEO", "setVideoId": "sv1" }])
             ),
             json!({ "playlistId": "PLabc", "actions": [
-                { "action": "ACTION_REMOVE_VIDEO", "removedVideoId": "vid1", "setVideoId": "sv1" }
+                { "action": "ACTION_REMOVE_VIDEO", "setVideoId": "sv1" }
             ]})
         );
     }

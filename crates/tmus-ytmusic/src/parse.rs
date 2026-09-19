@@ -91,18 +91,24 @@ pub(crate) fn tracks(page: &Value) -> Vec<Track> {
 /// Треки плейлиста вместе с `setVideoId` каждой записи.
 ///
 /// `setVideoId` — служебный идентификатор записи внутри плейлиста
-/// (`playlistItemData.setVideoId`): без него эндпоинт
+/// (`playlistItemData.playlistSetVideoId`): без него эндпоинт
 /// `browse/edit_playlist` не даёт убрать трек. Он существует только
 /// внутри конкретного плейлиста и приходит только при его перечислении,
-/// поэтому добывается здесь, на месте, а не отдельным запросом. Для
-/// записей без `playlistItemData` (внеплейлистовые раскладки) — `None`.
+/// поэтому добывается здесь, на месте, а не отдельным запросом.
+///
+/// Имя поля сверено с живым протоколом (19.09): в InnerTube оно
+/// `playlistSetVideoId`, а НЕ `setVideoId` — первая реализация читала
+/// несуществующее поле, карта оставалась пустой и удаление трека
+/// всегда падало «нет такого трека» при видимых в листинге треках.
+/// Для записей без `playlistItemData` (внеплейлистовые раскладки) —
+/// `None`.
 pub(crate) fn playlist_entries(page: &Value) -> Vec<(Track, Option<String>)> {
     renderers(page, "musicResponsiveListItemRenderer")
         .iter()
         .filter_map(|item| {
             let track = track_from_responsive(item)?;
             let set_video_id = item
-                .pointer("/playlistItemData/setVideoId")
+                .pointer("/playlistItemData/playlistSetVideoId")
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty())
                 .map(str::to_owned);
@@ -688,7 +694,7 @@ mod tests {
 
         json!({
             "musicResponsiveListItemRenderer": {
-                "playlistItemData": { "videoId": "dQw4w9WgXcQ", "setVideoId": "SVabc123" },
+                "playlistItemData": { "videoId": "dQw4w9WgXcQ", "playlistSetVideoId": "SVabc123" },
                 "flexColumns": [
                     column(json!({ "runs": [{ "text": "Заголовок" }] })),
                     column(json!({ "runs": [
