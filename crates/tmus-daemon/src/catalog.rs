@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tmus_core::model::{Playlist, PlaylistId, Rating, SearchKind, SearchResult, Track, TrackId};
+use tmus_core::model::{
+    CatalogShelf, Playlist, PlaylistId, Rating, SearchKind, SearchResult, Track, TrackId,
+};
 use tmus_core::protocol::{CatalogSource, Event, ProviderView};
 
 use crate::app::App;
@@ -10,6 +12,18 @@ use crate::app::App;
 /// дёргает состав на каждый шаг курсора по библиотеке, и без окна
 /// свежести каждый заход — секунды ожидания InnerTube.
 const PLAYLIST_TTL_SECS: i64 = 600;
+
+/// Сколько домашняя лента считается свежей без похода в сеть (ротация
+/// рекомендаций терпит устаревание).
+const HOME_TTL_SECS: u64 = 600;
+
+/// Снимок домашней ленты с ключом провайдера: повторный `Cmd::Home` с тем
+/// же разрезом в пределах TTL отвечает из кэша, а не из сети.
+pub(crate) struct HomeCache {
+    key: String,
+    at: Instant,
+    shelves: Vec<CatalogShelf>,
+}
 
 /// Кулдаун попыток перечитать cookies браузера: одна на провайдера,
 /// чтобы ливень auth-ошибок не превратился в ливень перечитываний
@@ -139,6 +153,46 @@ impl App {
         if !out.is_empty() {
             self.with_cache(|c| c.put_tracks(&out))?;
         }
+        Ok(out)
+    }
+
+    /// Домашняя лента рекомендаций с TTL-кэшем и single-flight.
+    ///
+    /// Замок `tokio::sync::Mutex` держится через весь сетевой заход:
+    /// параллельные `Cmd::Home` сливаются в один, а не дёргают
+    /// InnerTube горсткой. Протухшие полки не отдаём — сервис хранит
+    /// прошлую ленту у себя, честная ошибка лучше несвежих советов.
+    pub(crate) async fn home(&self, provider: Option<&str>) -> anyhow::Result<Vec<CatalogShelf>> {
+        let key = provider.unwrap_or("all").to_owned();
+        let mut guard = self.home_cache.lock().await;
+        if let Some(cached) = guard.as_ref() {
+            if cached.key == key && cached.at.elapsed().as_secs() < HOME_TTL_SECS {
+                return Ok(cached.shelves.clone());
+            }
+        }
+        let mut out = Vec::new();
+        for target in self.targets(provider)? {
+            match target.catalog().home().await {
+                Ok(shelves) => out.extend(shelves),
+                Err(tmus_provider::ProviderError::Unsupported { .. }) => {
+                    // Не каждый провайдер умеет домашнюю ленту: это не
+                    // сбой, просто полки у него нет.
+                    tracing::debug!(provider = %target.id(), "домашней ленты нет");
+                }
+                Err(err) => {
+                    tracing::warn!(provider = %target.id(), %err, "домашняя лента не прочиталась");
+                    self.report_auth(target, &err);
+                    if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
+                        self.try_reauth(target).await;
+                    }
+                    // Без stale-фолбэка: ошибки уходят клиенту целиком.
+                    return Err(err.into());
+                }
+            }
+        }
+        let results: Vec<SearchResult> = out.iter().flat_map(|s| s.items.iter().cloned()).collect();
+        self.remember(&results)?;
+        *guard = Some(HomeCache { key, at: Instant::now(), shelves: out.clone() });
         Ok(out)
     }
 

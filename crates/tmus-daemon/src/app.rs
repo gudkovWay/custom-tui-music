@@ -25,7 +25,7 @@ use tmus_player::Player;
 use tmus_provider::Registry;
 use tokio::sync::broadcast;
 
-use crate::catalog::resolve_catalog_source;
+use crate::catalog::{resolve_catalog_source, HomeCache};
 use crate::filler;
 
 /// Сколько событий держится в шине для отстающего подписчика.
@@ -51,6 +51,10 @@ pub struct App {
     paths: Paths,
     events: broadcast::Sender<Event>,
     pub(crate) catalog_source: std::sync::Mutex<CatalogSource>,
+    /// Кэш домашней ленты. tokio-замок: держится через await —
+    /// параллельные `Cmd::Home` сливаются в один сетевой заход
+    /// (single-flight).
+    pub(crate) home_cache: tokio::sync::Mutex<Option<HomeCache>>,
     /// Сигнал «пора гаситься». Нужен, потому что `Cmd::Shutdown`
     /// приходит из задачи control-socket, а гасить обязан `main`: только
     /// он снимает файл сокета и убивает mpv. Вызов `std::process::exit`
@@ -94,6 +98,7 @@ impl App {
             paths,
             events,
             catalog_source: std::sync::Mutex::new(catalog_source),
+            home_cache: tokio::sync::Mutex::new(None),
             shutdown: tokio::sync::Notify::new(),
             auth_retry: std::sync::Mutex::new(std::collections::HashMap::new()),
             self_arc: std::sync::OnceLock::new(),
@@ -374,6 +379,11 @@ impl App {
                 let out = self.liked(provider.as_deref()).await?;
                 release_memory();
                 Ok(Payload::Tracks(out))
+            }
+            Cmd::Home { provider } => {
+                let out = self.home(provider.as_deref()).await?;
+                release_memory(); // FEmusic_home — мегабайтный JSON, та же причина, что у каталожных arm'ов выше
+                Ok(Payload::Home(out))
             }
 
             // Оценки: список — из локального кэша, установка — через
