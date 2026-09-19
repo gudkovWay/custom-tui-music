@@ -122,6 +122,20 @@ fn process_alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// Формат значения `af` для провода в mpv IPC. Node-формат требует список
+/// мап `{name, params}`; список строк mpv отвергает ошибкой «unsupported
+/// format for accessing property» (замер живого сокета). Строка же парсится
+/// тем же текстовым парсером, что и `--af=`, поэтому все фильтры уходят
+/// одной склейкой через запятую; пустой срез — пустой node-список, который
+/// mpv понимает как «очистить фильтры».
+fn af_wire_value(entries: &[String]) -> serde_json::Value {
+    if entries.is_empty() {
+        json!([])
+    } else {
+        json!(entries.join(","))
+    }
+}
+
 /// Кадр IPC, уже разобранный по наличию `request_id`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum IpcFrame {
@@ -383,7 +397,7 @@ impl Mpv {
     /// отсутствие фильтра, а не фильтр с нулевыми усилениями, который
     /// продолжал бы тратить CPU.
     pub async fn set_audio_filter(&self, entries: &[String]) -> Result<(), MpvError> {
-        self.set_property("af", json!(entries)).await
+        self.set_property("af", af_wire_value(entries)).await
     }
 
     /// Остановить воспроизведение; благодаря `--idle=yes` процесс живёт.
@@ -619,6 +633,25 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::time::SystemTime;
+
+    #[test]
+    fn af_wire_value_empty_clears_filters() {
+        assert_eq!(af_wire_value(&[]), json!([]));
+    }
+
+    #[test]
+    fn af_wire_value_single_filter_verbatim() {
+        let lavfi = "lavfi=[firequalizer=gain_entry='entry(0,0);entry(1000,-3)']".to_string();
+        assert_eq!(af_wire_value(&[lavfi.clone()]), json!(lavfi));
+    }
+
+    #[test]
+    fn af_wire_value_multiple_filters_comma_joined() {
+        assert_eq!(
+            af_wire_value(&["lavfi=[a]".into(), "lavfi=[b]".into()]),
+            json!("lavfi=[a],lavfi=[b]")
+        );
+    }
 
     fn remote(ua: Option<&str>) -> StreamSource {
         StreamSource::Remote {
