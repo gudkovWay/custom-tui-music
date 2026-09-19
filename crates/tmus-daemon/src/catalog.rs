@@ -13,6 +13,13 @@ use crate::app::App;
 /// свежести каждый заход — секунды ожидания InnerTube.
 const PLAYLIST_TTL_SECS: i64 = 600;
 
+/// Потолок страниц при ПОЛНОМ перечитывании состава плейлиста.
+/// Зеркалит `MAX_PAGES` провайдера: batch-путь — страховка от вечного
+/// цикла, а не замена ленивой догрузке. Если все страницы взяты, а токен
+/// остался, он сохраняется — хвост дозагружается через
+/// `playlist_tracks_page`.
+const PLAYLIST_BATCH_PAGES: usize = 10;
+
 /// Сколько домашняя лента считается свежей без похода в сеть (ротация
 /// рекомендаций терпит устаревание).
 const HOME_TTL_SECS: u64 = 600;
@@ -118,14 +125,52 @@ impl App {
         if let Some(tracks) = self.with_cache(|c| c.playlist_tracks_if_fresh(id, PLAYLIST_TTL_SECS))? {
             return Ok(tracks);
         }
-        match provider.catalog().playlist_tracks(id).await {
-            Ok(tracks) => {
+        // Полное чтение идёт через постраничный API, а не через
+        // `playlist_tracks`: только так после последней взятой страницы
+        // остаётся токен, и хвост плейлиста (LM длиннее тысячи треков
+        // не влезает в батч) доступен ленивой догрузке.
+        let catalog = provider.catalog();
+        let mut tracks = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut last_token: Option<String> = None;
+        let mut failure = None;
+        for _ in 0..PLAYLIST_BATCH_PAGES {
+            match catalog.playlist_tracks_page(id, cursor.as_deref()).await {
+                Ok(page) => {
+                    last_token = page.next.clone();
+                    cursor = page.next;
+                    tracks.extend(page.tracks);
+                    // Провайдеры без пагинации (дефолт трейта) отдают
+                    // всё сразу с next=None — цикл кончается первой же
+                    // итерацией.
+                    if last_token.is_none() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    failure = Some(err);
+                    break;
+                }
+            }
+        }
+        match failure {
+            None => {
                 // put_playlist_tracks теперь ещё и ставит метку
-                // свежести — следующий заход попадёт в TTL-ветку выше.
-                self.with_cache(|c| c.put_playlist_tracks(id, &tracks))?;
+                // свежести — следующий заход попадёт в TTL-ветку выше;
+                // курсор поверх неё фиксирует полноту среза:
+                // Some(токен) — есть хвост, None — дочитано.
+                self.with_cache(|c| {
+                    c.put_playlist_tracks(id, &tracks)?;
+                    c.put_playlist_continuation(
+                        id.provider.as_str(),
+                        id,
+                        last_token.as_deref(),
+                        tracks.len(),
+                    )
+                })?;
                 Ok(tracks)
             }
-            Err(err) => {
+            Some(err) => {
                 tracing::warn!(playlist = %id, %err, "плейлист не прочитался, беру из кэша");
                 self.report_auth(provider, &err);
                 if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
@@ -134,6 +179,44 @@ impl App {
                 Ok(self.with_cache(|c| c.playlist_tracks(id))?)
             }
         }
+    }
+
+    /// Одна страница ленивой догрузки состава. Пустой ответ (без треков
+    /// и без курсора) значит «дочитано или не начато»: панель по нему
+    /// прекращает догрузку.
+    pub(crate) async fn playlist_tracks_page(
+        &self,
+        id: &PlaylistId,
+    ) -> anyhow::Result<(Vec<Track>, Option<String>)> {
+        let provider = self
+            .registry
+            .get(id.provider)
+            .ok_or_else(|| anyhow::anyhow!("провайдер {} не подключён", id.provider))?;
+        // Нет курсора — догрузить нечего: страница была бы пустой, а
+        // сеть дёргать зря не хочется.
+        let Some(cursor) = self.with_cache(|c| c.playlist_continuation(id.provider.as_str(), id))?
+        else {
+            return Ok((Vec::new(), None));
+        };
+        let page = provider
+            .catalog()
+            .playlist_tracks_page(id, Some(&cursor))
+            .await?;
+        // Отдельного счётчика fetched в кэше наружу не выставлено —
+        // берём текущий размер сохранённого среза: append дописывает в
+        // его конец, так что это и есть число уже подтянутых треков.
+        let fetched =
+            self.with_cache(|c| c.playlist_tracks(id))?.len() + page.tracks.len();
+        self.with_cache(|c| {
+            c.append_playlist_tracks(id.provider.as_str(), id, &page.tracks)?;
+            c.put_playlist_continuation(
+                id.provider.as_str(),
+                id,
+                page.next.as_deref(),
+                fetched,
+            )
+        })?;
+        Ok((page.tracks, page.next))
     }
 
     pub(crate) async fn liked(&self, provider: Option<&str>) -> anyhow::Result<Vec<Track>> {

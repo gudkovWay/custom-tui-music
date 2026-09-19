@@ -57,6 +57,11 @@ pub enum Cmd {
     /// Поставить плейлист в очередь целиком; `start` — индекс трека,
     /// с которого начать.
     PlayPlaylist { playlist: PlaylistId, start: Option<usize> },
+    /// Играть готовый список треков как новый контекст: очередь
+    /// заменяется списком, `start` — индекс трека, с которого начать.
+    /// Клиент сам владеет списком (страница поиска, лайк), поэтому
+    /// плейлист демоном не читается.
+    PlayContext { tracks: Vec<TrackId>, start: usize },
     Toggle,
     Play,
     Pause,
@@ -100,6 +105,10 @@ pub enum Cmd {
     /// Плейлисты библиотеки; `provider = None` — из всех.
     Library { provider: Option<String> },
     LibraryTracks { playlist: PlaylistId },
+    /// Следующая страница состава плейлиста по сохранённому курсору
+    /// догрузки. Ответ [`Payload::TracksPage`]; пустая страница с
+    /// `next: None` значит «дочитано».
+    LibraryTracksPage { playlist: PlaylistId },
     Liked { provider: Option<String> },
     /// Домашняя лента рекомендаций; provider = None — из всех.
     Home { provider: Option<String> },
@@ -159,6 +168,11 @@ pub enum Payload {
     // что пары иначе уходят в `Tracks`.
     Ratings(Vec<(TrackId, Rating)>),
     Tracks(Vec<Track>),
+    /// Страница ленивой догрузки состава: свежие треки и курсор
+    /// следующей страницы. `next: None` — плейлист дочитан. Безопасно
+    /// после `Tracks`: объект с обязательным `next` не декодируется как
+    /// массив треков.
+    TracksPage { tracks: Vec<Track>, next: Option<String> },
     Playlists(Vec<crate::model::Playlist>),
     // Полка домашней ленты безопасна после Playlists: {title, subtitle,
     // items} структурно не матчится ни с Results (нет тега kind), ни с

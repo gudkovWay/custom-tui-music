@@ -186,6 +186,10 @@ impl App {
                 self.play_playlist(&playlist, start.unwrap_or(0)).await?;
                 Ok(Payload::Ack(Ack::default()))
             }
+            Cmd::PlayContext { tracks, start } => {
+                self.play_context(tracks, start).await?;
+                Ok(Payload::Ack(Ack::default()))
+            }
             Cmd::Toggle => {
                 // Медиа-клавиша play/pause обязана что-то делать в любом
                 // статусе: на Stopped в пустом mpv пауза — тихий нооп.
@@ -193,7 +197,9 @@ impl App {
                 match state.status {
                     PlaybackStatus::Playing => self.player.mpv().pause(true).await?,
                     PlaybackStatus::Stopped => match state.track {
-                        Some(track) => self.play_track(&track.id).await?,
+                        // Трек из `state` берётся из очереди по индексу,
+                        // значит он там гарантированно есть.
+                        Some(track) => self.play_known(&track.id).await?,
                         None => return Ok(Payload::Ack(Ack::default())),
                     },
                     PlaybackStatus::Paused => self.player.mpv().pause(false).await?,
@@ -345,7 +351,9 @@ impl App {
                     .await;
                 match track {
                     Some(track) => {
-                        self.play_track(&track.id).await?;
+                        // Позицию только что подтвердил `goto`, повторно
+                        // искать и двигать очередь не нужно.
+                        self.play_known(&track.id).await?;
                         Ok(Payload::Ack(Ack::default()))
                     }
                     None => anyhow::bail!("в очереди нет позиции {index}"),
@@ -374,6 +382,11 @@ impl App {
                 let out = self.playlist_tracks(&playlist).await?;
                 release_memory();
                 Ok(Payload::Tracks(out))
+            }
+            Cmd::LibraryTracksPage { playlist } => {
+                let (tracks, next) = self.playlist_tracks_page(&playlist).await?;
+                release_memory(); // тот же мегабайтный JSON продолжений, что и у LibraryTracks
+                Ok(Payload::TracksPage { tracks, next })
             }
             Cmd::Liked { provider } => {
                 let out = self.liked(provider.as_deref()).await?;
@@ -465,30 +478,28 @@ impl App {
 
     // ────────────────────────────────────────────────── внутреннее
 
+    /// Однотрековый контекст: очередь заменяется единственным треком.
+    ///
+    /// Раньше незнакомый трек дописывался в конец очереди, и трек из
+    /// поиска жил позицией ~1001 в очереди старого плейлиста — next/prev
+    /// продолжали играть старый контекст. Утверждённое решение: любой
+    /// поштучный запуск — это новый контекст из одного трека.
     async fn play_track(&self, id: &TrackId) -> anyhow::Result<()> {
-        // Трек обязан оказаться в очереди, даже если его включили
-        // поштучно. `Player::state()` берёт текущий трек из очереди по
-        // индексу, и без этого `tmus play <id>` играл бы «в никуда»:
+        // `Player::state()` берёт текущий трек из очереди по индексу, и
+        // без добавления в очередь `tmus play <id>` играл бы «в никуда»:
         // музыка идёт, а `status`, MPRIS и Discord показывают пустоту.
         // Замерено на стенде.
-        let known = self.player.with_queue(|q| q.find_index(id)).await;
-        match known {
-            Some(index) => {
-                self.player.with_queue(|q| q.goto(index)).await;
-            }
-            None => {
-                let track = self.hydrate(std::slice::from_ref(id))?.remove(0);
-                let index = self
-                    .player
-                    .with_queue(|q| {
-                        q.append(track);
-                        q.len() - 1
-                    })
-                    .await;
-                self.player.with_queue(|q| q.goto(index)).await;
-            }
-        }
-
+        let track = self.hydrate(std::slice::from_ref(id))?.remove(0);
+        let len = self
+            .player
+            .with_queue(|q| {
+                q.clear();
+                q.append(track);
+                q.goto(0);
+                q.len()
+            })
+            .await;
+        self.emit(Event::QueueChanged { len, index: Some(0) });
         self.player.resolve_and_play(id).await?;
         // События о смене трека не шлём отсюда: плеер уже дал сигнал
         // вахтёру, а тот — единственный, кто сравнивает состояние с
@@ -497,6 +508,42 @@ impl App {
         // двойную перерисовку бара, причём первый кадр — без
         // длительности, которую mpv сообщает позже.
         Ok(())
+    }
+
+    /// Запуск трека, который гарантированно уже в очереди: только
+    /// навигация и резолв, очередь не трогаем.
+    async fn play_known(&self, id: &TrackId) -> anyhow::Result<()> {
+        let index = match self.player.with_queue(|q| q.find_index(id)).await {
+            Some(index) => index,
+            None => anyhow::bail!("трека {id} нет в очереди"),
+        };
+        self.player.with_queue(|q| q.goto(index)).await;
+        self.player.resolve_and_play(id).await?;
+        Ok(())
+    }
+
+    /// Контекст из готового списка треков — обобщение `play_playlist`
+    /// без чтения плейлиста: список приносит сам клиент.
+    async fn play_context(&self, ids: Vec<TrackId>, start: usize) -> anyhow::Result<()> {
+        if ids.is_empty() {
+            anyhow::bail!("пустой контекст воспроизведения");
+        }
+        let start = start.min(ids.len() - 1);
+        let current = ids[start].clone();
+        let tracks = self.hydrate(&ids)?;
+        let len = self
+            .player
+            .with_queue(|q| {
+                q.clear();
+                for track in tracks {
+                    q.append(track);
+                }
+                q.goto(start);
+                q.len()
+            })
+            .await;
+        self.emit(Event::QueueChanged { len, index: Some(start) });
+        self.play_known(&current).await
     }
 
     async fn play_playlist(&self, id: &PlaylistId, start: usize) -> anyhow::Result<()> {
@@ -518,7 +565,9 @@ impl App {
             })
             .await;
         self.emit(Event::QueueChanged { len, index: Some(start) });
-        self.play_track(&first).await
+        // Трек уже поставлен в очередь выше: `play_track` здесь нельзя —
+        // он теперь заменяет очередь однотрековым контекстом.
+        self.play_known(&first).await
     }
 
     /// Шаг по очереди. Отдельно от `Cmd::Next`, потому что то же нужно
@@ -608,9 +657,14 @@ mod tests {
         /// Журнал плейлистных вызовов: тесты проверяют не только ответ,
         /// но и что вызов дошёл до провайдера с правильными аргументами.
         playlist_calls: std::sync::Mutex<Vec<String>>,
+        /// Постраничные данные состава: страница по индексу курсора.
+        pages: std::sync::Mutex<Vec<Vec<Track>>>,
     }
 
     impl FakeProvider {
+        fn set_pages(&self, pages: Vec<Vec<Track>>) {
+            *self.pages.lock().expect("pages") = pages;
+        }
         fn record(&self, call: &str) {
             self.playlist_calls.lock().expect("calls").push(call.to_owned());
         }
@@ -661,6 +715,26 @@ mod tests {
             _playlist: &tmus_core::model::PlaylistId,
         ) -> Result<Vec<Track>, ProviderError> {
             Ok(Vec::new())
+        }
+        /// Курсор — индекс страницы строкой: токен "3" открывает
+        /// `pages[3]`, None — `pages[0]`. `next` указывает на следующую
+        /// страницу или отсутствует на последней.
+        async fn playlist_tracks_page(
+            &self,
+            _playlist: &tmus_core::model::PlaylistId,
+            cursor: Option<&str>,
+        ) -> Result<tmus_provider::TrackPage, ProviderError> {
+            let idx: usize = match cursor {
+                None => 0,
+                Some(token) => token.parse().map_err(|_| ProviderError::Format {
+                    provider: self.id,
+                    reason: format!("плохой курсор {token}"),
+                })?,
+            };
+            let pages = self.pages.lock().expect("pages");
+            let tracks = pages.get(idx).cloned().unwrap_or_default();
+            let next = (idx + 1 < pages.len()).then(|| (idx + 1).to_string());
+            Ok(tmus_provider::TrackPage { tracks, next })
         }
         async fn liked(&self) -> Result<Vec<Track>, ProviderError> {
             Ok(Vec::new())
@@ -807,6 +881,7 @@ mod tests {
             fail_rate: AtomicBool::new(fail_rate),
             fail_playlist: AtomicBool::new(fail_playlist),
             playlist_calls: std::sync::Mutex::new(Vec::new()),
+            pages: std::sync::Mutex::new(Vec::new()),
         });
         registry.insert(Arc::clone(&provider) as Arc<dyn Provider>);
         let gate = Arc::new(tokio::sync::Semaphore::new(2));
@@ -869,7 +944,7 @@ mod tests {
                 q.append(sample_track(&second));
             })
             .await;
-        app.play_track(&first).await.expect("play");
+        app.play_known(&first).await.expect("play");
         assert_eq!(
             app.player.state().await.track.map(|t| t.id),
             Some(first.clone()),
@@ -1026,5 +1101,252 @@ mod tests {
             events.try_recv().is_err(),
             "при ошибке провайдера PlaylistsChanged вещаться не должен"
         );
+    }
+
+    /// Поштучный запуск — новый контекст из одного трека: очередь
+    /// старого плейлиста обязана уйти, а не дописаться хвостом.
+    #[tokio::test]
+    async fn play_track_replaces_queue_with_single_context() {
+        let (app, _dir) = app(false).await;
+        // Два трека старого контекста — как очередь после плейлиста.
+        app.player
+            .with_queue(|q| {
+                q.append(sample_track(&TrackId::new(ProviderId::YTMUSIC, "old-1")));
+                q.append(sample_track(&TrackId::new(ProviderId::YTMUSIC, "old-2")));
+            })
+            .await;
+        let outsider = TrackId::new(ProviderId::YTMUSIC, "vid-out");
+
+        app.handle(Cmd::PlayTrack { track: outsider.clone() }).await.expect("play");
+
+        let state = app.player.state().await;
+        assert_eq!(state.queue_len, 1, "очередь обязана замениться одним треком");
+        assert_eq!(state.queue_index, Some(0));
+        assert_eq!(state.track.map(|t| t.id), Some(outsider));
+    }
+
+    /// PlayContext: готовый список становится очередью, старт — с
+    /// указанного индекса.
+    #[tokio::test]
+    async fn play_context_builds_queue_and_starts_at_index() {
+        let (app, _dir) = app(false).await;
+        let ids: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|s| TrackId::new(ProviderId::YTMUSIC, *s))
+            .collect();
+
+        app.handle(Cmd::PlayContext { tracks: ids.clone(), start: 1 })
+            .await
+            .expect("context");
+
+        let state = app.player.state().await;
+        assert_eq!(state.queue_len, 3);
+        assert_eq!(state.queue_index, Some(1));
+        assert_eq!(state.track.map(|t| t.id), Some(ids[1].clone()));
+    }
+
+    /// QueueGoto после PlayContext двигает курсор, не трогая очередь.
+    #[tokio::test]
+    async fn queue_goto_after_play_context_moves_cursor_only() {
+        let (app, _dir) = app(false).await;
+        let ids: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|s| TrackId::new(ProviderId::YTMUSIC, *s))
+            .collect();
+        app.handle(Cmd::PlayContext { tracks: ids, start: 0 }).await.expect("context");
+
+        app.handle(Cmd::QueueGoto { index: 2 }).await.expect("goto");
+
+        let state = app.player.state().await;
+        assert_eq!(state.queue_len, 3, "goto не должен менять размер очереди");
+        assert_eq!(state.queue_index, Some(2));
+        assert_eq!(state.track.map(|t| t.id), Some(TrackId::new(ProviderId::YTMUSIC, "c")));
+    }
+
+    /// Пустой контекст — ошибка команды, очередь не трогается.
+    #[tokio::test]
+    async fn play_context_with_empty_list_is_err() {
+        let (app, _dir) = app(false).await;
+        assert!(
+            app.handle(Cmd::PlayContext { tracks: Vec::new(), start: 0 })
+                .await
+                .is_err()
+        );
+    }
+
+    /// Страница из `n` треков с последовательными id "v0".."v{n-1}".
+    fn page_of(base: usize, n: usize) -> Vec<Track> {
+        (base..base + n)
+            .map(|i| sample_track(&TrackId::new(ProviderId::YTMUSIC, format!("v{i}"))))
+            .collect()
+    }
+
+    /// Полное чтение после протухания кладёт в кэш ВСЕ страницы, а курсор
+    /// остаётся на токене после последней взятой страницы: батч-потолок
+    /// не съедает хвост плейлиста — он остаётся доступен догрузке.
+    #[tokio::test]
+    async fn stale_playlist_tracks_reads_all_pages_and_keeps_cursor() {
+        let (app, provider, _dir) = app_full(false, false).await;
+        // 11 страниц по треку: PLAYLIST_BATCH_PAGES=10 заберёт первые
+        // десять, курсор обязан запомниться на "10".
+        provider.set_pages((0..11).map(|i| page_of(i, 1)).collect());
+        let playlist = PlaylistId::new(ProviderId::YTMUSIC, "LM");
+
+        let out = app.playlist_tracks(&playlist).await.expect("full read");
+        assert_eq!(out.len(), 10, "батч обязан взять первые десять страниц");
+        assert_eq!(
+            app.with_cache(|c| c.playlist_tracks(&playlist)).expect("cached").len(),
+            10
+        );
+        assert_eq!(
+            app.with_cache(|c| c.playlist_continuation(playlist.provider.as_str(), &playlist))
+                .expect("cursor"),
+            Some("10".to_owned()),
+            "токен после последней взятой страницы обязан сохраниться"
+        );
+
+        // Догрузка добирает хвост: позиции продолжаются, затем
+        // исчерпание даёт пустую страницу с next=None.
+        let (first, next) = app
+            .playlist_tracks_page(&playlist)
+            .await
+            .expect("page 10");
+        assert_eq!(first.len(), 1);
+        assert_eq!(next, None);
+        let cached = app
+            .with_cache(|c| c.playlist_tracks(&playlist))
+            .expect("cached");
+        assert_eq!(cached.len(), 11);
+        assert_eq!(cached[10].id.id, "v10", "догруженная страница встала в конец");
+        assert_eq!(
+            app.with_cache(|c| c.playlist_continuation(playlist.provider.as_str(), &playlist))
+                .expect("cursor"),
+            None,
+            "после исчерпания курсор обязан быть стёрт"
+        );
+    }
+
+    /// Полное чтение с исчерпанием фиксирует «дочитано»: курсор None.
+    #[tokio::test]
+    async fn full_read_to_exhaustion_clears_cursor() {
+        let (app, provider, _dir) = app_full(false, false).await;
+        provider.set_pages(vec![page_of(0, 2), page_of(2, 1)]);
+        let playlist = PlaylistId::new(ProviderId::YTMUSIC, "PL1");
+
+        let out = app.playlist_tracks(&playlist).await.expect("full read");
+        assert_eq!(out.len(), 3);
+        assert_eq!(
+            app.with_cache(|c| c.playlist_continuation(playlist.provider.as_str(), &playlist))
+                .expect("cursor"),
+            None,
+            "исчерпанный плейлист обязан быть помечен дочитанным"
+        );
+    }
+
+    /// LibraryTracksPage без курсора — пустая страница (панель
+    /// прекратит догрузку).
+    #[tokio::test]
+    async fn library_tracks_page_without_cursor_is_empty() {
+        let (app, _provider, _dir) = app_full(false, false).await;
+        let playlist = PlaylistId::new(ProviderId::YTMUSIC, "PL1");
+        match app.handle(Cmd::LibraryTracksPage { playlist }).await.expect("page") {
+            Payload::TracksPage { tracks, next } => {
+                assert!(tracks.is_empty());
+                assert_eq!(next, None);
+            }
+            other => panic!("неожиданный ответ: {other:?}"),
+        }
+    }
+
+    /// Полный путь догрузки через IPC: страницы аппендятся с
+    /// продолжающимися позициями, курсор движется, исчерпание даёт
+    /// пустую страницу.
+    #[tokio::test]
+    async fn library_tracks_page_appends_and_advances_cursor() {
+        let (app, provider, _dir) = app_full(false, false).await;
+        // 12 страниц: полное чтение берёт десять, дальше — три догрузки.
+        provider.set_pages((0..12).map(|i| page_of(i, 1)).collect());
+        let playlist = PlaylistId::new(ProviderId::YTMUSIC, "LM");
+
+        app.handle(Cmd::LibraryTracks { playlist: playlist.clone() })
+            .await
+            .expect("full read");
+
+        let payload = app
+            .handle(Cmd::LibraryTracksPage { playlist: playlist.clone() })
+            .await
+            .expect("page");
+        match payload {
+            Payload::TracksPage { tracks, next } => {
+                assert_eq!(tracks.len(), 1);
+                assert_eq!(tracks[0].id.id, "v10");
+                assert_eq!(next, Some("11".to_owned()));
+            }
+            other => panic!("неожиданный ответ: {other:?}"),
+        }
+        let payload = app
+            .handle(Cmd::LibraryTracksPage { playlist: playlist.clone() })
+            .await
+            .expect("page");
+        match payload {
+            Payload::TracksPage { tracks, next } => {
+                assert_eq!(tracks[0].id.id, "v11");
+                assert_eq!(next, None);
+            }
+            other => panic!("неожиданный ответ: {other:?}"),
+        }
+
+        let cached = app
+            .with_cache(|c| c.playlist_tracks(&playlist))
+            .expect("cached");
+        assert_eq!(cached.len(), 12, "догруженные страницы обязаны попасть в кэш");
+        let ids: Vec<_> = cached.iter().map(|t| t.id.id.clone()).collect();
+        let expected: Vec<_> = (0..12).map(|i| format!("v{i}")).collect();
+        assert_eq!(ids, expected, "позиции страниц обязаны продолжиться по порядку");
+
+        // Повторный вызов после исчерпания — пусто, без похода в сеть.
+        let payload = app
+            .handle(Cmd::LibraryTracksPage { playlist })
+            .await
+            .expect("page");
+        match payload {
+            Payload::TracksPage { tracks, next } => {
+                assert!(tracks.is_empty());
+                assert_eq!(next, None);
+            }
+            other => panic!("неожиданный ответ: {other:?}"),
+        }
+    }
+
+    /// forget_playlist_sync затирает курсор вместе со строкой sync:
+    /// после него догрузка обязана считаться «дочитанной» (пусто, None).
+    #[tokio::test]
+    async fn forget_playlist_sync_clears_cursor() {
+        let (app, provider, _dir) = app_full(false, false).await;
+        provider.set_pages((0..11).map(|i| page_of(i, 1)).collect());
+        let playlist = PlaylistId::new(ProviderId::YTMUSIC, "LM");
+        app.playlist_tracks(&playlist).await.expect("full read");
+        assert!(
+            app.with_cache(|c| c.playlist_continuation(playlist.provider.as_str(), &playlist))
+                .expect("cursor")
+                .is_some(),
+            "перед forget курсор обязан существовать"
+        );
+
+        app.with_cache(|c| c.forget_playlist_sync(&playlist))
+            .expect("forget");
+
+        assert_eq!(
+            app.with_cache(|c| c.playlist_continuation(playlist.provider.as_str(), &playlist))
+                .expect("cursor"),
+            None,
+            "курсор обязан сброситься вместе со строкой sync"
+        );
+        let (tracks, next) = app
+            .playlist_tracks_page(&playlist)
+            .await
+            .expect("page");
+        assert!(tracks.is_empty());
+        assert_eq!(next, None);
     }
 }
