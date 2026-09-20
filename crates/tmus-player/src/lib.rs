@@ -111,6 +111,33 @@ struct Inner {
     /// резолва), и честный `Stopped` в этот момент виден человеку
     /// вспышкой «■ остановлено» в баре.
     advancing: std::sync::atomic::AtomicBool,
+    /// Сколько треков подряд не сыграли (`PlaybackFailed`). Защита от
+    /// выжженной очереди: при общем сбое (волна 403 от 20.09) авто-переход
+    /// без потолка промотал бы тысячу треков в тишину за минуты. Сбрасывается,
+    /// когда трек реально заиграл (`Position` > 0 — отказ приходит уже ПОСЛЕ
+    /// `loadfile`, поэтому сам факт загрузки успехом не считается) или
+    /// дослушан до конца (`EndOfFile`).
+    failure_streak: std::sync::atomic::AtomicU32,
+}
+
+/// Потолок авто-переходов при неудачах подряд: три перехода допустимы
+/// (единичный битый файл и пара соседних — не повод вставать), четвёртая
+/// неудача подряд останавливает плеер с видимой причиной. Без потолка
+/// общий сбой промотал бы всю очередь в тишину.
+const MAX_AUTO_SKIPS: u32 = 3;
+
+/// Решение после отказа воспроизведения: промотать дальше или встать.
+enum FailureAction {
+    Advance,
+    Stop,
+}
+
+fn failure_action(streak: u32) -> FailureAction {
+    if streak <= MAX_AUTO_SKIPS {
+        FailureAction::Advance
+    } else {
+        FailureAction::Stop
+    }
 }
 
 /// Собрать lavfi-граф эквалайзера для mpv-фильтра `af`.
@@ -194,6 +221,7 @@ impl Player {
                 skip_settle: tokio::sync::Mutex::new(None),
                 changed: tokio::sync::Notify::new(),
                 advancing: std::sync::atomic::AtomicBool::new(false),
+                failure_streak: std::sync::atomic::AtomicU32::new(0),
             }),
         };
         tokio::spawn(Player::clone(&player).run(events));
@@ -588,6 +616,14 @@ impl Player {
             match event {
                 MpvEvent::Position { position } => {
                     *self.inner.position.lock().await = Some(position);
+                    // Трек реально заиграл: отказ приходит после `loadfile`,
+                    // поэтому загрузка сама по себе счётчиком не считается —
+                    // сброс только по факту слышимого звука.
+                    if position > std::time::Duration::ZERO {
+                        self.inner
+                            .failure_streak
+                            .store(0, std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
                 MpvEvent::Duration(duration) => {
                     *self.inner.duration.lock().await = Some(duration);
@@ -611,7 +647,13 @@ impl Player {
                     *self.inner.status.lock().await = status;
                     self.inner.changed.notify_one();
                 }
-                MpvEvent::EndOfFile => self.on_track_end().await,
+                // Дослушан до конца — успех, потолок неудач начинается заново.
+                MpvEvent::EndOfFile => {
+                    self.inner
+                        .failure_streak
+                        .store(0, std::sync::atomic::Ordering::SeqCst);
+                    self.on_track_end().await
+                },
                 MpvEvent::PlaybackFailed { reason } => {
                     // Причина привязывается к текущему треку из `current`:
                     // это тот файл, который mpv отказался играть. Не
@@ -627,6 +669,24 @@ impl Player {
                     *self.inner.last_error.lock().await = Some(reason);
                     *self.inner.status.lock().await = PlaybackStatus::Stopped;
                     self.inner.changed.notify_one();
+                    // Авто-переход: единичный битый файл не должен рушить
+                    // прослушивание, но и молча жечь очередь нельзя —
+                    // поэтому потолок (`MAX_AUTO_SKIPS`), а не бесконечная
+                    // промотка.
+                    let streak = self
+                        .inner
+                        .failure_streak
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1;
+                    match failure_action(streak) {
+                        FailureAction::Advance => {
+                            tracing::warn!(track = %track, streak, "трек не сыграл — перехожу к следующему");
+                            self.on_track_end().await;
+                        }
+                        FailureAction::Stop => {
+                            tracing::warn!("подряд не сыграли {} треков — останавливаюсь", streak);
+                        }
+                    }
                 }
                 MpvEvent::Idle => {
                     // `idle` после stop или неудачной загрузки — это
@@ -742,6 +802,23 @@ impl Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Границы потолка авто-переходов: три неудачи подряд ещё переходят к
+    /// следующему треку (единичный битый файл и пара соседних), четвёртая —
+    /// остановка. Это ровно то, что обещает README.
+    #[test]
+    fn failure_action_advances_within_limit() {
+        assert!(matches!(failure_action(0), FailureAction::Advance));
+        assert!(matches!(failure_action(1), FailureAction::Advance));
+        assert!(matches!(failure_action(2), FailureAction::Advance));
+        assert!(matches!(failure_action(3), FailureAction::Advance));
+    }
+
+    #[test]
+    fn failure_action_stops_after_limit() {
+        assert!(matches!(failure_action(4), FailureAction::Stop));
+        assert!(matches!(failure_action(5), FailureAction::Stop));
+    }
 
     /// Выключенный эквалайзер обязан давать пустой `af`: фильтр с
     /// нулевыми усилениями продолжал бы тратить CPU без смысла.
