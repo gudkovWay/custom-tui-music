@@ -41,6 +41,13 @@ pub enum MpvEvent {
     Duration(Duration),
     Paused(bool),
     EndOfFile,
+    /// mpv отказался играть файл по своей причине (HTTP 403 по ссылке,
+    /// нераскрываемый формат и т.п.). Об отказе mpv сообщает НЕ
+    /// синхронным ответом на `loadfile` (тот отвечает ok), а асинхронным
+    /// `end-file` с `reason != eof/stop/quit` — до 20.09.2026 эти
+    /// события молча глотались, и человек видел трек с `--:--` и тишину
+    /// без единой строки в журнале демона.
+    PlaybackFailed { reason: String },
     /// mpv ушёл в idle: плейлист кончился или файл не загрузился.
     Idle,
     /// Супервизор перезапустил упавший процесс. Наружу состояние
@@ -206,7 +213,23 @@ fn map_event(name: &str, data: &Value) -> Option<MpvEvent> {
         }
         "end-file" => match data.get("reason").and_then(Value::as_str) {
             Some("eof") => Some(MpvEvent::EndOfFile),
-            _ => None,
+            // stop/quit — человек или демон; redirect — штатный переезд,
+            // mpv сам догрузит по новому адресу. Их сюда: превращение в
+            // «сбой» останавливало бы переход по очереди.
+            Some("stop") | Some("quit") | Some("redirect") | None => None,
+            // Остальное (error, unsupported и т.п.) — реальный отказ на
+            // стороне mpv. Текст ошибки mpv кладёт в поле `error`/
+            // `file_error` только иногда, поэтому падаем на текст из
+            // самого reason.
+            Some(reason) => {
+                let detail = data
+                    .get("error")
+                    .or_else(|| data.get("file_error"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("end-file: {reason}"));
+                Some(MpvEvent::PlaybackFailed { reason: detail })
+            }
         },
         "idle" => Some(MpvEvent::Idle),
         _ => None,
@@ -759,7 +782,7 @@ mod tests {
 
     #[test]
     fn end_file_other_reasons_do_not_advance() {
-        for reason in ["stop", "quit", "error", "redirect", "unknown"] {
+        for reason in ["stop", "quit", "redirect"] {
             let event = map_event(
                 "end-file",
                 &json!({"event":"end-file","reason":reason,"playlist_entry_id":1}),
@@ -770,6 +793,34 @@ mod tests {
             map_event("end-file", &json!({"event":"end-file","playlist_entry_id":1})),
             None,
             "отсутствие reason не должен давать EndOfFile"
+        );
+    }
+
+    #[test]
+    fn end_file_error_maps_to_playback_failed() {
+        // Текст ошибки берётся из поля `error`, если mpv его прислал.
+        assert_eq!(
+            map_event(
+                "end-file",
+                &json!({"event":"end-file","reason":"error","error":"HTTP 403","playlist_entry_id":1}),
+            ),
+            Some(MpvEvent::PlaybackFailed { reason: "HTTP 403".into() })
+        );
+        // Без текста падаем на сам reason.
+        assert_eq!(
+            map_event(
+                "end-file",
+                &json!({"event":"end-file","reason":"error","playlist_entry_id":1}),
+            ),
+            Some(MpvEvent::PlaybackFailed { reason: "end-file: error".into() })
+        );
+        // Альтернативное поле `file_error` тоже читается.
+        assert_eq!(
+            map_event(
+                "end-file",
+                &json!({"event":"end-file","reason":"error","file_error":"no codec","playlist_entry_id":1}),
+            ),
+            Some(MpvEvent::PlaybackFailed { reason: "no codec".into() })
         );
     }
 

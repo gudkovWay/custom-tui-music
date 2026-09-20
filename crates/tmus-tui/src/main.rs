@@ -547,7 +547,15 @@ fn format_payload(payload: &Payload) -> String {
                 .unwrap_or_else(|| "—".to_owned());
             let pos = fmt_time(s.position.map(|d| d.as_secs()));
             let dur = fmt_time(s.duration.map(|d| d.as_secs()));
-            format!("{track} [{:?}] {pos}/{dur} vol={}{}", s.status, s.volume.round() as u64, if s.shuffle { " shuffle" } else { "" })
+            // Причина последнего сбоя воспроизведения (403 от
+            // googlevideo и т.п.): без неё отказ mpv выглядел в тексте
+            // как обычное «stopped» — тишина без объяснений.
+            let err = s
+                .last_error
+                .as_deref()
+                .map(|e| format!(" error={e}"))
+                .unwrap_or_default();
+            format!("{track} [{:?}] {pos}/{dur} vol={}{}{}", s.status, s.volume.round() as u64, if s.shuffle { " shuffle" } else { "" }, err)
         }
         Payload::Queue(q) => q
             .tracks

@@ -224,6 +224,13 @@ pub struct PlayerState {
     /// написанные до появления эквалайзера, продолжали парситься.
     #[serde(default)]
     pub equalizer: EqState,
+    /// Причина последнего сбоя воспроизведения (HTTP 403 от googlevideo
+    /// и т.п.). Ставится при асинхронном отказе mpv (`end-file` с
+    /// reason вне eof/stop/quit), сбрасывается при успешной загрузке
+    /// следующего трека. `default` — чтобы старые клиенты без знания об
+    /// этом поле продолжали разбирать снапшоты, как с equalizer.
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -573,6 +580,24 @@ mod tests {
         assert!(with.equalizer.enabled);
         assert_eq!(with.equalizer.preset, "Bass Boost");
         assert_eq!(with.equalizer.bands[0], 6.0);
+    }
+
+    #[test]
+    fn player_state_last_error_is_backward_compatible() {
+        // Снапшот старого демона без last_error обязан парситься.
+        let without: PlayerState = serde_json::from_str(
+            r#"{"status":"stopped","volume":70.0,"loop_mode":"none","shuffle":false,"queue_len":0,"offline":false}"#,
+        )
+        .expect("снапшот без last_error обязан парситься");
+        assert_eq!(without.last_error, None);
+
+        // И поле обязано уходить в провод при наличии.
+        let mut with = PlayerState { last_error: Some("HTTP 403".into()), ..Default::default() };
+        with.status = crate::model::PlaybackStatus::Stopped;
+        let json = serde_json::to_string(&with).expect("serialize");
+        assert!(json.contains(r#""last_error":"HTTP 403""#), "json={json}");
+        let back: PlayerState = serde_json::from_str(&json).expect("roundtrip");
+        assert_eq!(back.last_error.as_deref(), Some("HTTP 403"));
     }
 
     #[test]

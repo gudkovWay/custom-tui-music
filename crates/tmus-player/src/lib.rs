@@ -48,6 +48,11 @@ struct Inner {
     /// `state()`, и для слияния частичных команд Equalizer.
     equalizer: Mutex<EqState>,
     status: Mutex<PlaybackStatus>,
+    /// Причина последнего сбоя воспроизведения, отдаётся в
+    /// `PlayerState.last_error`. Ставится при `PlaybackFailed`, чистится
+    /// при успешном `mpv.load` — нечистая причина липла бы к чужим
+    /// трекам и выглядела как сбой там, где всё играет.
+    last_error: Mutex<Option<String>>,
     /// Трек, КОТОРЫЙ ЗАПРОШЕН, но ещё не загружен в mpv. `current`
     /// обновляется только после `mpv.load`, и без этого поля бар
     /// показывал бы старый трек все секунды резолва — человек нажал
@@ -170,6 +175,7 @@ impl Player {
                 // персист (сохранённое состояние).
                 equalizer: Mutex::new(EqState::default()),
                 status: Mutex::new(PlaybackStatus::Stopped),
+                last_error: Mutex::new(None),
                 pending: Mutex::new(None),
                 preloaded: Mutex::new(None),
                 play_gen,
@@ -229,6 +235,10 @@ impl Player {
         *self.inner.position.lock().await = None;
         *self.inner.duration.lock().await = None;
         self.inner.mpv.load(&source).await?;
+        // Загрузка прошла — прошлый сбой больше не характеризует
+        // состояние плеера: иначе причина 403 от мёртвой ссылки висела
+        // бы в `tmus status` до конца сессии.
+        *self.inner.last_error.lock().await = None;
         // Паузу обязаны снять явно: `pause` у mpv глобальный и
         // `loadfile` его не сбрасывает. Без этого пауза (панель,
         // медиа-клавиша, `Space` в TUI) плюс любая смена трека давали
@@ -467,6 +477,7 @@ impl Player {
             queue_index: index,
             queue_len: queue.len(),
             offline,
+            last_error: self.inner.last_error.lock().await.clone(),
         }
     }
 
@@ -588,6 +599,22 @@ impl Player {
                     self.inner.changed.notify_one();
                 }
                 MpvEvent::EndOfFile => self.on_track_end().await,
+                MpvEvent::PlaybackFailed { reason } => {
+                    // Причина привязывается к текущему треку из `current`:
+                    // это тот файл, который mpv отказался играть. Не
+                    // выдумываем «играет другой трек» — после отказа mpv
+                    // ничего не играет, `current` ещё держит упавший.
+                    let current = self.inner.current.lock().await;
+                    let track = current
+                        .as_ref()
+                        .map(|c| c.track_id.to_string())
+                        .unwrap_or_else(|| "?".to_owned());
+                    drop(current);
+                    tracing::warn!(track = %track, reason = %reason, "воспроизведение прервалось на стороне mpv");
+                    *self.inner.last_error.lock().await = Some(reason);
+                    *self.inner.status.lock().await = PlaybackStatus::Stopped;
+                    self.inner.changed.notify_one();
+                }
                 MpvEvent::Idle => {
                     // `idle` после stop или неудачной загрузки — это
                     // остановка, а конец трека несёт `end-file`
