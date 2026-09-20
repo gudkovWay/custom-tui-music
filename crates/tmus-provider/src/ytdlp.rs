@@ -10,8 +10,11 @@
 //! - `--flat-playlist` на плейлисте лайков YTM → 1.36 с.
 //!
 //! Грабли, учтённые здесь:
-//! - `player_client` обязан быть запинен вызывающим в `web_music`: дефолт
-//!   yt-dlp уходит в `web_creator`, URL резолвится, а GET по нему даёт 403;
+//! - `player_client` обязан быть запинен вызывающим: дефолт yt-dlp уходит
+//!   в `web_creator`, URL резолвится, а GET по нему даёт 403. С волны
+//!   403 от googlevideo (20.09.2026, yt-dlp #17682/#17705) пинится уже
+//!   цепочка клиентов — см. `YtMusic::resolve`; здесь хелпер про то,
+//!   как честно дождаться/убить процесс;
 //! - из заголовков ответа берётся ТОЛЬКО `User-Agent` — см. комментарий
 //!   в [`parse_media`];
 //! - ссылка потока живёт ~6 ч (`expire=`), поэтому кэшировать URL нельзя
@@ -21,6 +24,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -112,32 +116,71 @@ impl YtDlp {
             // 0.9 CPU-с и 335 МБ на процесс, замерено 18.09.2026.
             .kill_on_drop(true);
 
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .map_err(|e| ProviderError::Tool {
                 tool: "yt-dlp",
                 reason: format!("не удалось запустить {}: {e}", self.binary.display()),
             })?;
 
-        let output = timeout(self.timeout, child.wait_with_output())
-            .await
-            .map_err(|_| ProviderError::Tool {
-                tool: "yt-dlp",
-                reason: format!(
-                    "yt-dlp не ответил за {}с",
-                    self.timeout.as_secs()
-                ),
-            })?
-            .map_err(|e| ProviderError::Tool {
+        // stdout/stderr забираются из child ДО ожидания и читаются
+        // конкурентно: `wait_with_output` под timeout при срабатывании
+        // дропал child вместе с незачитанными пайпами — процесс убивался
+        // kill_on_drop, но не реапился (в журнале: зомби yt-dlp, Stat Z,
+        // 3 ч 23 мин, RSS 0, 20.09.2026). Конкурентное чтение здесь ещё и
+        // от дедлока: `-J`-ответ — мегабайты, пайп (64 КиБ) забивается,
+        // yt-dlp висит на записи, а мы на wait() — классический тупик,
+        // если читать stdout только после завершения.
+        let mut stdout_pipe = child
+            .stdout
+            .take()
+            .expect("stdout запрошен пайпом при спавне");
+        let mut stderr_pipe = child
+            .stderr
+            .take()
+            .expect("stderr запрошен пайпом при спавне");
+        let stdout_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = stdout_pipe.read_to_end(&mut buf).await;
+            buf
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = stderr_pipe.read_to_end(&mut buf).await;
+            buf
+        });
+
+        let status = match timeout(self.timeout, child.wait()).await {
+            Ok(status) => status.map_err(|e| ProviderError::Tool {
                 tool: "yt-dlp",
                 reason: format!("сбой ввода-вывода: {e}"),
-            })?;
+            })?,
+            Err(_) => {
+                // kill_on_drop дропнутого child не реапит: убитый процесс
+                // остаётся зомби, пока жив родитель. Поэтому явные
+                // kill + wait — пара гарантирует, что потомка нет и в
+                // таблице процессов.
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(ProviderError::Tool {
+                    tool: "yt-dlp",
+                    reason: format!("yt-dlp не ответил за {}с", self.timeout.as_secs()),
+                });
+            }
+        };
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = stdout_task
+            .await
+            .expect("задача чтения stdout не может запаниковать");
+        let stderr = stderr_task
+            .await
+            .expect("задача чтения stderr не может запаниковать");
+
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr);
             return Err(stderr_error(provider, &stderr));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok(String::from_utf8_lossy(&stdout).into_owned())
     }
 
     /// Чистая функция: `YtDlpMedia` → `StreamSource`. Без io, чтобы
@@ -316,11 +359,13 @@ mod tests {
         let cookies = tmus_core::cookies::CookieSource::Browser {
             spec: "chromium:/home/user/.config/ytm/profile".into(),
         };
+        // Клиент в тесте — первый из цепочки резолва (web_embedded):
+        // единственный переживший волну 403 от googlevideo 20.09.2026.
         let req = YtDlpRequest {
             provider: YTM,
-            page_url: "https://music.youtube.com/watch?v=abc",
+            page_url: "https://www.youtube.com/watch?v=abc",
             format: "bestaudio[acodec=opus]/bestaudio",
-            extractor_args: &["youtube:player_client=web_music"],
+            extractor_args: &["youtube:player_client=web_embedded"],
             cookies: Some(&cookies),
         };
 
@@ -333,11 +378,48 @@ mod tests {
 
         // extractor_args идут парами флаг+значение; cookies-аргументы присутствуют.
         assert!(args.windows(2).any(|w| w[0] == "--extractor-args"
-            && w[1] == "youtube:player_client=web_music"));
+            && w[1] == "youtube:player_client=web_embedded"));
         assert!(args
             .windows(2)
             .any(|w| w[0] == "--cookies-from-browser"
                 && w[1].starts_with("chromium:")));
+    }
+
+    /// Таймаут обязан не только вернуть ошибку, но и не оставить
+    /// процесса: раньше брошенный `wait_with_output` убивал потомка
+    /// kill_on_drop без реапа — зомби yt-dlp жил в таблице процессов
+    /// часами (Stat Z, 3 ч 23 мин, 20.09.2026).
+    #[tokio::test]
+    async fn timeout_kills_and_reaps_child() {
+        let dlp = YtDlp::new(PathBuf::from("/bin/sleep")).timeout(Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        let err = dlp.run(&["30".into()], YTM).await.unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "таймаут должен сработать быстро, а не через 30 с"
+        );
+        match err {
+            ProviderError::Tool { tool, reason } => {
+                assert_eq!(tool, "yt-dlp");
+                assert!(reason.contains("не ответил"), "неожиданная причина: {reason}");
+            }
+            other => panic!("ожидался Tool, получен {other:?}"),
+        }
+        // sleep всё ещё в таблице процессов = kill/wait-пара не сработала.
+        // Даём ядру секунду добрать реап — SIGKILL мгновенный, но
+        // планировщик не мгновенный.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let zombies: Vec<String> = std::fs::read_dir("/proc")
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| std::fs::read_to_string(e.path().join("stat")).ok())
+            .filter(|stat| {
+                // поле 3 — состояние; имя в скобках может содержать
+                // пробелы, поэтому ищем с конца: ") Z"
+                stat.contains(") Z") && stat.contains("(sleep)")
+            })
+            .collect();
+        assert!(zombies.is_empty(), "остались зомби sleep: {zombies:?}");
     }
 
     #[test]
