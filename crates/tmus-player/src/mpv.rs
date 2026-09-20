@@ -471,6 +471,33 @@ impl Mpv {
     }
 }
 
+impl Drop for Inner {
+    // Страховочное гашение для владельцев, которые забыли позвать
+    // `shutdown()`: `cargo test --workspace` без него оставлял ~15 живых
+    // mpv на прогон (`/tmp/.tmp*/run/tmus-mpv.sock`, `--idle=yes`) — тесты
+    // роняют Player без явного `shutdown()`.
+    //
+    // Drop именно на `Inner`, а не на `Mpv`: `Mpv` — клонируемый
+    // дескриптор над общей `Arc<Inner>`, и Drop на первом же клоне убивал
+    // бы плеер живьём, пока остальные клоны ещё им пользуются.
+    //
+    // `kill` по pid, а не `Child::kill`: `Child` принадлежит задаче-
+    // супервизору и до Drop не доходит.
+    //
+    // `shutting_down` выставляется ДО сигнала: иначе ещё живой супервизор
+    // воспримет смерть mpv как падение и поднимет его заново — та же
+    // ловушка, от которой `shutdown()` защищается первым делом.
+    fn drop(&mut self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let pid = self.child_pid.load(Ordering::SeqCst);
+        if pid > 0 {
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+        }
+    }
+}
+
 impl Inner {
     /// Разослать всем ждущим командам закрытие соединения. Вызывается
     /// при смерти reader'а: иначе команда висела бы вечно.
