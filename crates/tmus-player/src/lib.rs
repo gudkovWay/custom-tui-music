@@ -86,7 +86,16 @@ struct Inner {
     preload_task: tokio::sync::Mutex<Option<(TrackId, tokio::task::JoinHandle<()>)>>,
     /// Отложенный запуск после серии скипов: очередь двигается сразу,
     /// а yt-dlp/loadfile — только после SETTLE покоя (см. `skip`).
-    skip_settle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    ///
+    /// Цель хранится рядом с хендлом по той же причине, что и у
+    /// [`Self::preload_task`]: `resolve_and_play` обязан гасить только
+    /// ЧУЖОЙ отложенный запуск. Без цели он гасил свой собственный —
+    /// settle-задача сама зовёт `resolve_and_play`, тот брал её же хендл
+    /// и делал `abort`: задача умирала на первом же ожидании, не дойдя ни
+    /// до резолва, ни до mpv. Внешне это выглядело как «нажал `n`/
+    /// медиа-клавишу — очередь сдвинулась, а трек не грузится» (найдено
+    /// живой проверкой на стенде 21.09.2026).
+    skip_settle: tokio::sync::Mutex<Option<(TrackId, tokio::task::JoinHandle<()>)>>,
     /// Пинг «состояние изменилось по событию mpv». Демон обязан узнать
     /// о смене трека и о приехавшей длительности сразу, а не следующим
     /// тиком опроса: замерено, бар до секунды рисовал `--:--` и
@@ -196,9 +205,13 @@ impl Player {
     pub async fn resolve_and_play(&self, track_id: &TrackId) -> Result<(), PlayerError> {
         let my_gen = self.next_generation();
         // Новая команда гасит отложенный запуск серии скипов: явный
-        // выбор важнее накопленных нажатий.
-        if let Some(handle) = self.inner.skip_settle.lock().await.take() {
-            handle.abort();
+        // выбор важнее накопленных нажатий. Свой (тот же трек) не гасим:
+        // этот вызов пришёл ИЗ него — `abort` собственного хендла убивал
+        // settle-задачу до резолва, и скип не играл (см. `skip_settle`).
+        if let Some((settling, handle)) = self.inner.skip_settle.lock().await.take() {
+            if &settling != track_id {
+                handle.abort();
+            }
         }
         // Чужая предзагрузка отменяется (её трек уже не следующий), своя
         // (этот же трек) доживает и положит результат в слот — иначе
@@ -501,7 +514,7 @@ impl Player {
         }
         .map(|t| t.id)?;
 
-        if let Some(handle) = self.inner.skip_settle.lock().await.take() {
+        if let Some((_, handle)) = self.inner.skip_settle.lock().await.take() {
             handle.abort();
         }
         let this = self.clone();
@@ -512,7 +525,7 @@ impl Player {
                 tracing::warn!(track = %target, error = %e, "скип не удался");
             }
         });
-        *self.inner.skip_settle.lock().await = Some(handle);
+        *self.inner.skip_settle.lock().await = Some((id.clone(), handle));
         Some(id)
     }
 
