@@ -694,6 +694,9 @@ local function npNode(s)
       ui.column({ key = "np-text", gap = 2, flexGrow = 1 }, {
         lbl(shorten(tostring(s.title or ""), 48), { key = "np-title", size = 15, color = COLORS.text }),
         lbl(shorten(tostring(s.artist or ""), 48), { key = "np-artist", size = 12, color = COLORS.muted }),
+        -- Причина отказа видна и без играющего трека — иначе она
+        -- нужна именно тогда, когда трека нет.
+        (tostring(s.lastError or "") ~= "") and lbl(shorten("! " .. tostring(s.lastError), 56), { key = "np-error", size = 11, color = COLORS.error }) or nil,
         lbl(#marks > 0 and table.concat(marks, " · ") or "", {
           key = "np-marks",
           size = 11,
@@ -736,6 +739,9 @@ local function npNode(s)
           size = 12,
           color = COLORS.muted,
         }),
+        -- Ошибка воспроизведения чаще всего остаётся при пустом треке —
+        -- без этой строки панель молчит там, где она нужнее всего.
+        (tostring(s.lastError or "") ~= "") and lbl(shorten("! " .. tostring(s.lastError), 56), { key = "np-error", size = 11, color = COLORS.error }) or nil,
       }),
     }))
   end

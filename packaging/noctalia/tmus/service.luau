@@ -26,6 +26,7 @@ local data = {
   loop = "none",
   shuffle = false,
   offline = false,
+  lastError = "",
   source = "all",
   providers = {},
   playlists = {},
@@ -278,6 +279,9 @@ local function applyState(state)
   data.loop = tostring(state.loop_mode or "none")
   data.shuffle = state.shuffle == true
   data.offline = state.offline == true
+  -- last_error шлёт только новый демон; старый молчит — поэтому or "",
+  -- как у equalizer выше.
+  data.lastError = tostring(state.last_error or "")
   data.queueLen = tonumber(state.queue_len) or 0
   data.queueIndex = tonumber(state.queue_index)
   -- Эквалайзер опционален: старый демон шлёт состояние без поля —
