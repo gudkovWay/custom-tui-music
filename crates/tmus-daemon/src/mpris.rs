@@ -460,6 +460,19 @@ async fn notify_state_changed(player_ref: &zbus::object_server::InterfaceRef<Pla
 }
 
 pub async fn run(app: Arc<App>) -> anyhow::Result<()> {
+    // ВАЖНО: zbus обязан быть собран с фичей `tokio` (корневой Cargo.toml).
+    // Без неё zbus работает на своём async-io executor'е, а хендлеры
+    // `#[zbus::interface]` исполняются в его потоках, где нет tokio-реактора
+    // — `tokio::spawn` в `Player::skip` (tmus-player/src/lib.rs:498, путь
+    // медиа-клавиши) паникует: «there is no reactor running». Снаружи это
+    // выглядит как молчаливый таймаут: `busctl --user call … Next` →
+    // «Call failed: Connection timed out», очередь не двигается
+    // (воспроизведено 21.09.2026). Выбора билдера не требуется:
+    // zbus 5.19 в `abstractions/mod.rs` (`select_runtime!`, `use_tokio()`)
+    // переключается на tokio сам, когда вызов идёт из-под активного
+    // tokio-рантайма, а соединение строится здесь — внутри `tasks.spawn`.
+    // Альтернатива — переписывать хендлеры под async-io, что дороже и
+    // ломает единый рантайм демона.
     let cache = Arc::new(StateCache::default());
     // Стартовый снимок: до первого события свойства уже должны быть
     // осмысленными, иначе клиент, подключившийся сразу, увидит нули.
@@ -671,6 +684,7 @@ mod tests {
             queue_index: Some(3),
             queue_len: 10,
             offline: false,
+            last_error: None,
         };
         let props = state_properties(&state);
         let expected = [
