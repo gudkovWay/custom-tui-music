@@ -51,10 +51,28 @@ const HOME_BROWSE: &str = "FEmusic_home";
 /// вызывающий не должен знать, что у YouTube Music лайки — плейлист.
 const LIKED_PLAYLIST: &str = "LM";
 
-/// `player_client` обязателен, и это не украшение: дефолтный выбор yt-dlp
-/// уходит в `web_creator`, URL резолвится, а GET по нему даёт
-/// `403 Forbidden`. Замерено 17.09.2026.
-const EXTRACTOR_ARGS: &[&str] = &["youtube:player_client=web_music"];
+/// Цепочка клиентов резолва вместо одного. Почему цепочка: волна 403 от
+/// googlevideo 20.09.2026 (yt-dlp #17682, #17705) показала, что ссылка,
+/// которую yt-dlp успешно выпросил, может не играть. Замеры 21.09.2026:
+/// `web_music`/`mweb`/`web_creator` отдают ссылки `c=WEB_REMIX`, на
+/// которые обычный GET → 403, а GET с `Range: bytes=0-0` → 206; при этом
+/// `web_embedded` (`c=WEB_EMBEDDED_PLAYER`) отдаёт ссылки, играющие и
+/// обычным GET → 200. Резолвим по очереди, каждую ссылку пробуем и
+/// берём первую живую; yt-dlp-отказ клиента — не конец, а переход к
+/// следующему. Порядок: `web_embedded` первым (битрейт ниже — itag 251
+/// ~139k против 774 ~266k у WEB_REMIX, — но единственный, чьи ссылки
+/// реально играют), прежние клиенты — фолбэком на случай, если Google
+/// откатит политику.
+/// Пара `(client, база страницы watch)`. База у `web_embedded` —
+/// обычный сайт: на `music.youtube.com/watch?v=` yt-dlp этот клиент не
+/// берёт и молча уходит в `web_music` (замерено 21.09.2026: тот же
+/// трек, флаг `player_client=web_embedded`, а ответ пришёл `c=WEB_REMIX`
+/// с 403-ссылкой).
+const RESOLVE_CHAIN: &[(&str, &str)] = &[
+    ("web_embedded", "https://www.youtube.com/watch?v="),
+    ("web_music", "https://music.youtube.com/watch?v="),
+    ("mweb", "https://music.youtube.com/watch?v="),
+];
 
 /// Провайдер YouTube Music.
 pub struct YtMusic {
@@ -437,8 +455,8 @@ impl Resolver for YtMusic {
             return Err(ProviderError::NoSuchTrack(track.clone()));
         }
         // `TrackId` — это только идентификатор видео, а yt-dlp нужен URL:
-        // собираем страницу трека, она у yt-dlp же и разрешается.
-        let page_url = format!("https://music.youtube.com/watch?v={}", track.id);
+        // страница трека собирается в цикле ниже — база зависит от
+        // клиента цепочки.
 
         // Быстрый путь: player-запрос VISIONOS отдаёт прямую ссылку без
         // yt-dlp (замер: yt-dlp ~4 с и ~335 МБ на процесс). Любой негатив
@@ -456,20 +474,103 @@ impl Resolver for YtMusic {
             }
         }
 
-        let media = self
-            .yt_dlp
-            .media(&YtDlpRequest {
-                provider: self.id,
-                page_url: &page_url,
-                format: &self.format,
-                // Без этого аргумента ссылка резолвится, а воспроизведение
-                // упирается в `403 Forbidden` — см. `EXTRACTOR_ARGS`.
-                extractor_args: EXTRACTOR_ARGS,
-                cookies: Some(&self.cookies),
-            })
-            .await?;
+        // Цепочка клиентов: первый, чья ссылка прошла пробу, выигрывает.
+        // Живость решает [`probe_passed`] (см. тест), здесь только io:
+        // резолв, проба, лог. Не победил никто — наружу уходит ошибка с
+        // причиной последнего отказа: прежние причины к этому моменту
+        // уже история.
+        let mut last_error: Option<ProviderError> = None;
+        for (client, base) in RESOLVE_CHAIN {
+            let page_url = format!("{base}{}", track.id);
+            // yt-dlp требует пару `IE_KEY:ARGS`, а не голое имя клиента:
+            // `--extractor-args "mweb"` он отвергает с «wrong
+            // --extractor-args formatting» (поймано живым прогоном
+            // 21.09.2026, юнит-тесты этого не видели). Отдельная
+            // привязка — срез обязан жить через .await, а временный
+            // массив в выражении запроса жил бы только до него.
+            let arg = extractor_arg(client);
+            let extractor_args = [arg.as_str()];
+            let media = match self
+                .yt_dlp
+                .media(&YtDlpRequest {
+                    provider: self.id,
+                    page_url: &page_url,
+                    format: &self.format,
+                    // Без пина `player_client` yt-dlp уходит в дефолт,
+                    // чьи ссылки Google режет 403 — см. `RESOLVE_CHAIN`.
+                    extractor_args: &extractor_args,
+                    cookies: Some(&self.cookies),
+                })
+                .await
+            {
+                Ok(media) => media,
+                Err(error) => {
+                    tracing::debug!(
+                        provider = "ytmusic",
+                        video_id = %track.id,
+                        client,
+                        "клиент цепочки не отдал ссылку, следующий: {error}"
+                    );
+                    last_error = Some(error);
+                    continue;
+                }
+            };
 
-        Ok(YtDlp::to_stream_source(media))
+            // Проба обязательна: yt-dlp отвечает «успехом» и на ссылку,
+            // которая при воспроизведении упрётся в 403 (замер 21.09.2026:
+            // WEB_REMIX-ссылки, обычный GET 403, с Range: bytes=0-0 — 206).
+            let probe_status = crate::innertube::probe(&media.url, media.user_agent.as_deref()).await;
+            match probe_status {
+                Ok(status) if probe_passed(status) => {
+                    tracing::info!(
+                        provider = "ytmusic",
+                        video_id = %track.id,
+                        client,
+                        itag = url_param(&media.url, "itag").unwrap_or("?"),
+                        ext = %media.ext,
+                        probe_status = status,
+                        "ссылка резолвлена и прошла пробу"
+                    );
+                    return Ok(YtDlp::to_stream_source(media));
+                }
+                Ok(status) => {
+                    tracing::debug!(
+                        provider = "ytmusic",
+                        video_id = %track.id,
+                        client,
+                        "проба ссылки не прошла (HTTP {status}), следующий клиент"
+                    );
+                    last_error = Some(ProviderError::Format {
+                        provider: self.id,
+                        reason: format!("клиент {client}: проба ссылки вернула HTTP {status}"),
+                    });
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        provider = "ytmusic",
+                        video_id = %track.id,
+                        client,
+                        "проба ссылки не удалась: {error}"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        Err(ProviderError::Format {
+            provider: self.id,
+            reason: format!(
+                "ни один клиент цепочки ({}) не отдал рабочую ссылку; последняя причина: {}",
+                RESOLVE_CHAIN
+                    .iter()
+                    .map(|(c, _)| *c)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                last_error
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "нет попыток".into()),
+            ),
+        })
     }
 }
 
@@ -498,4 +599,64 @@ fn matches_kind(result: &SearchResult, kind: SearchKind) -> bool {
             | (SearchKind::Artists, SearchResult::Artist { .. })
             | (SearchKind::Albums | SearchKind::Playlists, SearchResult::Playlist(_))
     )
+}
+
+/// Значение параметра из query-части URL. Нужно только для info-лога
+/// (itag резолва), поэтому без полного парсинга.
+fn url_param<'a>(url: &'a str, key: &str) -> Option<&'a str> {
+    url.split(['?', '&'])
+        .find_map(|q| q.strip_prefix(key)?.strip_prefix('='))
+}
+
+/// Прошла ли ссылка пробу. 200 — полный ответ; 206 — частичный по
+/// `Range: bytes=0-0`, и это тоже успех: замер 21.09.2026 показал, что
+/// живая googlevideo-ссылка на `bytes=0-0` отвечает именно 206, а
+/// мёртвая (класс отказа той волны) — 403.
+fn probe_passed(status: u16) -> bool {
+    matches!(status, 200 | 206)
+}
+
+/// Аргумент `--extractor-args` для клиента цепочки: формат обязан быть
+/// `IE_KEY:ARGS`, голое имя клиента yt-dlp отвергает («wrong
+/// --extractor-args formatting; it should be IE_KEY:ARGS, not `mweb`»).
+/// Ошибка в этом месте валит резолв целиком, а юнит-тесты её не видели —
+/// поймал живой прогон 21.09.2026, поэтому формат закреплён тестом.
+fn extractor_arg(client: &str) -> String {
+    format!("youtube:player_client={client}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_accepts_full_and_range_responses() {
+        assert!(probe_passed(200));
+        assert!(probe_passed(206));
+        // 403 — класс отказа волны 20.09.2026: yt-dlp ссылку отдал,
+        // googlevideo воспроизведение зарезал.
+        assert!(!probe_passed(403));
+        assert!(!probe_passed(404));
+        assert!(!probe_passed(500));
+    }
+
+    #[test]
+    fn extractor_arg_carries_the_ie_key_prefix() {
+        // Живой прогон 21.09.2026: без префикса все клиенты цепочки
+        // падали на «wrong --extractor-args formatting», и резолв не
+        // работал вовсе — при зелёных тестах.
+        assert_eq!(extractor_arg("mweb"), "youtube:player_client=mweb");
+        assert_eq!(
+            extractor_arg("web_embedded"),
+            "youtube:player_client=web_embedded"
+        );
+    }
+
+    #[test]
+    fn url_param_reads_query() {
+        let url = "https://rr3---sn.googlevideo.com/videoplayback?id=abc&expire=1893456000&itag=251";
+        assert_eq!(url_param(url, "itag"), Some("251"));
+        assert_eq!(url_param(url, "expire"), Some("1893456000"));
+        assert_eq!(url_param(url, "missing"), None);
+    }
 }

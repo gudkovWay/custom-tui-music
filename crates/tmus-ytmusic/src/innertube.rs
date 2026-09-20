@@ -571,6 +571,37 @@ fn snippet(body: &str) -> String {
     format!("{head}…")
 }
 
+/// Проба googlevideo-ссылки перед выдачей плееру: обычный GET с
+/// `Range: bytes=0-0` и тем User-Agent, каким ссылку выпрашивали
+/// (googlevideo сверяет UA — чужой получает отказ). Возвращает
+/// HTTP-статус; живость статуса решает [`crate::probe_passed`].
+///
+/// Почему проба обязательна: с волны 20.09.2026 (yt-dlp #17682/#17705)
+/// yt-dlp отвечает «успехом» и на мёртвую ссылку — WEB_REMIX-ссылки
+/// резолвятся, но обычный GET по ним даёт 403; та же ссылка с
+/// `Range: bytes=0-0` (≤ 1 MiB) даёт 206, весь файл разом — снова 403.
+/// Проба в 1 байт ловит ровно этот класс отказа до того, как плеер
+/// покажет «тихий stopped». Замерено 21.09.2026, 3/3 раунда.
+pub(crate) async fn probe(url: &str, user_agent: Option<&str>) -> Result<u16> {
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(PROBE_TIMEOUT);
+    if let Some(user_agent) = user_agent {
+        builder = builder.user_agent(user_agent);
+    }
+    let http = builder
+        .build()
+        .map_err(|error| ProviderError::Network(error.to_string()))?;
+    let response = http
+        .get(url)
+        .header(reqwest::header::RANGE, "bytes=0-0")
+        .send()
+        .await
+        .map_err(|error| ProviderError::Network(error.to_string()))?;
+    Ok(response.status().as_u16())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
