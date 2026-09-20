@@ -89,6 +89,13 @@ impl Paths {
         self.state_dir.join("state.json")
     }
 
+    /// Эксклюзивный замок демона. Лежит рядом с control-socket: та же
+    /// жизненная зона runtime-каталога, чистится тем же tmpfiles-правилом.
+    #[must_use]
+    pub fn lock_file(&self) -> PathBuf {
+        self.runtime_dir.join(format!("{APP}.lock"))
+    }
+
     /// Control-socket демона.
     #[must_use]
     pub fn control_socket(&self) -> PathBuf {
@@ -149,6 +156,7 @@ mod tests {
         );
         assert_eq!(paths.control_socket(), PathBuf::from("/stand/run/tmus.sock"));
         assert_eq!(paths.mpv_socket(), PathBuf::from("/stand/run/tmus-mpv.sock"));
+        assert_eq!(paths.lock_file(), PathBuf::from("/stand/run/tmus.lock"));
     }
 
     #[test]

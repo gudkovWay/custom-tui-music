@@ -18,10 +18,12 @@ mod mpris;
 mod orphan_sweep;
 mod persist;
 mod rpc;
+mod singleton;
 mod tray;
 mod watcher;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use tmus_core::cache::Cache;
@@ -56,6 +58,27 @@ async fn main() -> anyhow::Result<()> {
 
     let paths = Paths::resolve().context("не разрешились пути XDG")?;
     paths.ensure_dirs().context("не создались каталоги")?;
+
+    // Эксклюзивный запуск: замок берём ДО sweep_orphan_mpv и mpv —
+    // иначе дубликат успел бы подметать чужих mpv (гробил mpv живого
+    // демона, 21.09) и поднимать собственного. Ждём ~10 с: рестарт
+    // юнита гасит старый демон примерно столько. Держим до конца main —
+    // release случится сам при закрытии дескриптора на выходе процесса.
+    // При занятом замке выходим с кодом 0: второй демон не должен
+    // красить systemd-юнит и не должен трогать файл очереди.
+    let _singleton = match singleton::acquire(&paths.lock_file(), Duration::from_secs(10))
+        .context("замок демона не открылся")?
+    {
+        Some(lock) => lock,
+        None => {
+            tracing::error!(
+                "демон уже работает ({}): второй не стартую",
+                paths.lock_file().display()
+            );
+            return Ok(());
+        }
+    };
+
     let config = Config::load(&paths).context("конфиг не прочитался")?;
     let cache = Arc::new(std::sync::Mutex::new(
         Cache::open(&paths, config.cache.limit_bytes).context("кэш не открылся")?,
