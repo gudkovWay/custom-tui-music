@@ -4,6 +4,7 @@ members = [
     "crates/tmus-core",
     "crates/tmus-provider",
     "crates/tmus-ytmusic",
+    "crates/tmus-soundcloud",
     "crates/tmus-player",
     "crates/tmus-daemon",
     "crates/tmus-tui",
@@ -20,6 +21,7 @@ repository = "https://github.com/gudkovWay/custom-tui-music"
 tmus-core = { path = "crates/tmus-core" }
 tmus-provider = { path = "crates/tmus-provider" }
 tmus-ytmusic = { path = "crates/tmus-ytmusic" }
+tmus-soundcloud = { path = "crates/tmus-soundcloud" }
 tmus-player = { path = "crates/tmus-player" }
 
 anyhow = "1.0.104"
@@ -34,6 +36,8 @@ libc = "0.2.189"
 ratatui = "0.30.2"
 reqwest = { version = "0.13.5", default-features = false, features = [
     "json",
+    "query",
+    "form",
     # В reqwest 0.13 фича зовётся `rustls`, а не `rustls-tls` (та осталась в
     # 0.12). Ошибка здесь валит резолв ВСЕГО воркспейса, а не одного крейта.
     "rustls",

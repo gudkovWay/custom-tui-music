@@ -16,6 +16,7 @@ tmus-core.workspace = true
 tmus-provider.workspace = true
 tmus-player.workspace = true
 tmus-ytmusic.workspace = true
+tmus-soundcloud.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 clap.workspace = true

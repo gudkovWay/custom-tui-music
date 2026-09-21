@@ -205,6 +205,11 @@ pub struct ProviderConfig {
     /// Известное ограничение: VISIONOS не отдаёт «made for kids» —
     /// такие треки штатно уходят в yt-dlp-фолбэк.
     pub fast_resolve: bool,
+
+    /// Переопределение client_id провайдера (SoundCloud) — escape-hatch
+    /// на случай, если извлечение из сайта сломается. `None` —
+    /// провайдер добывает сам.
+    pub client_id: Option<String>,
 }
 
 impl Default for ProviderConfig {
@@ -213,6 +218,7 @@ impl Default for ProviderConfig {
             enabled: true,
             browser_profile: None,
             fast_resolve: false,
+            client_id: None,
         }
     }
 }
@@ -341,6 +347,7 @@ mod tests {
                 enabled: true,
                 browser_profile: Some("firefox:/tmp/свой".to_owned()),
                 fast_resolve: false,
+                client_id: None,
             },
         );
 

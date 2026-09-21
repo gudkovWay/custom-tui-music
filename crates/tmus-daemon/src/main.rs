@@ -221,7 +221,7 @@ fn build_registry(
     let mut registry = Registry::new();
 
     if config.provider(tmus_core::ProviderId::YTMUSIC.as_str()).enabled {
-        match tmus_core::cookies::source_from_config(config) {
+        match provider_cookies(config, "ytmusic") {
             Ok(cookies) => match tmus_ytmusic::YtMusic::new(config, cookies) {
                 Ok(provider) => {
                     registry.insert(crate::cache_layer::Cached::wrap(
@@ -237,7 +237,31 @@ fn build_registry(
         }
     }
 
+    if config.provider(tmus_core::ProviderId::SOUNDCLOUD.as_str()).enabled {
+        match provider_cookies(config, "soundcloud") {
+            Ok(cookies) => match tmus_soundcloud::SoundCloud::new(config, cookies) {
+                Ok(provider) => {
+                    registry.insert(crate::cache_layer::Cached::wrap(
+                        Arc::new(provider),
+                        Arc::clone(cache),
+                    ));
+                }
+                Err(err) => tracing::warn!(%err, "SoundCloud не подключился"),
+            },
+            Err(err) => tracing::warn!(%err, "cookies браузера не нашлись"),
+        }
+    }
+
     Ok(registry)
+}
+
+/// CookieSource для провайдера: свой профиль из [providers.<id>],
+/// иначе автодетект/общий [browser].profile.
+fn provider_cookies(config: &Config, id: &str) -> tmus_core::Result<tmus_core::cookies::CookieSource> {
+    match config.browser_profile_for(id) {
+        Some(spec) => Ok(tmus_core::cookies::CookieSource::Browser { spec: spec.to_owned() }),
+        None => tmus_core::cookies::source_from_config(config),
+    }
 }
 
 
