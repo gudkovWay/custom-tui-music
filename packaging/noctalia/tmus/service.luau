@@ -341,9 +341,20 @@ local function pullProviders()
     for _, p in ipairs(type(got) == "table" and got or {}) do
       local auth = p.auth
       local kind = type(auth) == "table" and tostring(next(auth) or "") or tostring(auth or "")
-      if kind == "Ready" or kind == "Anonymous" then
-        table.insert(out, { id = tostring(p.id or ""), name = tostring(p.name or p.id or "") })
+      -- Берём ВСЕХ провайдеров: неавторизованный тоже должен быть виден
+      -- в Clients (там по authKind показываем Sign in).
+      local hint = ""
+      if type(auth) == "table" and type(auth[kind]) == "table" then
+        hint = tostring(auth[kind].hint or "")
       end
+      table.insert(out, {
+        id = tostring(p.id or ""),
+        name = tostring(p.name or p.id or ""),
+        glyph = tostring(p.glyph or ""),
+        color = tostring(p.color or ""),
+        authKind = kind,
+        authHint = hint,
+      })
     end
     data.providers = out
   end)

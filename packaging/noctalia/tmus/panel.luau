@@ -368,6 +368,42 @@ local function plRef(p)
   return tostring(p.id or "")
 end
 
+-- Метаданные провайдеров: id -> { glyph, color, authKind, authHint }.
+-- Перестраиваем на каждый вызов rows() — таблица маленькая, а snapshot
+-- refresh() подменяет целиком, кэш тут не поможет.
+local providerMeta = {}
+
+local function rebuildProviderMeta(s)
+  providerMeta = {}
+  for _, p in ipairs(s.providers or {}) do
+    providerMeta[tostring(p.id or "")] = {
+      glyph = tostring(p.glyph or ""),
+      color = tostring(p.color or ""),
+      authKind = tostring(p.authKind or ""),
+      authHint = tostring(p.authHint or ""),
+    }
+  end
+end
+
+-- Глиф-бейдж провайдера: "☁ " / "♪ ", пусто — если провайдер неизвестен.
+local function providerGlyph(providerId)
+  local m = providerMeta[tostring(providerId or "")]
+  if m == nil or m.glyph == "" then
+    return ""
+  end
+  return m.glyph .. " "
+end
+
+-- id провайдера трека: у очереди item.id — таблица {provider, id},
+-- у строк поиска/библиотеки — составная строка "provider:id".
+local function providerByTrack(t)
+  local id = type(t) == "table" and t.id or nil
+  if type(id) == "table" then
+    return tostring(id.provider or "")
+  end
+  return tostring(id or ""):match("^[^:]*") or ""
+end
+
 -- Рендер-модель home-ленты: массив полок {title, subtitle, count,
 -- cards} из homeFeed. count — ЧЕСТНОЕ число элементов полки до капа
 -- (счётчик окна показывает его), cards капятся HOME_CARD_CAP —
@@ -692,7 +728,7 @@ local function npNode(s)
     table.insert(children, ui.row({ key = "np-top", gap = 12, align = "center" }, {
       artNode(s.artPath, 48),
       ui.column({ key = "np-text", gap = 2, flexGrow = 1 }, {
-        lbl(shorten(tostring(s.title or ""), 48), { key = "np-title", size = 15, color = COLORS.text }),
+        lbl(providerGlyph(s.provider) .. shorten(tostring(s.title or ""), 48), { key = "np-title", size = 15, color = COLORS.text }),
         lbl(shorten(tostring(s.artist or ""), 48), { key = "np-artist", size = 12, color = COLORS.muted }),
         -- Причина отказа видна и без играющего трека — иначе она
         -- нужна именно тогда, когда трека нет.
@@ -769,7 +805,8 @@ local function trackRow(i, t, opts)
       }),
     }),
     artNode(o.art, 32),
-    lbl(shorten(marker .. o.title, 52), {
+    -- Бейдж провайдера перед названием (и рейтинг-маркером).
+    lbl(shorten(providerGlyph(providerByTrack(t)) .. marker .. o.title, 52), {
       key = "title" .. i,
       grow = 1,
       color = current and COLORS.accent or (active and COLORS.text or COLORS.muted),
@@ -859,6 +896,7 @@ local rowsCacheSnap = nil
 
 function rows()
   local s = snapshot
+  rebuildProviderMeta(s)
   local key = view .. "|" .. playlistId .. "|" .. tostring(showHidden) .. "|" .. tostring(s.searchSerial or "")
   if rowsCache ~= nil and rowsCacheKey == key and rowsCacheSnap == s then
     return rowsCache
@@ -1358,6 +1396,22 @@ local function listChildren(slice, first)
       lastKind = row.kind
     end
     if view == "clients" then
+      -- Всё из providerMeta: никаких хардкодов имён провайдеров.
+      local meta = providerMeta[tostring(row.payload or "")]
+      local glyph = providerGlyph(row.payload)
+      local authKind = meta and meta.authKind or ""
+      local connected = authKind == "Ready" or authKind == "Anonymous"
+      local hint = meta and meta.authHint or ""
+      -- «All» — агрегатор, а не провайдер: meta у него нет, и «Sign in»
+      -- для него соврал бы. Статус нейтральный.
+      local stateText, stateColor
+      if meta == nil then
+        stateText, stateColor = "All sources", COLORS.muted
+      elseif connected then
+        stateText, stateColor = "Connected", COLORS.accent
+      else
+        stateText, stateColor = "Sign in", COLORS.muted
+      end
       table.insert(children, ui.row({
         key = "client" .. i,
         gap = 10,
@@ -1376,9 +1430,16 @@ local function listChildren(slice, first)
           name = row.active and "circle-check" or "server",
           color = row.active and COLORS.accent or COLORS.muted,
         }),
-        lbl(row.title, { key = "client-title" .. i, grow = 1, color = COLORS.text }),
-        lbl(row.subtitle, { key = "client-sub" .. i, color = COLORS.muted }),
-        lbl("Connected", { key = "client-state" .. i, color = COLORS.muted }),
+        lbl(glyph ~= "" and (glyph .. row.title) or row.title, {
+          key = "client-title" .. i,
+          grow = 1,
+          color = COLORS.text,
+        }),
+        lbl(hint ~= "" and shorten(hint, 40) or row.subtitle, { key = "client-sub" .. i, color = COLORS.muted }),
+        lbl(stateText, {
+          key = "client-state" .. i,
+          color = stateColor,
+        }),
       }))
     elseif row.kind == "more" then
       -- Приглашение догрузки: приглушённая, без onClick и event —
@@ -1429,7 +1490,7 @@ local function homeWorkspace(s)
     artNode(s.artPath, 64),
     ui.column({ key = "np-text", gap = 4, flexGrow = 1 }, {
       lbl("Now Playing", { key = "np-over", size = 11, color = COLORS.muted }),
-      lbl(shorten(tostring(s.title or ""), 40), { key = "np-title", size = 18, color = COLORS.text }),
+      lbl(providerGlyph(s.provider) .. shorten(tostring(s.title or ""), 40), { key = "np-title", size = 18, color = COLORS.text }),
       lbl(shorten(tostring(s.artist or ""), 40), { key = "np-artist", size = 13, color = COLORS.accent }),
       lbl(
         (tostring(s.album or "") ~= "" and shorten(s.album, 40) .. " · " or "")
@@ -1631,6 +1692,10 @@ local function queueContextNode(s)
             key = "q-idx" .. i,
             color = isPlaying and COLORS.accent or COLORS.muted,
           }),
+        }),
+        -- Бейдж провайдера перед артом: из какого клиента трек.
+        ui.row({ key = "q-badge" .. i, width = 22, align = "center" }, {
+          lbl(providerGlyph(providerByTrack(t)), { key = "q-badge-t" .. i, color = COLORS.muted }),
         }),
         artNode(t.art_path, 28),
         lbl(shorten(marker .. tostring(t.title or ""), 26), {
