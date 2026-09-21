@@ -17,12 +17,48 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 
-use tmus_core::model::{LoopMode, PlaybackStatus, Playlist, Rating, SearchResult, Track, TrackId};
+use tmus_core::model::{AuthStatus, LoopMode, PlaybackStatus, Playlist, Rating, SearchResult, Track, TrackId};
 use tmus_core::protocol::{CatalogSource, Cmd, Event, Payload, PlayerState};
 use tmus_core::Paths;
 
 use crate::client::Client;
 use crate::fmt_time;
+
+/// Бейдж провайдера: глиф и цвет из ProviderView. Живёт в App как карта
+/// id -> бейдж, заполняется из Cmd::Providers и обновляется на
+/// AuthChanged — сессии могут оживать и протухать на ходу.
+struct Badge {
+    glyph: String,
+    color: Color,
+}
+
+/// Парсинг "#rrggbb": по 2 hex-цифры на канал. None при любом
+/// несовпадении — кривой цвет от провайдера не должен ронять кадр.
+fn hex_color(s: &str) -> Option<Color> {
+    let hex = s.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some(Color::Rgb(channel(0)?, channel(2)?, channel(4)?))
+}
+
+/// Цветной глиф провайдера перед названием: None — бейджа нет, строка
+/// остаётся в прежнем текстовом виде "[{provider}] ...".
+fn badge_span<'a>(badges: &HashMap<String, Badge>, provider: &str) -> Option<Span<'a>> {
+    badges.get(provider).map(|b| {
+        Span::styled(format!("{} ", b.glyph), Style::default().fg(b.color))
+    })
+}
+
+/// Подпись источника каталога для заголовков панелей: "all" или имя
+/// провайдера (fallback — id, если Cmd::Providers ещё не отвечал).
+fn source_label(app: &App) -> String {
+    match &app.source.provider {
+        None => "all".to_owned(),
+        Some(id) => app.provider_names.get(id).cloned().unwrap_or_else(|| id.clone()),
+    }
+}
 
 /// Панели левой колонки. Tab переключает по кругу.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -193,6 +229,12 @@ struct App {
     search_view: Vec<usize>,
     /// Открытый пикер плейлистов (`a`); None — закрыт.
     picker: Option<PlaylistPicker>,
+    /// Бейджи провайдеров: id -> глиф+цвет. Обновляются из Cmd::Providers.
+    badges: HashMap<String, Badge>,
+    /// id провайдера -> человекочитаемое имя, для заголовков панелей.
+    provider_names: HashMap<String, String>,
+    /// id -> последний AuthStatus: ctrl+r собирает из него notice.
+    auths: HashMap<String, AuthStatus>,
 }
 
 pub async fn run(paths: &Paths) -> Result<()> {
@@ -240,12 +282,38 @@ pub async fn run(paths: &Paths) -> Result<()> {
         track_view: Vec::new(),
         search_view: Vec::new(),
         picker: None,
+        badges: HashMap::new(),
+        provider_names: HashMap::new(),
+        auths: HashMap::new(),
     };
+    // Стартовый снимок бейджей: сразу после снимка оценок, до первого
+    // кадра — иначе в очереди/поиске мелькнет текстовый "[provider]".
+    refresh_provider_badges(&mut app).await;
 
     let mut terminal = enter_terminal()?;
     let result = event_loop(&mut app, &mut events, &mut terminal).await;
     restore_terminal()?;
     result
+}
+
+/// Перезапросить Cmd::Providers и обновить бейджи/имена. Вызывается на
+/// старте, на AuthChanged и после ctrl+r: сессии меняются вне цикла
+/// событий, тянуть их инкрементально нечем — карта провайдеров мала.
+async fn refresh_provider_badges(app: &mut App) {
+    if let Ok(Payload::Providers(list)) = app.client.call(Cmd::Providers).await {
+        app.badges = list
+            .iter()
+            .map(|p| {
+                (
+                    p.id.clone(),
+                    Badge { glyph: p.glyph.clone(), color: hex_color(&p.color).unwrap_or(Color::Reset) },
+                )
+            })
+            .collect();
+        app.provider_names =
+            list.iter().map(|p| (p.id.clone(), p.name.clone())).collect();
+        app.auths = list.iter().map(|p| (p.id.clone(), p.auth.clone())).collect();
+    }
 }
 
 fn enter_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
@@ -380,7 +448,14 @@ async fn apply_event(app: &mut App, event: Event) -> bool {
             }
             true
         }
-        Event::TrackChanged { .. } | Event::CacheProgress { .. } | Event::AuthChanged { .. } => false,
+        Event::TrackChanged { .. } | Event::CacheProgress { .. } => false,
+        Event::AuthChanged { .. } => {
+            // Сессия ожила или протухла — бейджи и имена могли измениться;
+            // true: перерисовать (кадр по изменению, false бы оставил
+            // старые глифы до следующего события).
+            refresh_provider_badges(app).await;
+            true
+        }
     }
 }
 
@@ -446,6 +521,14 @@ async fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Re
             call_quiet(app, Cmd::SetVolume { volume: (app.state.volume - 5.0).clamp(0.0, 100.0) }).await;
         }
         KeyCode::Char('s') => call_quiet(app, Cmd::SetShuffle { shuffle: !app.state.shuffle }).await,
+        // ctrl+r: перечитать сессии всех провайдеров и обновить бейджи;
+        // notice — только если что-то не в порядке. Раньше голого `r` —
+        // иначе `r` с CONTROL попадает в цикл повтора.
+        KeyCode::Char('r') if modifiers.contains(KeyModifiers::CONTROL) => {
+            call_quiet(app, Cmd::RefreshAuth { provider: None }).await;
+            refresh_provider_badges(app).await;
+            app.notice = auth_notices(app);
+        }
         KeyCode::Char('r') => {
             let next = match app.state.loop_mode {
                 LoopMode::None => LoopMode::Track,
@@ -456,6 +539,41 @@ async fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Re
         }
         KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.show_disliked = !app.show_disliked;
+        }
+        // c: источник каталога None (все) -> провайдеры по алфавиту ->
+        // снова None. Библиотека перечитывается сразу, поиск — той же
+        // логикой, что Enter в строке поиска, если результаты есть.
+        KeyCode::Char('c') => {
+            let mut keys: Vec<String> = app.badges.keys().cloned().collect();
+            keys.sort();
+            let next = match &app.source.provider {
+                None => keys.first().cloned(),
+                Some(cur) => {
+                    let idx = keys.iter().position(|k| k == cur).map(|i| i + 1).unwrap_or(0);
+                    keys.get(idx).cloned()
+                }
+            };
+            app.source.provider = next;
+            call_quiet(app, Cmd::SetCatalogSource { source: app.source.clone() }).await;
+            if let Ok(Payload::Playlists(ps)) =
+                app.client.call(Cmd::Library { provider: app.source.provider.clone() }).await
+            {
+                app.playlists = ps;
+            }
+            if !app.search_results.is_empty() && !app.search_input.is_empty() {
+                if let Ok(Payload::Results(results)) = app
+                    .client
+                    .call(Cmd::Search {
+                        query: app.search_input.clone(),
+                        kind: tmus_core::model::SearchKind::Tracks,
+                        provider: app.source.provider.clone(),
+                    })
+                    .await
+                {
+                    app.search_results = results;
+                    app.nav.search_sel.select(Some(0));
+                }
+            }
         }
         KeyCode::Char('f') => rate_selected(app, Rating::Liked).await,
         KeyCode::Char('d') => rate_selected(app, Rating::Disliked).await,
@@ -478,6 +596,29 @@ async fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Re
         _ => {}
     }
     Ok(false)
+}
+
+/// Подсказки по нерабочим сессиям для строки состояния после ctrl+r:
+/// "<имя>: <hint>"; None, когда у всех всё в порядке.
+fn auth_notices(app: &App) -> Option<String> {
+    let parts: Vec<String> = app
+        .auths
+        .iter()
+        .filter(|(_, auth)| !auth.is_usable())
+        .map(|(id, auth)| {
+            let hint = match auth {
+                AuthStatus::Missing { hint } | AuthStatus::Expired { hint } => hint.clone(),
+                _ => String::new(),
+            };
+            let name = app.provider_names.get(id).cloned().unwrap_or_else(|| id.clone());
+            if hint.is_empty() {
+                name
+            } else {
+                format!("{name}: {hint}")
+            }
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 async fn handle_search_key(app: &mut App, code: KeyCode) -> Result<()> {
@@ -886,15 +1027,20 @@ fn draw(f: &mut Frame, app: &mut App) {
         .areas(main);
 
     // Левая колонка: текущая панель. В режиме поиска заголовок
-    // показывает ввод.
+    // показывает ввод. Библиотека и поиск показывают источник каталога:
+    // клавиша `c` меняет его, без подписи непонятно, откуда данные.
     let (title, items, sel_panel) = match app.nav.panel {
         Panel::Library => (
-            "Библиотека [Tab] [l]".to_owned(),
+            format!("Библиотека [Tab] [c] [l] · src: {}", source_label(app)),
             app.playlists
                 .iter()
                 .map(|p| {
                     let count = p.track_count.map(|c| format!(" ({c})")).unwrap_or_default();
-                    ListItem::new(Line::from(format!("{}{}", p.title, count)))
+                    let text = format!("{}{}", p.title, count);
+                    match badge_span(&app.badges, p.id.provider.as_str()) {
+                        Some(b) => ListItem::new(Line::from(vec![b, Span::raw(text)])),
+                        None => ListItem::new(text),
+                    }
                 })
                 .collect(),
             &mut app.nav.library_sel,
@@ -905,7 +1051,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             &mut app.nav.queue_sel,
         ),
         Panel::Search => (
-            format!("Результаты: {}", app.search_input),
+            format!("Результаты: {} · src: {}", app.search_input, source_label(app)),
             search_items(app),
             &mut app.nav.search_sel,
         ),
@@ -929,7 +1075,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             .track_view
             .iter()
             .filter_map(|&i| app.playlist_tracks.get(i))
-            .map(|t| track_line(t, current.as_ref(), app.ratings.get(&t.id)))
+            .map(|t| track_line(t, current.as_ref(), app.ratings.get(&t.id), &app.badges))
             .collect();
         let right_list = List::new(items)
             .block(Block::new().borders(Borders::ALL).title(title))
@@ -998,16 +1144,36 @@ fn centered_rect(percent_x: u16, height: u16, area: ratatui::layout::Rect) -> ra
 /// Строка трека в списках; `current` — играющий сейчас `TrackId`,
 /// `rating` — локальная оценка трека. Играющий трек получает тёплый
 /// фон и метку `▶`: в плейлисте на сотни строк взгляд ищет «что же
-/// играет» чаще, чем позицию курсора.
-fn track_line(track: &Track, current: Option<&TrackId>, rating: Option<&Rating>) -> ListItem<'static> {
+/// играет» чаще, чем позицию курсора. Бейдж глифа заменяет текстовый
+/// "[{provider}]": очередь и поиск смешанные, цветной глиф читается
+/// взглядом, а не чтением.
+fn track_line(
+    track: &Track,
+    current: Option<&TrackId>,
+    rating: Option<&Rating>,
+    badges: &HashMap<String, Badge>,
+) -> ListItem<'static> {
     let playing = current == Some(&track.id);
     let marker = rating_marker(rating);
-    let text = if playing {
-        format!("{marker}▶ [{}] {} — {}", track.id.provider, track.artist_line(), track.title)
-    } else {
-        format!("{marker}[{}] {} — {}", track.id.provider, track.artist_line(), track.title)
+    let spans: Vec<Span> = match badge_span(badges, track.id.provider.as_str()) {
+        Some(badge) => {
+            let head = if playing {
+                Span::raw(format!("{marker}▶ "))
+            } else {
+                Span::raw(marker.to_owned())
+            };
+            vec![head, badge, Span::raw(format!("{} — {}", track.artist_line(), track.title))]
+        }
+        None => {
+            let text = if playing {
+                format!("{marker}▶ [{}] {} — {}", track.id.provider, track.artist_line(), track.title)
+            } else {
+                format!("{marker}[{}] {} — {}", track.id.provider, track.artist_line(), track.title)
+            };
+            vec![Span::raw(text)]
+        }
     };
-    let item = ListItem::new(Line::from(text));
+    let item = ListItem::new(Line::from(spans));
     if playing {
         item.style(
             // ANSI 0 (normal.black) и ANSI 11 (bright.yellow) темятся терминалом:
@@ -1031,7 +1197,7 @@ fn queue_items(app: &App) -> Vec<ListItem<'static>> {
     // очередь, а d на нём всё равно доступен.
     match &app.state.track {
         Some(track) => {
-            vec![track_line(track, Some(&track.id), app.ratings.get(&track.id))]
+            vec![track_line(track, Some(&track.id), app.ratings.get(&track.id), &app.badges)]
         }
         None => vec![ListItem::new("очередь пуста")],
     }
@@ -1043,10 +1209,22 @@ fn search_items(app: &App) -> Vec<ListItem<'static>> {
         .iter()
         .filter_map(|&i| app.search_results.get(i))
         .map(|r| match r {
-            SearchResult::Track(t) => track_line(t, current.as_ref(), app.ratings.get(&t.id)),
-            SearchResult::Playlist(p) => ListItem::new(format!("{}: {}", p.id, p.title)),
+            SearchResult::Track(t) => track_line(t, current.as_ref(), app.ratings.get(&t.id), &app.badges),
+            SearchResult::Playlist(p) => {
+                let badge = badge_span(&app.badges, p.id.provider.as_str());
+                let text = format!("{}: {}", p.id, p.title);
+                match badge {
+                    Some(b) => ListItem::new(Line::from(vec![b, Span::raw(text)])),
+                    None => ListItem::new(text),
+                }
+            }
             SearchResult::Artist { provider, id, name } => {
-                ListItem::new(format!("[{provider}:{id}] {name}"))
+                let badge = badge_span(&app.badges, provider.as_str());
+                let text = format!("[{provider}:{id}] {name}");
+                match badge {
+                    Some(b) => ListItem::new(Line::from(vec![b, Span::raw(text)])),
+                    None => ListItem::new(text),
+                }
             }
         })
         .collect()
@@ -1124,6 +1302,16 @@ fn progress_bar(position: Option<u64>, duration: Option<u64>, width: usize) -> S
         bar.push(if i < filled { '\u{2588}' } else { '\u{2591}' });
     }
     bar
+}
+
+/// Обрезка по символам с многоточием, если строка не влезла.
+fn trim_fit(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        return s.to_owned();
+    }
+    let mut cut: String = s.chars().take(width.saturating_sub(1)).collect();
+    cut.push('\u{2026}');
+    cut
 }
 
 #[cfg(test)]
@@ -1367,6 +1555,17 @@ mod tests {
     }
 
     #[test]
+    fn hex_color_parses_rrggbb_and_rejects_bad_input() {
+        assert_eq!(hex_color("#ff5500"), Some(Color::Rgb(0xff, 0x55, 0x00)));
+        assert_eq!(hex_color("#000000"), Some(Color::Rgb(0, 0, 0)));
+        // Грабли: без #, короткая/длинная, не hex — всё None.
+        assert_eq!(hex_color("ff5500"), None);
+        assert_eq!(hex_color("#ff550"), None);
+        assert_eq!(hex_color("#ff55000"), None);
+        assert_eq!(hex_color("#zz5500"), None);
+    }
+
+    #[test]
     fn progress_bar_is_symbol_based() {
         let bar = progress_bar(Some(0), Some(100), 10);
         assert_eq!(bar, "\u{2591}".repeat(10));
@@ -1376,14 +1575,4 @@ mod tests {
         assert_eq!(progress_bar(Some(1), None, 10), "");
         assert_eq!(progress_bar(Some(1), Some(0), 10), "");
     }
-}
-
-/// Обрезка по символам с многоточием, если строка не влезла.
-fn trim_fit(s: &str, width: usize) -> String {
-    if s.chars().count() <= width {
-        return s.to_owned();
-    }
-    let mut cut: String = s.chars().take(width.saturating_sub(1)).collect();
-    cut.push('\u{2026}');
-    cut
 }
