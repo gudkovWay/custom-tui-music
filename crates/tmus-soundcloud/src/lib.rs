@@ -94,15 +94,6 @@ impl SoundCloud {
             cookies,
         })
     }
-
-    /// Полный список id треков плейлиста. Нужен перед каждой правкой:
-    /// SoundCloud не умеет точечную вставку/удаление — только PUT
-    /// полного состава.
-    async fn playlist_track_ids(&self, playlist_id: &str) -> Result<Vec<String>> {
-        let page = self.api.playlist(playlist_id).await?;
-        let (tracks, _next) = parse::playlist_tracks(&page);
-        Ok(tracks.into_iter().map(|t| t.id.id).collect())
-    }
 }
 
 #[async_trait]
@@ -229,11 +220,13 @@ impl Catalog for SoundCloud {
     }
 
     /// Лайки. Звуковый лайк — не плейлист (в отличие от YouTube Music):
-    /// отдельный эндпоинт с пагинацией `next_href`.
+    /// отдельный эндпоинт с пагинацией `next_href`. Страницы — по 200
+    /// (лимит сервиса), продолжения приходят такими же like-объектами,
+    /// поэтому разбор у всех страниц один — [`parse::liked_of`].
     async fn liked(&self) -> Result<Vec<Track>> {
         let mut all = Vec::new();
         let (mut page_items, mut next) = {
-            let page = self.api.likes(24).await?;
+            let page = self.api.likes(200).await?;
             parse::liked_of(&page)
         };
         all.append(&mut page_items);
@@ -248,7 +241,7 @@ impl Catalog for SoundCloud {
                 break;
             }
             let page = self.api.get_url(&url).await?;
-            let (page_items, next_href) = parse::collection_page(&page);
+            let (page_items, next_href) = parse::liked_of(&page);
             all.extend(page_items);
             next = next_href;
             pages += 1;
@@ -296,14 +289,14 @@ impl Catalog for SoundCloud {
         if track.provider != self.id {
             return Err(ProviderError::NoSuchTrack(track.clone()));
         }
-        let mut ids = self.playlist_track_ids(&playlist.id).await?;
-        // Трек уже там — повторная вставка дубликат ничего не стоит
-        // пользователю, но стоит PUT полного состава: отсекаем.
-        if ids.iter().any(|id| id == &track.id) {
-            return Ok(());
-        }
-        ids.push(track.id.clone());
-        self.api.replace_playlist_tracks(&playlist.id, &ids).await
+        // Правка состава (PUT /playlists/:id) переехала на JSON-протокол
+        // веб-клиента, формат которого не подтверждён живым запросом:
+        // все опробованные тела (id, urn, полные объекты треков) сервис
+        // отвергает 400. Честный Unsupported лучше молчаливой лжи.
+        Err(ProviderError::Unsupported {
+            provider: self.id,
+            what: "добавление в плейлист",
+        })
     }
 
     async fn playlist_remove(&self, playlist: &PlaylistId, track: &TrackId) -> Result<()> {
@@ -313,15 +306,11 @@ impl Catalog for SoundCloud {
         if track.provider != self.id {
             return Err(ProviderError::NoSuchTrack(track.clone()));
         }
-        let ids = self.playlist_track_ids(&playlist.id).await?;
-        let rest: Vec<String> = ids.iter().filter(|id| *id != &track.id).cloned().collect();
-        if rest.len() == ids.len() {
-            // Трека нет — результат уже достигнут, PUT не нужен.
-            return Ok(());
-        }
-        self.api
-            .replace_playlist_tracks(&playlist.id, &rest)
-            .await
+        // См. playlist_add: PUT полного состава не подтверждён.
+        Err(ProviderError::Unsupported {
+            provider: self.id,
+            what: "удаление из плейлиста",
+        })
     }
 
     async fn playlist_delete(&self, playlist: &PlaylistId) -> Result<()> {

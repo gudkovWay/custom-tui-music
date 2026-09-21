@@ -75,6 +75,15 @@ impl ScAuth {
         read(&self.token).clone()
     }
 
+    /// Заголовок `Cookie` целиком. Бот-защита SoundCloud (datadome)
+    /// сверяет браузерные cookies и без них пишущие запросы ловят
+    /// 403-капчу (замерено 21.09.2026 на PUT-лайке).
+    #[must_use]
+    pub fn cookie_header(&self) -> Option<String> {
+        let header = read(&self.jar).header();
+        (!header.is_empty()).then_some(header)
+    }
+
     /// Сессия подтверждена сервисом запросом.
     pub fn mark_ready(&self) {
         *write(&self.status) = AuthStatus::Ready;

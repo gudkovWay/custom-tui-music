@@ -115,20 +115,17 @@ pub(crate) fn playlists(value: &Value) -> Vec<Playlist> {
         .unwrap_or_default()
 }
 
-/// Страница треков плейлиста: `{"tracks":{"collection":[…],"next_href":…}}`.
+/// Треки плейлиста. С `linked_partitioning=1` сервис отдаёт их целиком
+/// массивом `tracks: [ {track…}, … ]` — без пагинации и `next_href`
+/// (замерено 21.09.2026: плейлист на 33 трека приехал одним ответом).
 #[must_use]
 pub(crate) fn playlist_tracks(value: &Value) -> (Vec<Track>, Option<String>) {
-    let tracks = value.get("tracks");
-    let collection = tracks
-        .and_then(|t| t.get("collection"))
+    let tracks = value
+        .get("tracks")
         .and_then(Value::as_array)
         .map(|items| items.iter().filter_map(track).collect())
         .unwrap_or_default();
-    let next = tracks
-        .and_then(|t| t.get("next_href"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    (collection, next)
+    (tracks, None)
 }
 
 /// Страница общей коллекции треков: `{"collection":[…],"next_href":…}` —
@@ -316,16 +313,16 @@ mod tests {
     }
 
     #[test]
-    fn playlist_tracks_reads_nested_collection() {
+    fn playlist_tracks_reads_full_array() {
+        // Замерено 21.09.2026: `linked_partitioning=1` отдаёт треки
+        // целиком массивом, без пагинации.
         let value = json!({
-            "tracks": {
-                "collection": [sample_track(1), sample_track(2)],
-                "next_href": "https://api-v2.soundcloud.com/playlists/9?offset=2"
-            }
+            "tracks": [sample_track(1), sample_track(2)]
         });
         let (tracks, next) = playlist_tracks(&value);
         assert_eq!(tracks.len(), 2);
-        assert_eq!(next.as_deref(), Some("https://api-v2.soundcloud.com/playlists/9?offset=2"));
+        assert_eq!(tracks[1].id.id, "2");
+        assert_eq!(next, None);
     }
 
     #[test]

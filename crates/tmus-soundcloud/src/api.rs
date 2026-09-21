@@ -52,6 +52,9 @@ pub struct Api {
     /// стоит похода в сеть за страницей и JS-ассетами. Пустая строка —
     /// маркер «кэш отравлен, надо переизвлечь».
     client_id: RwLock<String>,
+    /// Числовой id аккаунта из `/me`. Пути библиотеки строятся как
+    /// `users/:userId/…`: `me/…` у SoundCloud отвалился (404).
+    uid: RwLock<Option<String>>,
 }
 
 impl Api {
@@ -74,7 +77,26 @@ impl Api {
             http,
             auth,
             client_id: RwLock::new(client_id),
+            uid: RwLock::new(None),
         })
+    }
+
+    /// Числовой id аккаунта из `/me`, кэшируется.
+    async fn uid(&self) -> Result<String, ProviderError> {
+        if let Some(uid) = read(&self.uid) {
+            return Ok(uid);
+        }
+        let me = self.request(reqwest::Method::GET, "me", &[], None, true).await?;
+        let uid = me
+            .get("id")
+            .and_then(Value::as_u64)
+            .map(|id| id.to_string())
+            .ok_or_else(|| ProviderError::Format {
+                provider: ProviderId::SOUNDCLOUD,
+                reason: "в ответе /me нет id".into(),
+            })?;
+        *write(&self.uid) = Some(uid.clone());
+        Ok(uid)
     }
 
     /// oauth-токен из auth — заголовок `Authorization: OAuth …`.
@@ -104,7 +126,7 @@ impl Api {
         method: reqwest::Method,
         path_or_url: &str,
         query: &[(&str, &str)],
-        form: Option<&[(&str, &str)]>,
+        json: Option<&Value>,
         auth_required: bool,
     ) -> Result<Value, ProviderError> {
         let url = self.build_url(path_or_url);
@@ -120,30 +142,42 @@ impl Api {
         let mut attempt = 0;
         loop {
             let mut req = self.http.request(method.clone(), &url).query(query);
-            if auth_required {
-                if let Some(oauth) = self.oauth() {
-                    req = req.header(reqwest::header::AUTHORIZATION, oauth);
-                }
+            // Токен цепляется всегда, когда есть, а не только на
+            // «аутентифицированных» эндпоинтах: продолжения пагинации
+            // (next_href) тоже требуют сессию, а их ходят через get_url
+            // с auth_required=false (замерено 21.09.2026: 401 на хвосте
+            // лайков без заголовка).
+            if let Some(oauth) = self.oauth() {
+                req = req.header(reqwest::header::AUTHORIZATION, oauth);
             }
-            if let Some(form) = form {
-                req = req.form(form);
+            // Браузерные cookies обязательны: бот-защита (datadome)
+            // сверяет их и на пишущих запросах отвечает 403-капчей без
+            // них (замерено 21.09.2026 на PUT-лайке).
+            if let Some(cookie) = self.auth.cookie_header() {
+                req = req.header(reqwest::header::COOKIE, cookie);
+            }
+            if let Some(json) = json {
+                req = req.json(json);
             }
             let response = req
                 .send()
                 .await
                 .map_err(|error| ProviderError::Network(error.to_string()))?;
             let status = response.status();
-            if status.as_u16() == 200 {
-                let value: Value = response
-                    .json()
-                    .await
-                    .map_err(|error| {
-                        ProviderError::Format {
+            // 200/201 — с телом; 204 (DELETE плейлистов) — без тела.
+            match status.as_u16() {
+                200 | 201 => {
+                    let value: Value = response
+                        .json()
+                        .await
+                        .map_err(|error| ProviderError::Format {
                             provider: ProviderId::SOUNDCLOUD,
-                            reason: format!("тело 200 не разбирается как JSON: {error}"),
-                        }
-                    })?;
-                return Ok(value);
+                            reason: format!("тело {status} не разбирается как JSON: {error}"),
+                        })?;
+                    return Ok(value);
+                }
+                204 => return Ok(Value::Null),
+                _ => {}
             }
 
             let body = response.text().await.unwrap_or_default();
@@ -287,11 +321,14 @@ impl Api {
         .await
     }
 
-    /// Плейлисты аккаунта.
+    /// Плейлисты аккаунта. `/me/playlists` умер (404) — жив
+    /// `users/:userId/playlists` (замерено 21.09.2026).
     pub async fn me_playlists(&self) -> Result<Value, ProviderError> {
+        let uid = self.uid().await?;
+        let path = format!("users/{uid}/playlists");
         self.request(
             reqwest::Method::GET,
-            "me/playlists",
+            &path,
             &[("limit", "50"), ("linked_partitioning", "1")],
             None,
             true,
@@ -299,7 +336,8 @@ impl Api {
         .await
     }
 
-    /// Плейлист по id с пагинацией (`linked_partitioning`).
+    /// Плейлист по id с пагинацией (`linked_partitioning`). Треки
+    /// приходят целиком полем `tracks` — массивом, без пагинации.
     pub async fn playlist(&self, id: &str) -> Result<Value, ProviderError> {
         let path = format!("playlists/{id}?linked_partitioning=1");
         self.request(reqwest::Method::GET, &path, &[], None, false)
@@ -312,24 +350,36 @@ impl Api {
             .await
     }
 
-    /// Страница лайков аккаунта.
+    /// Страница лайков. Живой путь — `users/:userId/likes`: элементы
+    /// `{kind:"like", track:{…}}`, `next_href`, до 200 на страницу
+    /// (проверено live 21.09.2026; `/e1/me/track_likes` — 404).
     pub async fn likes(&self, limit: u32) -> Result<Value, ProviderError> {
-        let path = format!("e1/me/track_likes?limit={limit}&linked_partitioning=1");
-        self.request(reqwest::Method::GET, &path, &[], None, true)
-            .await
+        let uid = self.uid().await?;
+        let path = format!("users/{uid}/likes");
+        self.request(
+            reqwest::Method::GET,
+            &path,
+            &[("limit", &limit.to_string()), ("linked_partitioning", "1")],
+            None,
+            true,
+        )
+        .await
     }
 
-    /// Лайк трека.
+    /// Лайк: `PUT users/:userId/track_likes/:id` (шаблон из JS-бандла
+    /// веб-клиента; проверен live net-zero 21.09.2026).
     pub async fn like(&self, id: &str) -> Result<(), ProviderError> {
-        let path = format!("e1/me/track_likes/{id}");
+        let uid = self.uid().await?;
+        let path = format!("users/{uid}/track_likes/{id}");
         self.request(reqwest::Method::PUT, &path, &[], None, true)
             .await?;
         Ok(())
     }
 
-    /// Снять лайк.
+    /// Снять лайк: `DELETE users/:userId/track_likes/:id`.
     pub async fn unlike(&self, id: &str) -> Result<(), ProviderError> {
-        let path = format!("e1/me/track_likes/{id}");
+        let uid = self.uid().await?;
+        let path = format!("users/{uid}/track_likes/{id}");
         self.request(reqwest::Method::DELETE, &path, &[], None, true)
             .await?;
         Ok(())
@@ -347,43 +397,22 @@ impl Api {
         .await
     }
 
-    /// Создать приватный плейлист. Сервис принимает form, а не JSON.
+    /// Создать приватный плейлист. POST принимает JSON
+    /// `{"playlist":{"title","sharing","tracks":[]}}` — без `tracks`
+    /// сервис отвечает 404 (замерено 21.09.2026).
     pub async fn create_playlist(&self, title: &str) -> Result<Value, ProviderError> {
-        self.request(
-            reqwest::Method::POST,
-            "playlists",
-            &[],
-            Some(&[
-                ("playlist[title]", title),
-                ("playlist[sharing]", "private"),
-            ]),
-            true,
-        )
-        .await
+        let body = json!({
+            "playlist": {
+                "title": title,
+                "sharing": "private",
+                "tracks": [],
+            }
+        });
+        self.request(reqwest::Method::POST, "playlists", &[], Some(&body), true)
+            .await
     }
 
-    /// Заменить состав плейлиста целиком: SoundCloud не умеет
-    /// точечную вставку — только PUT полного списка id.
-    pub async fn replace_playlist_tracks(
-        &self,
-        id: &str,
-        track_ids: &[String],
-    ) -> Result<(), ProviderError> {
-        let form: Vec<(String, String)> = track_ids
-            .iter()
-            .map(|id| ("playlist[tracks][][id]".to_owned(), id.clone()))
-            .collect();
-        let form_refs: Vec<(&str, &str)> = form
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str()))
-            .collect();
-        let path = format!("playlists/{id}");
-        self.request(reqwest::Method::PUT, &path, &[], Some(&form_refs), true)
-            .await?;
-        Ok(())
-    }
-
-    /// Удалить плейлист.
+    /// Удалить плейлист. Отвечает 204 без тела.
     pub async fn delete_playlist(&self, id: &str) -> Result<(), ProviderError> {
         let path = format!("playlists/{id}");
         self.request(reqwest::Method::DELETE, &path, &[], None, true)
@@ -463,11 +492,11 @@ fn snippet(body: &str) -> String {
 }
 
 /// Отравленный лок не повод падать: под ним строка client_id.
-fn read(lock: &RwLock<String>) -> String {
+fn read<T: Clone>(lock: &RwLock<T>) -> T {
     lock.read().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
-fn write<'a>(lock: &'a RwLock<String>) -> std::sync::RwLockWriteGuard<'a, String> {
+fn write<'a, T>(lock: &'a RwLock<T>) -> std::sync::RwLockWriteGuard<'a, T> {
     lock.write().unwrap_or_else(PoisonError::into_inner)
 }
 
