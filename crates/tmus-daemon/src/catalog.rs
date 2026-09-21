@@ -47,6 +47,8 @@ impl App {
                     id: provider.id().as_str().to_owned(),
                     name: account.display_name().to_owned(),
                     auth: account.auth(),
+                    glyph: account.glyph().to_owned(),
+                    color: account.color().to_owned(),
                 }
             })
             .collect()

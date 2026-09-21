@@ -362,6 +362,18 @@ impl App {
 
             Cmd::State => Ok(Payload::State(self.player.state().await)),
             Cmd::Providers => Ok(Payload::Providers(self.providers())),
+            Cmd::RefreshAuth { provider } => {
+                for target in self.targets(provider.as_deref())? {
+                    let id = target.id().as_str().to_owned();
+                    // refresh ходит в сеть; клиент ждёт ответ, поэтому таймаут.
+                    match tokio::time::timeout(std::time::Duration::from_secs(10), target.account().refresh()).await {
+                        Ok(Ok(auth)) => self.emit(Event::AuthChanged { provider: id, auth }),
+                        Ok(Err(err)) => tracing::debug!(provider = %id, %err, "перечитывание сессии не удалось"),
+                        Err(_) => tracing::debug!(provider = %id, "перечитывание сессии не уложилось в таймаут"),
+                    }
+                }
+                Ok(Payload::Ack(Ack::default()))
+            }
             // Каталожные операции разбирают мегабайты JSON: библиотека
             // из 1000 треков приезжает десятком страниц продолжений.
             // После них арены glibc остаются раздутыми — замерено:

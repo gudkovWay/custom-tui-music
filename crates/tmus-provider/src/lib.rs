@@ -69,6 +69,18 @@ pub trait Account: Send + Sync {
     /// Человекочитаемое имя для UI: «YouTube Music», «SoundCloud».
     fn display_name(&self) -> &str;
 
+    /// Глиф-бейдж провайдера для UI. Только ASCII/Unicode-блоки (☁, ♪)
+    /// — без Nerd Font. TUI и панель берут бейджи из [`tmus_core::protocol::ProviderView`]
+    /// и конкретных провайдеров не знают.
+    fn glyph(&self) -> &'static str {
+        "♪"
+    }
+
+    /// Брендовый цвет бейджа в формате "#rrggbb". Дефолт — нейтральный.
+    fn color(&self) -> &'static str {
+        "#888888"
+    }
+
     /// Текущее состояние авторизации. Дешёвая операция: состояние
     /// кэшируется, сеть не трогается.
     fn auth(&self) -> AuthStatus;

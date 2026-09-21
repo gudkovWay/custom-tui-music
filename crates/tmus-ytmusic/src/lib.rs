@@ -200,6 +200,14 @@ impl Account for YtMusic {
         DISPLAY_NAME
     }
 
+    fn glyph(&self) -> &'static str {
+        "♪"
+    }
+
+    fn color(&self) -> &'static str {
+        "#ff0000"
+    }
+
     fn auth(&self) -> AuthStatus {
         self.auth.cached()
     }

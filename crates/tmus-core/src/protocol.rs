@@ -98,6 +98,10 @@ pub enum Cmd {
 
     // --- состояние и каталог ---
     State,
+    /// Перечитать cookies и проверить сессии у провайдеров.
+    /// `None` — у всех. Ответ [`Payload::Ack`]; результаты приходят
+    /// событиями [`Event::AuthChanged`].
+    RefreshAuth { provider: Option<String> },
     /// Провайдеры и состояние их авторизации.
     Providers,
     /// `provider = None` — искать во всех подключённых сразу.
@@ -246,6 +250,10 @@ pub struct ProviderView {
     pub id: String,
     pub name: String,
     pub auth: crate::model::AuthStatus,
+    /// Бейдж провайдера из `Account::glyph/color` — клиенты рисуют
+    /// иконку клиента, не зная список провайдеров.
+    pub glyph: String,
+    pub color: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -491,6 +499,19 @@ mod tests {
         assert_eq!(got, r#"{"id":30,"cmd":"home","provider":null}"#);
         let back: Request = serde_json::from_str(&got).expect("parse");
         assert_eq!(back.cmd, Cmd::Home { provider: None });
+    }
+
+    #[test]
+    fn refresh_auth_serializes() {
+        let got = line(&Request { id: 40, cmd: Cmd::RefreshAuth { provider: None } });
+        assert_eq!(got, r#"{"id":40,"cmd":"refresh_auth","provider":null}"#);
+        let back: Request = serde_json::from_str(&got).expect("parse");
+        assert_eq!(back.cmd, Cmd::RefreshAuth { provider: None });
+
+        let scoped = line(&Request { id: 41, cmd: Cmd::RefreshAuth { provider: Some("soundcloud".into()) } });
+        assert_eq!(scoped, r#"{"id":41,"cmd":"refresh_auth","provider":"soundcloud"}"#);
+        let back: Request = serde_json::from_str(&scoped).expect("parse");
+        assert_eq!(back.cmd, Cmd::RefreshAuth { provider: Some("soundcloud".into()) });
     }
 
     #[test]
