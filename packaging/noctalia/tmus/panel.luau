@@ -220,6 +220,10 @@ local typing = false
 local insertPending = nil
 local INSERT_ESCAPE_MS = 250
 local searchKind = "all"
+-- Фильтр выдачи по клиенту-провайдеру (§19): чипы над результатами
+-- и `c` в normal — цикл all → ytmusic → soundcloud → … Фильтр чисто
+-- локальный: выдача уже лежит в snapshot.results, демон не дёргается.
+local searchProvider = "all"
 local lastSearchSerial = nil
 local doSearch -- defined below; used by chips and submitSearch
 local rows -- defined below; used by rateSelected (cursor row lookup)
@@ -878,7 +882,9 @@ local function searchRows(s)
         kind = "track"
       end
     end
-    if (want == "all" or want == kind) and GROUP_TITLES[kind] then
+    -- Фильтр по клиенту (§19): рядом с фильтром вида, чисто локально.
+    local provOk = searchProvider == "all" or providerByTrack(r) == searchProvider
+    if provOk and (want == "all" or want == kind) and GROUP_TITLES[kind] then
       local row = resultRow(r)
       row.kind = kind
       -- Фильтр дизлайков касается только треков-результатов.
@@ -903,7 +909,7 @@ local rowsCacheSnap = nil
 function rows()
   local s = snapshot
   rebuildProviderMeta(s)
-  local key = view .. "|" .. playlistId .. "|" .. tostring(showHidden) .. "|" .. tostring(s.searchSerial or "")
+  local key = view .. "|" .. playlistId .. "|" .. tostring(showHidden) .. "|" .. tostring(s.searchSerial or "") .. "|" .. searchProvider
   if rowsCache ~= nil and rowsCacheKey == key and rowsCacheSnap == s then
     return rowsCache
   end
@@ -1783,6 +1789,47 @@ local function chipNode(kind, title)
   })
 end
 
+-- Чип фильтра по клиенту: тот же вид, что у чипов вида, но переключение
+-- чисто локальное — перевыдача не нужна, выдача уже в snapshot.
+local function providerChipNode(pid, title)
+  local active = searchProvider == pid
+  return ui.button({
+    key = "chip-prov-" .. pid,
+    text = title,
+    controlSize = "sm",
+    variant = active and "primary" or "ghost",
+    onClick = function()
+      searchProvider = pid
+      cursor = 1
+      draw()
+    end,
+  })
+end
+
+-- c в normal (поиск): цикл All → клиенты по порядку демона → All.
+-- Кириллический двойник — физическая C = Cyrillic_es (как A/D-паттерн).
+local function cycleSearchProvider()
+  local list = { "all" }
+  for _, p in ipairs(snapshot.providers or {}) do
+    local pid = tostring(p.id or "")
+    if pid ~= "" then
+      table.insert(list, pid)
+    end
+  end
+  if #list < 2 then
+    return
+  end
+  local idx = 1
+  for i, pid in ipairs(list) do
+    if pid == searchProvider then
+      idx = i
+      break
+    end
+  end
+  searchProvider = list[idx % #list + 1]
+  cursor = 1
+end
+
 -- Ввод имени нового плейлиста: как поиск, буфер ведёт onKey (витрину
 -- рисует Library-заголовок). forTrack — трек, который после создания
 -- надо сразу добавить.
@@ -1904,6 +1951,7 @@ local function helpNode()
     helpRow("back", "BackSpace · Esc", "назад: плейлист → Library, поиск → Home, буфер 3 → 2"),
     helpRow("search", "/ · i", "поиск: insert; jj/Esc — normal"),
     helpRow("killword", "ctrl+BackSpace", "удалить слово в запросе"),
+    helpRow("prov", "c", "фильтр выдачи по клиенту (поиск)"),
   })
   local col2 = ui.column({ key = "help-col-act", gap = 5 }, {
     helpRow("enter", "Return · Space", "открыть · играть · тумблер eq; пауза"),
@@ -1958,6 +2006,16 @@ function draw()
     for _, k in ipairs(SEARCH_KINDS) do
       table.insert(chips, chipNode(k.id, k.title))
     end
+    -- Чипы клиентов (§19): строим при >1 подключённом провайдере —
+    -- при единственном фильтр вырождается в шум. Глиф + имя клиента.
+    local provChips = { providerChipNode("all", "All") }
+    for _, p in ipairs(s.providers or {}) do
+      local pid = tostring(p.id or "")
+      if pid ~= "" then
+        local glyph = tostring(p.glyph or "")
+        table.insert(provChips, providerChipNode(pid, (glyph ~= "" and glyph .. " " or "") .. tostring(p.name or pid)))
+      end
+    end
     local state = stateNode(s, items)
     local body = {}
     if state then
@@ -2004,6 +2062,11 @@ function draw()
       ui.row({ key = "chips", gap = 8 }, chips),
       ui.column({ key = "ws-body", gap = GAP, flexGrow = 1 }, body),
     }
+    -- Строка чипов клиентов (§19) — между чипами видов и телом выдачи,
+    -- только когда есть из чего выбирать (>1 чипа = All + клиенты).
+    if #provChips > 1 then
+      table.insert(wsChildren, 3, ui.row({ key = "chips-prov", gap = 8 }, provChips))
+    end
   elseif view == "library" then
     local state = stateNode(s, items)
     local body = {}
@@ -2484,6 +2547,12 @@ function onKey(chord, pressed)
       elseif key == "i" or chord == "slash" or chord == "period" then
         typing = true
         insertPending = nil
+      elseif chord == "C" or chord == "c" or chord == "Cyrillic_es" then
+        -- c — фильтр выдачи по клиенту (§19), как `c` в TUI сужает
+        -- источник каталога; в insert-режиме это просто буква.
+        -- Оба регистра латиницы: хост отдаёт по-разному (прецедент
+        -- f-бинда нижним и A-бинда верхним регистром).
+        cycleSearchProvider()
       elseif key == "j" then
         move(1)
         startHold(chord, "down")
