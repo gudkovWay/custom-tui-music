@@ -964,6 +964,18 @@ function rows()
         active = tostring(s.source or "all") == p.id,
       })
     end
+    -- Действие, а не провайдер: полный перезапуск демона. Оно же —
+    -- способ перечитать cookies браузера без терминала: залогинился в
+    -- SoundCloud — жми сюда. Сокет обрывается, watch сервиса
+    -- переподключается и перечитывает состояние.
+    table.insert(out, {
+      kind = "client",
+      title = "Restart tmusd",
+      subtitle = "перезапустить демон: перечитать cookies и библиотеки",
+      event = "restart-daemon",
+      payload = "1",
+      restart = true,
+    })
   elseif view == "eq" then
     -- Старый демон (без equalizer в PlayerState) не даёт строк —
     -- вью покажет заглушку «eq недоступен».
@@ -1403,9 +1415,12 @@ local function listChildren(slice, first)
       local connected = authKind == "Ready" or authKind == "Anonymous"
       local hint = meta and meta.authHint or ""
       -- «All» — агрегатор, а не провайдер: meta у него нет, и «Sign in»
-      -- для него соврал бы. Статус нейтральный.
+      -- для него соврал бы. Статус нейтральный. Строка перезапуска —
+      -- действие, её подпись тоже нейтральная.
       local stateText, stateColor
-      if meta == nil then
+      if row.restart then
+        stateText, stateColor = "Restart", COLORS.muted
+      elseif meta == nil then
         stateText, stateColor = "All sources", COLORS.muted
       elseif connected then
         stateText, stateColor = "Connected", COLORS.accent

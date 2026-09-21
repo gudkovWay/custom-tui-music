@@ -787,6 +787,18 @@ function onIpc(event, payload)
       template = "kitty -e %s"
     end
     noctalia.runAsync((string.gsub(template, "%%s", TMUS)))
+  elseif event == "restart-daemon" then
+    -- Полный перезапуск демона из вида Clients: перечитывает cookies
+    -- браузера (логин в SoundCloud после старта демона) и библиотеки.
+    -- Сокет обрывается, watch переподключается сам; очередь и громкость
+    -- демон персистит при выходе.
+    noctalia.runAsync({ "systemctl", "--user", "restart", "tmusd" }, function(res)
+      if res and res.exitCode ~= 0 then
+        data.error = (res.stderr and noctalia.string.trim(res.stderr) or "") ~= ""
+          and noctalia.string.trim(res.stderr) or "restart tmusd не удался"
+        publish()
+      end
+    end)
   elseif event == "refresh" then
     refreshAll()
   elseif event == "reconnect" then

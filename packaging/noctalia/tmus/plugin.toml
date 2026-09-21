@@ -1,6 +1,6 @@
 id = "q/tmus"
 name = "Музыка"
-version = "0.6.2"
+version = "0.6.3"
 plugin_api = 24
 author = "q"
 license = "MIT"
