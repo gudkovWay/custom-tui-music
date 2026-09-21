@@ -74,11 +74,23 @@ impl App {
         kind: SearchKind,
         provider: Option<&str>,
     ) -> anyhow::Result<Vec<SearchResult>> {
+        // Параллельный fan-out, а не последовательный for: сумма
+        // латентностей провайдеров при мультисессии (YTM + SC) делает
+        // поиск мучительным, join_all ждал бы всех одновременно, а
+        // порядок результатов остаётся детерминированным (порядок
+        // Registry).
+        let targets = self.targets(provider)?;
+        let results = futures_util::future::join_all(
+            targets
+                .iter()
+                .map(|target| async move { (*target, target.catalog().search(query, kind).await) }),
+        )
+        .await;
         let mut out = Vec::new();
-        for target in self.targets(provider)? {
+        for (target, result) in results {
             // Один упавший провайдер не должен обнулять поиск по
             // остальным: агрегирующий поиск тем и полезен.
-            match target.catalog().search(query, kind).await {
+            match result {
                 Ok(found) => out.extend(found),
                 Err(err) => {
                     tracing::warn!(provider = %target.id(), %err, "поиск не удался");
@@ -94,9 +106,19 @@ impl App {
     }
 
     pub(crate) async fn library(&self, provider: Option<&str>) -> anyhow::Result<Vec<Playlist>> {
+        // Fan-out параллельно: поиск и библиотека — самые частые
+        // мультисессионные запросы, последовательная сумма латентностей
+        // недопустима.
+        let targets = self.targets(provider)?;
+        let results = futures_util::future::join_all(
+            targets
+                .iter()
+                .map(|target| async move { (*target, target.catalog().playlists().await) }),
+        )
+        .await;
         let mut out = Vec::new();
-        for target in self.targets(provider)? {
-            match target.catalog().playlists().await {
+        for (target, result) in results {
+            match result {
                 Ok(found) => out.extend(found),
                 Err(err) => {
                     tracing::warn!(provider = %target.id(), %err, "библиотека не прочиталась");
@@ -222,9 +244,18 @@ impl App {
     }
 
     pub(crate) async fn liked(&self, provider: Option<&str>) -> anyhow::Result<Vec<Track>> {
+        // Fan-out параллельно по той же причине, что и `search`:
+        // мультисессия не должна платить суммой латентностей.
+        let targets = self.targets(provider)?;
+        let results = futures_util::future::join_all(
+            targets
+                .iter()
+                .map(|target| async move { (*target, target.catalog().liked().await) }),
+        )
+        .await;
         let mut out = Vec::new();
-        for target in self.targets(provider)? {
-            match target.catalog().liked().await {
+        for (target, result) in results {
+            match result {
                 Ok(found) => out.extend(found),
                 Err(err) => {
                     tracing::warn!(provider = %target.id(), %err, "лайки не прочитались");
@@ -255,9 +286,19 @@ impl App {
                 return Ok(cached.shelves.clone());
             }
         }
+        // Fan-out параллельно (причины те же, что у `search`), но
+        // со строгим инвариантом home: полная ошибка любого провайдера
+        // роняет весь ответ (кэш пишется только при полном успехе).
+        let targets = self.targets(provider)?;
+        let results = futures_util::future::join_all(
+            targets
+                .iter()
+                .map(|target| async move { (*target, target.catalog().home().await) }),
+        )
+        .await;
         let mut out = Vec::new();
-        for target in self.targets(provider)? {
-            match target.catalog().home().await {
+        for (target, result) in results {
+            match result {
                 Ok(shelves) => out.extend(shelves),
                 Err(tmus_provider::ProviderError::Unsupported { .. }) => {
                     // Не каждый провайдер умеет домашнюю ленту: это не
@@ -507,6 +548,10 @@ impl App {
     }
 }
 
+/// Правило дефолта источника каталога: сохранённый источник жив, пока
+/// он существует и валиден; при отсутствии/невалидности — «все
+/// клиенты» (`provider: None`), потому что мультисессионный режим
+/// делает переключение источника необязательным.
 pub fn resolve_catalog_source(
     saved: Option<&CatalogSource>,
     connected: Vec<String>,
@@ -520,7 +565,7 @@ pub fn resolve_catalog_source(
         {
             source.clone()
         }
-        _ => CatalogSource { provider: connected.into_iter().next() },
+        _ => CatalogSource { provider: None },
     }
 }
 
@@ -540,11 +585,11 @@ mod catalog_source_tests {
     }
 
     #[test]
-    fn invalid_saved_provider_falls_back_to_first_connected() {
+    fn invalid_saved_provider_falls_back_to_all() {
         let saved = CatalogSource { provider: Some("spotify".into()) };
         assert_eq!(
             resolve_catalog_source(Some(&saved), vec!["ytmusic".into(), "soundcloud".into()]),
-            CatalogSource { provider: Some("ytmusic".into()) }
+            CatalogSource { provider: None }
         );
     }
 
@@ -558,14 +603,14 @@ mod catalog_source_tests {
     }
 
     #[test]
-    fn no_saved_source_selects_first_connected_or_all() {
+    fn no_saved_source_is_all() {
         assert_eq!(
             resolve_catalog_source(None, Vec::new()),
             CatalogSource { provider: None }
         );
         assert_eq!(
             resolve_catalog_source(None, vec!["soundcloud".into()]),
-            CatalogSource { provider: Some("soundcloud".into()) }
+            CatalogSource { provider: None }
         );
     }
 }
