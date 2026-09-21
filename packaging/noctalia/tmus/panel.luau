@@ -2445,7 +2445,13 @@ function onKey(chord, pressed)
     draw()
     return
   end
-  if chord == "question" and not typing then
+  -- ? — keysym question в обеих раскладках, но хост может отдать
+  -- хорду с модификатором (Shift+question) или в другом регистре
+  -- (прецедент BackSpace/Backspace) — принимаем все формы через
+  -- lower. Буквы хост сглаживает в верхний регистр, пунктуацию —
+  -- как повезёт; capture_keys держит обе записи (plugin.toml).
+  local lq = string.lower(tostring(chord))
+  if (lq == "question" or lq == "shift+question") and not typing then
     helpShown = true
     draw()
     return

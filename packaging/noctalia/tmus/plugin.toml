@@ -1,6 +1,6 @@
 id = "q/tmus"
 name = "Музыка"
-version = "0.6.3"
+version = "0.6.4"
 plugin_api = 24
 author = "q"
 license = "MIT"
@@ -44,7 +44,7 @@ height = 760
 capture_keys = [
   "Left", "Right", "Up", "Down", "Return", "Escape", "Space", "slash",
   "period", "comma", "minus", "apostrophe", "BackSpace", "less", "greater",
-  "question",
+  "question", "Shift+question",
   "ctrl+j", "ctrl+k", "ctrl+Cyrillic_o", "ctrl+Cyrillic_el",
   "Tab", "ctrl+l", "ctrl+h", "ctrl+Cyrillic_de", "ctrl+Cyrillic_er",
   "ctrl+BackSpace",
