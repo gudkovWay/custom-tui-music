@@ -23,7 +23,8 @@
 сессию в профиле браузера.
 
 ```sh
-cargo install --path crates/tmus-tui --path crates/tmus-daemon
+cargo install --path crates/tmus-tui
+cargo install --path crates/tmus-daemon
 install -Dm644 packaging/tmusd.service ~/.config/systemd/user/tmusd.service
 systemctl --user enable --now tmusd
 ```
