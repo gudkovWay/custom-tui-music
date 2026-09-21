@@ -424,8 +424,8 @@ impl App {
             // рейтингов их не касается), после успеха демон рассылает
             // `PlaylistsChanged`, а список клиенты перечитывают сами —
             // см. `playlist_*` в catalog.rs.
-            Cmd::PlaylistCreate { title } => {
-                let playlist = self.playlist_create(&title).await?;
+            Cmd::PlaylistCreate { title, provider } => {
+                let playlist = self.playlist_create(&title, provider.as_deref()).await?;
                 Ok(Payload::PlaylistCreated { playlist: playlist.id })
             }
             Cmd::PlaylistAdd { playlist, track } => {
@@ -1048,7 +1048,7 @@ mod tests {
         let mut events = app.subscribe();
 
         let payload = app
-            .handle(Cmd::PlaylistCreate { title: "Chill".into() })
+            .handle(Cmd::PlaylistCreate { title: "Chill".into(), provider: None })
             .await
             .expect("create");
         match payload {
@@ -1114,7 +1114,7 @@ mod tests {
         let mut events = app.subscribe();
 
         assert!(
-            app.handle(Cmd::PlaylistCreate { title: "Chill".into() })
+            app.handle(Cmd::PlaylistCreate { title: "Chill".into(), provider: None })
                 .await
                 .is_err(),
             "ошибка создания обязана дойти наружу"

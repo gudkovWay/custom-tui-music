@@ -375,14 +375,21 @@ impl App {
         }
     }
 
-    /// Провайдер для плейлистных операций без явного адресата
-    /// (`PlaylistCreate`): берётся выбранный источник каталога, а без
-    /// выбора — единственный/первый подключённый. Create — единственная
-    /// операция, у которой нет id плейлиста, по которому можно понять
-    /// провайдера.
+    /// Адресат плейлистных операций без id плейлиста (`PlaylistCreate`).
+    /// Правило: явный provider из команды (иначе — ошибка, если такой
+    /// не подключён) → сохранённый источник каталога (та же валидация)
+    /// → первый подключённый. Create — единственная операция, у которой
+    /// нет id плейлиста, по которому можно понять провайдера.
     fn playlist_provider(
         &self,
+        explicit: Option<&str>,
     ) -> anyhow::Result<&Arc<dyn tmus_provider::Provider>> {
+        if let Some(name) = explicit {
+            return self
+                .registry
+                .get_by_str(name)
+                .ok_or_else(|| anyhow::anyhow!("провайдер {name} не подключён"));
+        }
         let saved: Option<String> = self
             .catalog_source
             .lock()
@@ -420,9 +427,14 @@ impl App {
         err.into()
     }
 
-    /// Создать плейлист у выбранного провайдера и разослать сигнал.
-    pub(crate) async fn playlist_create(&self, title: &str) -> anyhow::Result<Playlist> {
-        let provider = self.playlist_provider()?;
+    /// Создать плейлист у провайдера по правилу `playlist_provider`
+    /// и разослать сигнал.
+    pub(crate) async fn playlist_create(
+        &self,
+        title: &str,
+        provider: Option<&str>,
+    ) -> anyhow::Result<Playlist> {
+        let provider = self.playlist_provider(provider)?;
         match provider.catalog().playlist_create(title).await {
             Ok(playlist) => {
                 self.emit(Event::PlaylistsChanged);

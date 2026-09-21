@@ -720,7 +720,12 @@ async fn create_and_add(app: &mut App) {
         Some(title) => title,
         None => return,
     };
-    match app.client.call(Cmd::PlaylistCreate { title }).await {
+    // Плейлист создаём у того клиента, откуда трек: в мультисессионном
+    // режиме «первый подключённый» был бы сюрпризом. Пикер открыт, только
+    // когда есть выбранный трек, а пока он открыт, курсор списков не ходит
+    // (дж/к перехватывает пикер), так что цель та же, что при открытии.
+    let provider = selected_track(app).map(|t| t.provider.as_str().to_owned());
+    match app.client.call(Cmd::PlaylistCreate { title, provider }).await {
         Ok(Payload::PlaylistCreated { playlist }) => {
             app.picker = None;
             app.notice = None;

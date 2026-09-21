@@ -141,7 +141,13 @@ pub enum Cmd {
     /// умолчанию (YouTube Music — `PRIVATE`, чтобы пользовательский
     /// выбор приватности не приходилось тащить через весь протокол).
     /// Демон отвечает [`Payload::PlaylistCreated`] с новым id.
-    PlaylistCreate { title: String },
+    PlaylistCreate {
+        title: String,
+        /// Адресат создания: None значит «выбрать по правилу демона» —
+        /// сохранённый источник каталога, иначе первый подключённый.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
     /// Добавить трек в плейлист. И плейлист, и трек нужны явно: одна и
     /// та же операция осмысленна для любого плейлиста библиотеки, а
     /// «текущего плейлиста» в демоне нет — он играет очередь.
@@ -432,11 +438,11 @@ mod tests {
         let track_id = TrackId::new(ProviderId::YTMUSIC, "abc");
 
         // create: только title, приватность решает провайдер.
-        let create = line(&Request { id: 20, cmd: Cmd::PlaylistCreate { title: "Chill".into() } });
+        let create = line(&Request { id: 20, cmd: Cmd::PlaylistCreate { title: "Chill".into(), provider: None } });
         assert_eq!(create, r#"{"id":20,"cmd":"playlist_create","title":"Chill"}"#);
         let back: Request = serde_json::from_str(&create).expect("parse");
         assert_eq!(back.id, 20);
-        assert_eq!(back.cmd, Cmd::PlaylistCreate { title: "Chill".into() });
+        assert_eq!(back.cmd, Cmd::PlaylistCreate { title: "Chill".into(), provider: None });
 
         // add/remove: кадр плоский, оба id разворачиваются на месте.
         let add = line(&Request {

@@ -181,7 +181,13 @@ enum CacheCmd {
 #[derive(Subcommand)]
 enum PlCmd {
     /// Создать плейлист; печатает id созданного.
-    New { title: String },
+    New {
+        title: String,
+        /// Кому создавать: без флага решает демон (сохранённый источник
+        /// каталога, иначе первый подключённый клиент).
+        #[arg(long)]
+        provider: Option<String>,
+    },
     /// Добавить трек в плейлист.
     Add { playlist_id: String, track: String },
     /// Убрать трек из плейлиста.
@@ -409,17 +415,21 @@ async fn main() -> Result<()> {
 /// `tmus pl …`: пять действий над плейлистами. Все ходят в те же Cmd,
 /// что и TUI; `new` разворачивает `Payload::PlaylistCreated` в голый
 /// id — потребителю (сервису плагина) больше ничего не нужно, а id он
-/// сразу передаёт в `pl add`. `ls` переиспользует путь `library/list`
+/// сразу передаёт в `pl add`. `--provider` выбирает, у какого клиента
+/// создавать плейлист; без флага решает демон (сохранённый источник
+/// каталога, иначе первый подключённый). `ls` переиспользует путь `library/list`
 /// (`Cmd::Library`): отдельной команды плейлистов в протоколе нет.
 async fn run_pl(client: &mut client::Client, action: PlCmd) -> Result<()> {
     match action {
-        PlCmd::New { title } => match client.call(Cmd::PlaylistCreate { title }).await? {
-            Payload::PlaylistCreated { playlist } => {
-                println!("{playlist}");
-                Ok(())
+        PlCmd::New { title, provider } => {
+            match client.call(Cmd::PlaylistCreate { title, provider }).await? {
+                Payload::PlaylistCreated { playlist } => {
+                    println!("{playlist}");
+                    Ok(())
+                }
+                _ => bail!("неожиданный ответ на PlaylistCreate"),
             }
-            _ => bail!("неожиданный ответ на PlaylistCreate"),
-        },
+        }
         PlCmd::Add { playlist_id, track } => {
             let cmd = Cmd::PlaylistAdd {
                 playlist: parse_playlist_id(&playlist_id)?,
@@ -961,7 +971,10 @@ mod tests {
     #[test]
     fn pl_subcommands_parse_ids_title_and_json_flag() {
         match Cli::try_parse_from(["tmus", "pl", "new", "Chill"]).expect("valid").cmd {
-            Some(CliCmd::Pl(PlCmd::New { title })) => assert_eq!(title, "Chill"),
+            Some(CliCmd::Pl(PlCmd::New { title, provider })) => {
+                assert_eq!(title, "Chill");
+                assert_eq!(provider, None);
+            }
             _ => panic!("ожидалась подкоманда pl new"),
         }
         match Cli::try_parse_from(["tmus", "pl", "add", "ytmusic:PL1", "ytmusic:abc"])

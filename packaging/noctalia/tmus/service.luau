@@ -635,7 +635,10 @@ function onIpc(event, payload)
     if op == "new" then
       call({ "pl", "new", rest }, nil, function() pullLibrary() end)
     elseif op == "newadd" then
-      -- Создание + немедленное добавление трека. id нового плейлиста
+      -- Создание + немедленное добавление трека. В отличие от "new",
+      -- здесь есть контекст трека, поэтому плейлист создаём у провайдера
+      -- трека (--provider); адресата выбирает не демон. id нового
+      -- плейлиста
       -- существует только в stdout `pl new` (голая строка, не JSON),
       -- поэтому цепочка живёт здесь: call() прогоняет stdout через
       -- json.decode и голый id наружу не отдаёт — runAsync напрямую,
@@ -643,7 +646,7 @@ function onIpc(event, payload)
       -- дубликатами имён; в цепочке id точный.
       local title, prov, tid = rest:match("^([^:]+):([^:]+):(.+)$")
       if title and prov and tid then
-        noctalia.runAsync({ TMUS, "pl", "new", title }, function(res)
+        noctalia.runAsync({ TMUS, "pl", "new", title, "--provider", prov }, function(res)
           if not res or res.exitCode ~= 0 then
             data.error = res and noctalia.string.trim(res.stderr or "") ~= ""
               and noctalia.string.trim(res.stderr) or "tmus не ответил"
