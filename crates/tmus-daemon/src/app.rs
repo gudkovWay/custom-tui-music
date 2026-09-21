@@ -559,11 +559,32 @@ impl App {
     }
 
     async fn play_playlist(&self, id: &PlaylistId, start: usize) -> anyhow::Result<()> {
-        let tracks = self.playlist_tracks(id).await?;
+        let mut tracks = self.playlist_tracks(id).await?;
         if tracks.is_empty() {
             anyhow::bail!("плейлист {id} пуст");
         }
-        let start = start.min(tracks.len() - 1);
+        // Панель шлёт позицию из своего снапшота, а тот мог видеть
+        // больше страниц, чем лежит в свежем срезе кэша: TTL протух
+        // или демон перезапущен, и полное чтение взяло только батч
+        // первых страниц. Догружаем до запрошенной позиции, а не
+        // клампим молча в хвост среза — иначе играет «какой-то трек»,
+        // а не выбранный человеком.
+        while start >= tracks.len() {
+            let (page, next) = self.playlist_tracks_page(id).await?;
+            if page.is_empty() {
+                break;
+            }
+            tracks.extend(page);
+            if next.is_none() {
+                break;
+            }
+        }
+        if start >= tracks.len() {
+            anyhow::bail!(
+                "позиция {start} вне плейлиста {id}: загружено {} треков",
+                tracks.len()
+            );
+        }
         let first = tracks[start].id.clone();
         let len = self
             .player
@@ -1236,6 +1257,50 @@ mod tests {
             None,
             "после исчерпания курсор обязан быть стёрт"
         );
+    }
+
+    /// Выбор позиции глубже свежего среза обязан догрузиться до неё, а
+    /// не играть хвост батча: панель шлёт `--start` из снапшота, который
+    /// пережил TTL кэша. Раньше `start.min(len-1)` молча клампил в
+    /// последний трек батча — человек выбирал трек на 11-й странице, а
+    /// играл последний из первых десяти.
+    #[tokio::test]
+    async fn play_playlist_fetches_pages_until_requested_start() {
+        let (app, provider, _dir) = app_full(false, false).await;
+        provider.set_pages((0..11).map(|i| page_of(i, 1)).collect());
+        let playlist = PlaylistId::new(ProviderId::YTMUSIC, "LM");
+
+        // Срез протух: полное чтение берёт батч 10 страниц, курсор "10".
+        let slice = app.playlist_tracks(&playlist).await.expect("full read");
+        assert_eq!(slice.len(), 10, "свежий срез — только батч");
+
+        app.handle(Cmd::PlayPlaylist { playlist: playlist.clone(), start: Some(10) })
+            .await
+            .expect("play at 10");
+
+        let state = app.player.state().await;
+        assert_eq!(
+            state.track.map(|t| t.id),
+            Some(TrackId::new(ProviderId::YTMUSIC, "v10")),
+            "играет выбранный трек одиннадцатой страницы, а не хвост батча"
+        );
+        assert_eq!(state.queue_len, 11, "догруженный хвост обязан попасть в очередь");
+        assert_eq!(state.queue_index, Some(10));
+    }
+
+    /// Позиция за пределами реального состава — честная ошибка, а не
+    /// тихий сдвиг на последний трек.
+    #[tokio::test]
+    async fn play_playlist_rejects_start_beyond_listing() {
+        let (app, provider, _dir) = app_full(false, false).await;
+        provider.set_pages((0..3).map(|i| page_of(i, 1)).collect());
+        let playlist = PlaylistId::new(ProviderId::YTMUSIC, "LM");
+
+        let err = app
+            .handle(Cmd::PlayPlaylist { playlist: playlist.clone(), start: Some(50) })
+            .await
+            .expect_err("позиция вне состава — отказ");
+        assert!(err.to_string().contains("вне плейлиста"), "неожиданная ошибка: {err}");
     }
 
     /// Полное чтение с исчерпанием фиксирует «дочитано»: курсор None.
