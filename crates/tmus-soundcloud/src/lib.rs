@@ -342,7 +342,7 @@ impl Resolver for SoundCloud {
             .media(&YtDlpRequest {
                 provider: self.id,
                 page_url: &page_url,
-                format: &self.format,
+                format: self.format,
                 extractor_args: &[],
                 cookies: Some(&self.cookies),
             })
