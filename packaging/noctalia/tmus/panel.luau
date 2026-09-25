@@ -2028,8 +2028,10 @@ local function pickerItems(s)
   for _, p in ipairs(s.playlists or {}) do
     if playlistAddable(p, trackProv) then
       local ref = plRef(p)
-      local bare = ref:match(":(.+)$") or ref
-      table.insert(out, { ref = ref, title = tostring(p.title or ""), lm = bare == "LM" })
+      -- Лайк-адресат — ТОЛЬКО точный агрегатный id "local:liked" из
+      -- демона. Ни native "ytmusic:LM", ни плейлисты с похожими
+      -- названиями/суффиксами сюда не попадают.
+      table.insert(out, { ref = ref, title = tostring(p.title or ""), liked = ref == "local:liked" })
     end
   end
   return out
@@ -2064,9 +2066,9 @@ local function playlistPickerNode(s)
         draw()
       end,
     }, {
-      -- LM управляется лайками (edit_playlist туда не пишет) — помечаем
-      -- пункт, чтобы выбор читался как лайк, а не добавление.
-      lbl(item.lm and (shorten(item.title, 26) .. " · ♥ лайк") or shorten(item.title, 34), {
+      -- local:liked управляется лайками (pl add туда не пишет) —
+      -- помечаем пункт, чтобы выбор читался как лайк, а не добавление.
+      lbl(item.liked and (shorten(item.title, 26) .. " · ♥ лайк") or shorten(item.title, 34), {
         key = "plpick-t" .. i,
         grow = 1,
         color = active and COLORS.accent or COLORS.text,
@@ -2653,9 +2655,9 @@ function onKey(chord, pressed)
       else
         local item = items[plPicker.cursor]
         if item and item.ref then
-          if item.lm then
-            -- Liked Music нельзя править через edit_playlist — он
-            -- целиком выводится из лайков; подтверждение на LM = лайк
+          if item.ref == "local:liked" then
+            -- Агрегатный Liked нельзя править через pl add — он целиком
+            -- выводится из лайков; подтверждение на local:liked = лайк
             -- трека, ради которого и открыт пикер.
             poke("rate", "like:" .. plPicker.track)
           else
@@ -3028,7 +3030,10 @@ function onKey(chord, pressed)
       -- позиции (pl rm-at): дубликаты уходят строго по одному, идентичность
       -- не размывается. Нативный — только при caps.playlist_remove,
       -- иначе по id трека (pl rm).
-      if row and row.kind == "track" and row.id and row.pos ~= nil then
+      if row and row.kind == "track" and row.id and row.pos ~= nil
+        and playlistId ~= "local:liked" then
+        -- local:liked — агрегат только для чтения: убрать из него трек
+        -- нельзя (снимите лайк), ни по позиции, ни по id.
         local prov = trackProvider(playlistId)
         if isLocalProvider(prov) then
           poke("pl", "rmat:" .. playlistId .. ":" .. tostring(row.pos))
@@ -3050,9 +3055,10 @@ function onKey(chord, pressed)
       end
     elseif view == "library" then
       local row = rows()[cursor]
-      if row and row.kind == "playlist" and (row.plid or "") ~= "" then
+      if row and row.kind == "playlist" and (row.plid or "") ~= ""
+        and row.plid ~= "local:liked" then
         -- Удаление самого плейлиста: локальный — всегда; нативный —
-        -- только при caps.playlist_delete.
+        -- только при caps.playlist_delete. local:liked нельзя удалить.
         local caps = capsOfProvider(row.provider)
         if isLocalProvider(row.provider)
           or (type(caps) == "table" and caps.playlist_delete == true) then

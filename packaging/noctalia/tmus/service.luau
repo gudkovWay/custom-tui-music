@@ -57,6 +57,25 @@ local tracksMoreInFlight = false
 -- запрос (в т.ч. повторный по тому же id) не должен затирать свежий
 -- снапшот плейлиста. Инкремент и захват — в pullTracks.
 local tracksRequestGeneration = 0
+-- Летящая догрузка первой страницы (pullTracks): пока актуальный
+-- library-tracks не вернулся, tracks-more отклоняется — иначе
+-- продолжение может дописать страницы поверх/мимо нового снапшота.
+-- Снимается только тем поколением, которое её поставило: завершение
+-- устаревшего pull не должен гасить guard свежего.
+local tracksRefreshInFlight = false
+
+-- Агрегатный плейлист лайков: ТОЧНЫЙ id из демона. Никаких эвристик
+-- по названию или суффиксу "liked" — только полное совпадение.
+local LOCAL_LIKED = "local:liked"
+-- Нативная лайк-коллекция YTM: точный id демона, тоже маршрутизируется
+-- как лайк-коллекция для refresh после зеркалирования оценки.
+local NATIVE_LIKED = "ytmusic:LM"
+local LIKED_IDS = { [LOCAL_LIKED] = true, [NATIVE_LIKED] = true }
+-- Синхронный id запрошенного плейлиста: ставится в начале pullTracks
+-- рядом с инкрементом поколения. В отличие от data.tracksId (последний
+-- УСПЕШНЫЙ ответ), он отражает текущий запрос сразу — маршрутизация
+-- refresh-событий не должна опираться на устаревший успешный снапшот.
+local tracksRequestedId = nil
 -- Летящая догрузка home-ленты: тот же принцип, что у tracks-more.
 -- Сбрасывается также в pullHome — новая лента обнуляет продолжение,
 -- и застрявший guard не должен блокировать следующую догрузку.
@@ -499,20 +518,84 @@ local function pullLibrary()
 end
 
 local function pullTracks(id)
+  -- Синхронный захват до инкремента поколения: playlists_changed
+  -- маршрутизируется по запрошенному сейчас плейлисту, а не по
+  -- последнему успешному снапшоту (data.tracksId).
+  tracksRequestedId = id
   tracksRequestGeneration = tracksRequestGeneration + 1
   local generation = tracksRequestGeneration
+  tracksRefreshInFlight = true
   call({ "library-tracks", id, "--json" }, function(got)
     -- Ответ чужой, если пока летел запрос, ушёл более новый
     -- library-tracks (другой плейлист или повторное открытие того же).
+    -- Guard не трогаем: его поставило и снимет текущее поколение.
     if generation ~= tracksRequestGeneration then
       return
     end
+    tracksRefreshInFlight = false
     local tracks = type(got) == "table" and got or {}
     data.tracks = tracks
     data.tracksId = id
     data.hasMore = true
     for _, tr in ipairs(data.tracks) do
       decorateArt("track", tr)
+    end
+  end, function()
+    -- Ошибочный путь (onOk не сработал): снимаем guard, но только
+    -- если это по-прежнему актуальное поколение.
+    if generation == tracksRequestGeneration then
+      tracksRefreshInFlight = false
+    end
+  end)
+end
+
+-- Лимит цепочки догрузки: один tracks-more дочитывает не больше
+-- трёх ПОДРЯД пустых нетерминальных страниц. После лимита hasMore
+-- остаётся true — следующее движение панели повторит запрос.
+local TRACKS_MORE_MAX_EMPTY_CHAIN = 3
+
+-- Одна страница library-tracks-more. При пустой нетерминальной
+-- странице синхронно продолжает цепочку (до TRACKS_MORE_MAX_EMPTY_CHAIN
+-- пустых подряд), останавливаясь на первой непустой, терминальном
+-- next, чужом поколении или ошибке. finished снимает tracksMoreInFlight
+-- ровно один раз — в конце цепочки; промежуточный onDone после уже
+-- запущенного продолжения guard не трогает.
+local function fetchTracksMore(want, generation, emptyChain, finished)
+  local continued = false
+  call({ "library-tracks-more", want, "--json" }, function(got)
+    -- Пока летел запрос, открыли другой плейлист: страница чужая —
+    -- дописывать её в текущий список нельзя. Заодно: если ушёл новый
+    -- pullTracks (даже тот же id), снапшот обновился и продолжение
+    -- старого чтения протухло. Цепочка мертва — снимаем guard.
+    if data.tracksId ~= want or generation ~= tracksRequestGeneration then
+      finished()
+      return
+    end
+    local page = type(got) == "table" and got or {}
+    local pageTracks = type(page.tracks) == "table" and page.tracks or {}
+    -- Курсор продолжения живёт только в демоне: hasMore определяется
+    -- исключительно наличием next. Пустая страница с непустым next —
+    -- нетерминальная, догрузка продолжается; пустая без next — дочитано.
+    local next = type(page.next) == "string" and page.next ~= "" and page.next or nil
+    data.hasMore = next ~= nil
+    for _, tr in ipairs(pageTracks) do
+      table.insert(data.tracks, tr)
+      decorateArt("track", tr)
+    end
+    -- Непустая страница или терминальный next: конец цепочки (guard
+    -- снимет onDone, continued остался false).
+    if #pageTracks > 0 or next == nil then
+      return
+    end
+    if emptyChain + 1 >= TRACKS_MORE_MAX_EMPTY_CHAIN then
+      return
+    end
+    continued = true
+    fetchTracksMore(want, generation, emptyChain + 1, finished)
+  end, function()
+    -- Ошибка страницы без запущенного продолжения — конец цепочки.
+    if not continued then
+      finished()
     end
   end)
 end
@@ -669,11 +752,25 @@ local function onEvent(line)
     else
       data.ratings[key] = tostring(got.rating)
     end
+    -- Агрегатный Liked выводится из лайков, но перечитывать его здесь
+    -- нельзя: rating_changed прилетает до того, как демон доразрешил
+    -- зеркалирование в провайдеры, и гонка затирает свежий снапшот.
+    -- Обновление открытого local:liked делает playlists_changed,
+    -- который демон шлёт после зеркалирования.
   elseif kind == "playlists_changed" then
     -- Демон шлёт только сигнал без списка: перечитываем library целиком —
     -- полный ответ дешевле инкрементальных правок на 18 плейлистов, а
     -- панель обновится через watch тяжёлого ключа после publish().
     pullLibrary()
+    -- Демон шлёт playlists_changed и после зеркалирования оценки в
+    -- провайдеры: это сигнал, что открытую лайк-коллекцию (агрегат
+    -- local:liked или нативный ytmusic:LM) можно перечитать. Сверяемся
+    -- с запрошенным сейчас плейлистом: если пользователь уже ушёл с
+    -- лайков, поздний refresh не должен инкрементировать поколение и
+    -- отменять/затирать более новый запрос.
+    if LIKED_IDS[tracksRequestedId] then
+      pullTracks(tracksRequestedId)
+    end
   elseif kind == "state_changed" then
     applyState(got.state)
   elseif kind == "queue_changed" then
@@ -849,8 +946,11 @@ function onIpc(event, payload)
       -- жадный хвост (.+) — составной id трека "prov:id": двоеточия
       -- в нём расколу не мешают.
       local plProv, plBare, track = rest:match("^([^:]+):([^:]+):(.+)$")
-      if plProv and plBare and track then
-        call({ "pl", op, plProv .. ":" .. plBare, track }, nil, function() pullLibrary() end)
+      -- local:liked — агрегат только для чтения: добавить/убрать
+      -- трек через pl нельзя, лайки меняются через rate.
+      local plRefFull = plProv and plBare and (plProv .. ":" .. plBare) or ""
+      if plRefFull ~= "" and plRefFull ~= LOCAL_LIKED and plProv and plBare and track then
+        call({ "pl", op, plRefFull, track }, nil, function() pullLibrary() end)
       end
     elseif op == "rmat" then
       -- Удаление из ЛОКАЛЬНОГО плейлиста по абсолютной позиции
@@ -859,7 +959,8 @@ function onIpc(event, payload)
       -- плейлист заведомо локальный (панель шлёт rmat только для
       -- provider == "local").
       local plProv, plBare, pos = rest:match("^([^:]+):([^:]+):(%d+)$")
-      if plProv and plBare then
+      -- local:liked только для чтения: позиционное удаление мимо.
+      if plProv and plBare and not (plProv == "local" and plBare == "liked") then
         -- Захват до запуска: если пока летит rm-at панель открыла другой
         -- плейлист (pullTracks уже инкрементировал поколение), поздний
         -- рефреш не должен затирать новый запрос.
@@ -874,7 +975,10 @@ function onIpc(event, payload)
       end
     elseif op == "del" and rest ~= "" then
       -- rest уже составной "<prov>:<id>" — CLI принимает как есть.
-      call({ "pl", "del", rest }, nil, function() pullLibrary() end)
+      -- local:liked нельзя удалить.
+      if rest ~= LOCAL_LIKED then
+        call({ "pl", "del", rest }, nil, function() pullLibrary() end)
+      end
     end
   elseif event == "play-playlist" and payload then
     -- PlayPlaylist { playlist, track }: составной id плейлиста,
@@ -936,37 +1040,18 @@ function onIpc(event, payload)
     pullTracks(tostring(payload))
   elseif event == "tracks-more" and payload then
     -- Ленивая догрузка хвоста: панель стучится, когда курсор подошёл
-    -- к концу списка. Повторный запрос, пока летит предыдущий,
-    -- схлопываем флагом — cb/onDone его снимут.
-    if tracksMoreInFlight then
+    -- к концу списка. Повторный запрос, пока летит предыдущий, и запрос
+    -- во время догрузки первой страницы схлопываем флагами.
+    if tracksMoreInFlight or tracksRefreshInFlight then
       return
     end
     tracksMoreInFlight = true
     local want = tostring(payload)
     local generation = tracksRequestGeneration
-    call({ "library-tracks-more", want, "--json" }, function(got)
-      tracksMoreInFlight = false
-      -- Пока летел запрос, открыли другой плейлист: страница чужая —
-      -- дописывать её в текущий список нельзя. Заодно: если ушёл новый
-      -- pullTracks (даже тот же id), снапшот обновился и продолжение
-      -- старого чтения протухло.
-      if data.tracksId ~= want or generation ~= tracksRequestGeneration then
-        return
-      end
-      local page = type(got) == "table" and got or {}
-      local pageTracks = type(page.tracks) == "table" and page.tracks or {}
-      if #pageTracks > 0 then
-        for _, tr in ipairs(pageTracks) do
-          table.insert(data.tracks, tr)
-          decorateArt("track", tr)
-        end
-        -- Курсор продолжения живёт только в демоне: есть next — есть хвост.
-        data.hasMore = page.next ~= nil and page.next ~= ""
-      else
-        -- Пустая страница = дочитано: панель перестаёт стучаться.
-        data.hasMore = false
-      end
-    end, function()
+    -- Цепочка пустых нетерминальных страниц живёт внутри fetchTracksMore;
+    -- guard держится до её конца (успех, лимит, терминал, чужое
+    -- поколение или ошибка).
+    fetchTracksMore(want, generation, 0, function()
       tracksMoreInFlight = false
     end)
     -- publish() здесь не нужен: call() публикует сам в onDone (так же
