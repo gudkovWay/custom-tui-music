@@ -2832,6 +2832,12 @@ function onKey(chord, pressed)
         local count = #rows()
         cursor = cursor == 1 and count or 1
         maybeLoadMore()
+      elseif key == "f" then
+        -- Оценка строки курсора — то же, что глобальная карта ниже;
+        -- normal-ветка поиска иначе съедает клавишу draw/return'ом.
+        rateSelected("liked")
+      elseif key == "d" then
+        rateSelected("disliked")
       elseif chord == "BackSpace" or chord == "Backspace" then
         -- Назад на home — зеркало Esc; захват остаётся, чтобы
         -- клавиша не утекала под панель.
