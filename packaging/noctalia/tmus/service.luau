@@ -53,6 +53,10 @@ local sourceReady = false
 -- Летящая догрузка хвоста плейлиста: повторный tracks-more, пока не
 -- вернулся предыдущий call, игнорируется. Сбрасывается в cb и onDone.
 local tracksMoreInFlight = false
+-- Монотонный номер запроса library-tracks: поздний ответ на старый
+-- запрос (в т.ч. повторный по тому же id) не должен затирать свежий
+-- снапшот плейлиста. Инкремент и захват — в pullTracks.
+local tracksRequestGeneration = 0
 -- Летящая догрузка home-ленты: тот же принцип, что у tracks-more.
 -- Сбрасывается также в pullHome — новая лента обнуляет продолжение,
 -- и застрявший guard не должен блокировать следующую догрузку.
@@ -494,6 +498,25 @@ local function pullLibrary()
   end)
 end
 
+local function pullTracks(id)
+  tracksRequestGeneration = tracksRequestGeneration + 1
+  local generation = tracksRequestGeneration
+  call({ "library-tracks", id, "--json" }, function(got)
+    -- Ответ чужой, если пока летел запрос, ушёл более новый
+    -- library-tracks (другой плейлист или повторное открытие того же).
+    if generation ~= tracksRequestGeneration then
+      return
+    end
+    local tracks = type(got) == "table" and got or {}
+    data.tracks = tracks
+    data.tracksId = id
+    data.hasMore = true
+    for _, tr in ipairs(data.tracks) do
+      decorateArt("track", tr)
+    end
+  end)
+end
+
 local function pullHome()
   homeAt = noctalia.nowMs()
   -- Новая лента обнуляет продолжение: застрявший guard догрузки не
@@ -813,7 +836,12 @@ function onIpc(event, payload)
           if plId == "" then
             return
           end
-          call({ "pl", "add", "local:" .. plId, prov .. ":" .. tid }, nil, function() pullLibrary() end)
+          call({ "pl", "add", plId, prov .. ":" .. tid }, nil, function()
+            pullLibrary()
+            if data.tracksId == plId then
+              pullTracks(plId)
+            end
+          end)
         end)
       end
     elseif op == "add" or op == "rm" then
@@ -832,7 +860,17 @@ function onIpc(event, payload)
       -- provider == "local").
       local plProv, plBare, pos = rest:match("^([^:]+):([^:]+):(%d+)$")
       if plProv and plBare then
-        call({ "pl", "rm-at", plProv .. ":" .. plBare, pos }, nil, function() pullLibrary() end)
+        -- Захват до запуска: если пока летит rm-at панель открыла другой
+        -- плейлист (pullTracks уже инкрементировал поколение), поздний
+        -- рефреш не должен затирать новый запрос.
+        local generation = tracksRequestGeneration
+        call({ "pl", "rm-at", plProv .. ":" .. plBare, pos }, nil, function()
+          pullLibrary()
+          local id = plProv .. ":" .. plBare
+          if data.tracksId == id and generation == tracksRequestGeneration then
+            pullTracks(id)
+          end
+        end)
       end
     elseif op == "del" and rest ~= "" then
       -- rest уже составной "<prov>:<id>" — CLI принимает как есть.
@@ -895,16 +933,7 @@ function onIpc(event, payload)
       data.searchSerial = data.searchSerial + 1
     end)
   elseif event == "tracks" and payload then
-    call({ "library-tracks", tostring(payload), "--json" }, function(got)
-      data.tracks = type(got) == "table" and got or {}
-      data.tracksId = tostring(payload)
-      -- Полный список мог прийти неполным: демон режет выдачу
-      -- потолком batch — хвост добираем ленивой догрузкой.
-      data.hasMore = true
-      for _, tr in ipairs(data.tracks) do
-        decorateArt("track", tr)
-      end
-    end)
+    pullTracks(tostring(payload))
   elseif event == "tracks-more" and payload then
     -- Ленивая догрузка хвоста: панель стучится, когда курсор подошёл
     -- к концу списка. Повторный запрос, пока летит предыдущий,
@@ -914,11 +943,14 @@ function onIpc(event, payload)
     end
     tracksMoreInFlight = true
     local want = tostring(payload)
+    local generation = tracksRequestGeneration
     call({ "library-tracks-more", want, "--json" }, function(got)
       tracksMoreInFlight = false
       -- Пока летел запрос, открыли другой плейлист: страница чужая —
-      -- дописывать её в текущий список нельзя.
-      if data.tracksId ~= want then
+      -- дописывать её в текущий список нельзя. Заодно: если ушёл новый
+      -- pullTracks (даже тот же id), снапшот обновился и продолжение
+      -- старого чтения протухло.
+      if data.tracksId ~= want or generation ~= tracksRequestGeneration then
         return
       end
       local page = type(got) == "table" and got or {}
