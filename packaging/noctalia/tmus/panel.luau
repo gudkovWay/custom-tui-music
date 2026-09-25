@@ -1670,6 +1670,7 @@ local function homeCardNode(shelfIndex, cardIndex, c)
   return ui.column({
     key = "hf-card-" .. shelfIndex .. "-" .. cardIndex,
     width = 150,
+    height = 174,
     gap = 6,
     padding = 8,
     radius = 6,
@@ -1681,8 +1682,8 @@ local function homeCardNode(shelfIndex, cardIndex, c)
     end,
   }, {
     artNode(c.art, 110),
-    lbl(shorten(c.title, 18), { key = "t", color = COLORS.text }),
-    lbl(shorten(c.subtitle, 22), { key = "s", color = COLORS.muted }),
+    lbl(shorten(c.title, 18), { key = "t", height = 16, color = COLORS.text }),
+    lbl(shorten(c.subtitle, 22), { key = "s", height = 16, color = COLORS.muted }),
   })
 end
 
@@ -1708,9 +1709,9 @@ local function homeFeedNode()
   for i = homeTop, last do
     local shelf = shelves[i]
     local left = homeLeft[i] or 1
-    local header = ui.row({ key = "hf-head-" .. i, gap = 8, align = "center" }, {
-      lbl(shelf.title, { key = "hf-shelf-title-" .. i, size = 13, color = COLORS.text }),
-      shelf.subtitle ~= "" and lbl(shelf.subtitle, { key = "hf-shelf-sub-" .. i, size = 11, color = COLORS.muted }) or nil,
+    local header = ui.row({ key = "hf-head-" .. i, height = 20, gap = 8, align = "center" }, {
+      lbl(shorten(shelf.title, 24), { key = "hf-shelf-title-" .. i, size = 13, height = 20, color = COLORS.text }),
+      shelf.subtitle ~= "" and lbl(shorten(shelf.subtitle, 28), { key = "hf-shelf-sub-" .. i, size = 11, height = 20, color = COLORS.muted }) or nil,
       lbl("", { key = "hf-spacer-" .. i, grow = 1 }),
       lbl("◄ " .. left .. "–" .. (left + HOME_CARD_WINDOW - 1) .. "/" .. shelf.count .. " ►", {
         key = "hf-range-" .. i,
@@ -1723,7 +1724,7 @@ local function homeFeedNode()
     for j = left, clast do
       table.insert(cards, homeCardNode(i, j, shelf.cards[j]))
     end
-    table.insert(shelfNodes, ui.column({ key = "hf-shelf-" .. i, gap = 8 }, {
+    table.insert(shelfNodes, ui.column({ key = "hf-shelf-" .. i, height = HOME_SHELF_HEIGHT, gap = 8 }, {
       header,
       ui.row({ key = "hf-cards-" .. i, gap = GAP }, cards),
     }))
@@ -1740,6 +1741,7 @@ local function playlistCards(slice, first)
     table.insert(cards, ui.column({
       key = "pl" .. i,
       width = 168,
+      height = CARD_ROW_HEIGHT,
       gap = 8,
       padding = 12,
       radius = 6,
@@ -1751,8 +1753,8 @@ local function playlistCards(slice, first)
       end,
     }, {
       artNode(row.art, 120),
-      lbl(shorten(row.title, 20), { key = "pl-title" .. i, color = COLORS.text }),
-      lbl(shorten(row.subtitle, 24), { key = "pl-sub" .. i, color = COLORS.muted }),
+      lbl(shorten(row.title, 20), { key = "pl-title" .. i, height = 16, color = COLORS.text }),
+      lbl(shorten(row.subtitle, 24), { key = "pl-sub" .. i, height = 16, color = COLORS.muted }),
     }))
   end
   local grid = {}
