@@ -17,8 +17,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 
-use tmus_core::model::{AuthStatus, LoopMode, PlaybackStatus, Playlist, PlaylistId, Rating, SearchResult, Track, TrackId};
-use tmus_core::protocol::{CatalogSource, Cmd, Event, Payload, PlayerState};
+use tmus_core::model::{AuthStatus, LoopMode, PlaybackStatus, Playlist, PlaylistId, ProviderId, Rating, SearchResult, Track, TrackId};
+use tmus_core::protocol::{CatalogCapabilities, CatalogSource, Cmd, Event, Payload, PlayerState};
 use tmus_core::Paths;
 
 use crate::client::Client;
@@ -226,6 +226,9 @@ struct App {
     picker: Option<PlaylistPicker>,
     /// Бейджи провайдеров: id -> глиф+цвет. Обновляются из Cmd::Providers.
     badges: HashMap<String, Badge>,
+    /// Заявленные провайдером мутации (ProviderView.capabilities): пикер
+    /// плейлистов предлагает только операции, которые провайдер умеет.
+    capabilities: HashMap<String, CatalogCapabilities>,
     /// id провайдера -> человекочитаемое имя, для заголовков панелей.
     provider_names: HashMap<String, String>,
     /// id -> последний AuthStatus: ctrl+r собирает из него notice.
@@ -278,6 +281,7 @@ pub async fn run(paths: &Paths) -> Result<()> {
         search_view: Vec::new(),
         picker: None,
         badges: HashMap::new(),
+        capabilities: HashMap::new(),
         provider_names: HashMap::new(),
         auths: HashMap::new(),
     };
@@ -307,6 +311,8 @@ async fn refresh_provider_badges(app: &mut App) {
             .collect();
         app.provider_names =
             list.iter().map(|p| (p.id.clone(), p.name.clone())).collect();
+        app.capabilities =
+            list.iter().map(|p| (p.id.clone(), p.capabilities)).collect();
         app.auths = list.iter().map(|p| (p.id.clone(), p.auth.clone())).collect();
     }
 }
@@ -701,18 +707,18 @@ async fn handle_picker_key(app: &mut App, code: KeyCode) -> Result<()> {
                 return Ok(());
             }
             let sel = picker.sel;
-            // Трек и плейлист читаем до закрытия пикера: selected_track
-            // ходит по app, а не по пикеру, так что порядок не важен, но
-            // borrow-чеккер требует разнести мутацию и чтение.
+            // Пункт sel-1 в отфильтрованном списке адресатов (см.
+            // picker_destinations), а не в общей библиотеке.
             let track = selected_track(app);
-            let playlist = app.playlists.get(sel - 1).map(|p| p.id.clone());
+            let playlist =
+                picker_destinations(app).get(sel - 1).map(|p| p.id.clone());
             app.picker = None;
             if let (Some(track), Some(playlist)) = (track, playlist) {
                 fire(app, Cmd::PlaylistAdd { playlist, track });
             }
         }
         _ => {
-            let len = app.playlists.len();
+            let len = picker_destinations(app).len();
             let delta = match code {
                 KeyCode::Char('j') | KeyCode::Down => 1,
                 KeyCode::Char('k') | KeyCode::Up => -1,
@@ -726,21 +732,47 @@ async fn handle_picker_key(app: &mut App, code: KeyCode) -> Result<()> {
     Ok(())
 }
 
+/// Плейлисты-адресаты для добавления трека: локальные — всегда,
+/// нативные — только когда провайдер заявляет `playlist_add` и трек
+/// принадлежит тому же провайдеру, что и плейлист (нативная операция
+/// не умеет кладать трек чужого клиента).
+fn picker_destinations(app: &App) -> Vec<&Playlist> {
+    let track_provider = selected_track(app).map(|t| t.provider);
+    app.playlists
+        .iter()
+        .filter(|p| {
+            if p.id.provider == ProviderId::LOCAL {
+                return true;
+            }
+            match track_provider {
+                Some(tp) => {
+                    tp == p.id.provider
+                        && app
+                            .capabilities
+                            .get(p.id.provider.as_str())
+                            .is_some_and(|c| c.playlist_add)
+                }
+                None => false,
+            }
+        })
+        .collect()
+}
+
 /// Создать плейлист из введённого имени и сразу добавить в него трек
 /// под курсором: пользователь просил «добавить», создание — лишь
-/// средство. Ответ `PlaylistCreated` приходит синхронно, поэтому
-/// добавление уходит сразу после него.
+/// средство. Интерактивные плейлисты всегда локальные (смешанные
+/// провайдеры): демон создаёт их в кэше. Ответ `PlaylistCreated`
+/// приходит синхронно, поэтому добавление уходит сразу после него.
 async fn create_and_add(app: &mut App) {
     let title = match app.picker.as_ref().and_then(|p| p.confirmed_title()) {
         Some(title) => title,
         None => return,
     };
-    // Плейлист создаём у того клиента, откуда трек: в мультисессионном
-    // режиме «первый подключённый» был бы сюрпризом. Пикер открыт, только
-    // когда есть выбранный трек, а пока он открыт, курсор списков не ходит
-    // (дж/к перехватывает пикер), так что цель та же, что при открытии.
-    let provider = selected_track(app).map(|t| t.provider.as_str().to_owned());
-    match app.client.call(Cmd::PlaylistCreate { title, provider }).await {
+    match app
+        .client
+        .call(Cmd::PlaylistCreate { title, provider: Some(ProviderId::LOCAL.as_str().to_owned()) })
+        .await
+    {
         Ok(Payload::PlaylistCreated { playlist }) => {
             app.picker = None;
             app.notice = None;
@@ -758,14 +790,26 @@ async fn create_and_add(app: &mut App) {
 async fn playlist_remove_or_delete(app: &mut App) {
     if app.nav.focus == Focus::Tracks {
         let Some(id) = app.nav.open_playlist.clone() else { return };
-        let Some(track) = selected_track(app) else { return };
-        // Кэш и открытый список правим локально: PlaylistsChanged треки
-        // не несёт, иначе убранный трек висел бы до протухания TTL.
-        app.playlist_tracks.retain(|t| t.id != track);
-        if let Some((tracks, _)) = app.playlist_cache.get_mut(&id) {
-            tracks.retain(|t| t.id != track);
+        if id.provider == ProviderId::LOCAL {
+            // Абсолютная позиция из track_view — единственный адрес
+            // записи: дубликаты одного трека независимы, по id их не
+            // различить. Кэш и открытый список правим локально: событие
+            // PlaylistsChanged треки не несёт.
+            let Some(sel) = app.nav.playlist_sel.selected() else { return };
+            let Some(&position) = app.track_view.get(sel) else { return };
+            app.playlist_tracks.remove(position);
+            if let Some((tracks, _)) = app.playlist_cache.get_mut(&id) {
+                tracks.remove(position);
+            }
+            call_quiet(app, Cmd::PlaylistRemoveAt { playlist: id, position }).await;
+        } else {
+            let Some(track) = selected_track(app) else { return };
+            app.playlist_tracks.retain(|t| t.id != track);
+            if let Some((tracks, _)) = app.playlist_cache.get_mut(&id) {
+                tracks.retain(|t| t.id != track);
+            }
+            call_quiet(app, Cmd::PlaylistRemove { playlist: id, track }).await;
         }
-        call_quiet(app, Cmd::PlaylistRemove { playlist: id, track }).await;
     } else if app.nav.focus == Focus::Panel && app.nav.panel == Panel::Library {
         let Some(idx) = app.nav.library_sel.selected() else { return };
         let Some(playlist) = app.playlists.get(idx) else { return };
@@ -1119,16 +1163,17 @@ fn draw(f: &mut Frame, app: &mut App) {
 /// имени список скрыт, ввод отражается в заголовке.
 fn draw_picker(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let Some(picker) = &app.picker else { return };
-    let rows = app.playlists.len() as u16 + 3;
+    let destinations = picker_destinations(app);
+    let rows = destinations.len() as u16 + 3;
     let popup = centered_rect(60, rows, area);
     let (title, items) = match &picker.input {
         Some(input) => (format!("Новый плейлист: {input}_"), Vec::new()),
         None => {
-            let mut items: Vec<ListItem> = Vec::with_capacity(app.playlists.len() + 1);
-            for i in 0..=app.playlists.len() {
+            let mut items: Vec<ListItem> = Vec::with_capacity(destinations.len() + 1);
+            for i in 0..=destinations.len() {
                 let text = match i {
                     0 => "+ New playlist…".to_owned(),
-                    _ => app.playlists[i - 1].title.clone(),
+                    _ => destinations[i - 1].title.clone(),
                 };
                 let item = if i == picker.sel {
                     ListItem::new(text).style(Style::default().add_modifier(Modifier::REVERSED))

@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tmus_core::model::{
-    CatalogShelf, Playlist, PlaylistId, Rating, SearchKind, SearchResult, Track, TrackId,
+    CatalogShelf, Playlist, PlaylistId, ProviderId, Rating, SearchKind, SearchResult, Track, TrackId,
 };
 use tmus_core::protocol::{CatalogSource, Event, ProviderView};
 
@@ -49,6 +49,7 @@ impl App {
                     auth: account.auth(),
                     glyph: account.glyph().to_owned(),
                     color: account.color().to_owned(),
+                    capabilities: account.capabilities(),
                 }
             })
             .collect()
@@ -106,6 +107,16 @@ impl App {
     }
 
     pub(crate) async fn library(&self, provider: Option<&str>) -> anyhow::Result<Vec<Playlist>> {
+        // Явный local — только плейлисты приложения, сеть не трогаем.
+        if provider == Some(ProviderId::LOCAL.as_str()) {
+            return self.with_cache(|c| c.local_playlists());
+        }
+        // Смешанный запрос (None) начинается с плейлистов приложения:
+        // они всегда доступны, даже когда сеть лежит целиком.
+        let locals = match provider {
+            None => self.with_cache(|c| c.local_playlists())?,
+            Some(_) => Vec::new(),
+        };
         // Fan-out параллельно: поиск и библиотека — самые частые
         // мультисессионные запросы, последовательная сумма латентностей
         // недопустима.
@@ -116,10 +127,10 @@ impl App {
                 .map(|target| async move { (*target, target.catalog().playlists().await) }),
         )
         .await;
-        let mut out = Vec::new();
+        let mut remote = Vec::new();
         for (target, result) in results {
             match result {
-                Ok(found) => out.extend(found),
+                Ok(found) => remote.extend(found),
                 Err(err) => {
                     tracing::warn!(provider = %target.id(), %err, "библиотека не прочиталась");
                     self.report_auth(target, &err);
@@ -129,17 +140,27 @@ impl App {
                 }
             }
         }
-        if out.is_empty() {
+        // Локальные плейлисты в кэше провайдерских не живут, поэтому
+        // stale-фолбэк касается только удалённой части.
+        if remote.is_empty() {
             // Сеть могла отвалиться целиком — тогда показываем то, что
             // уже знаем. Это половина смысла офлайн-кэша.
-            out = self.with_cache(|c| c.playlists(provider))?;
+            let cached = self.with_cache(|c| c.playlists(provider))?;
+            remote.extend(cached);
         } else {
-            self.with_cache(|c| c.put_playlists(&out))?;
+            self.with_cache(|c| c.put_playlists(&remote))?;
         }
+        let mut out = locals;
+        out.extend(remote);
         Ok(out)
     }
 
     pub(crate) async fn playlist_tracks(&self, id: &PlaylistId) -> anyhow::Result<Vec<Track>> {
+        // Локальный плейлист живёт целиком в кэше: метаданные записаны
+        // при добавлении, Registry не при делах.
+        if id.provider == ProviderId::LOCAL {
+            return self.with_cache(|c| c.local_playlist_tracks(id));
+        }
         let provider = self
             .registry
             .get(id.provider)
@@ -212,6 +233,10 @@ impl App {
         &self,
         id: &PlaylistId,
     ) -> anyhow::Result<(Vec<Track>, Option<String>)> {
+        // Локальный состав всегда прочитан целиком: догрузить нечего.
+        if id.provider == ProviderId::LOCAL {
+            return Ok((Vec::new(), None));
+        }
         let provider = self
             .registry
             .get(id.provider)
@@ -244,6 +269,13 @@ impl App {
     }
 
     pub(crate) async fn liked(&self, provider: Option<&str>) -> anyhow::Result<Vec<Track>> {
+        // Смешанный запрос — агрегат: локальные лайки плюс удачные
+        // выдачи всех провайдеров, объединённые по TrackId. Сбой одного
+        // провайдера не стирает ни локальные, ни чужие результаты.
+        if provider.is_none() {
+            return self.liked_aggregate().await;
+        }
+        // Явный провайдер — только его выдача, по-прежнему.
         // Fan-out параллельно по той же причине, что и `search`:
         // мультисессия не должна платить суммой латентностей.
         let targets = self.targets(provider)?;
@@ -268,6 +300,54 @@ impl App {
         }
         if !out.is_empty() {
             self.with_cache(|c| c.put_tracks(&out))?;
+        }
+        Ok(out)
+    }
+
+    /// Агрегат лайкнутого для `Cmd::Liked { provider: None }`:
+    /// локально отмеченные (по свежести отметки) идут первыми, затем
+    /// провайдерские в порядке Registry и выдачи провайдера. Свежие
+    /// метаданные провайдера пишутся в кэш до чтения локальных строк,
+    /// поэтому локальные дубли приходят с теми же свежими полями.
+    async fn liked_aggregate(&self) -> anyhow::Result<Vec<Track>> {
+        let targets = self.targets(None)?;
+        let results = futures_util::future::join_all(
+            targets
+                .iter()
+                .map(|target| async move { (*target, target.catalog().liked().await) }),
+        )
+        .await;
+        let mut provider_order: Vec<TrackId> = Vec::new();
+        for (target, result) in results {
+            match result {
+                Ok(found) => {
+                    if !found.is_empty() {
+                        self.with_cache(|c| c.put_tracks(&found))?;
+                        for track in found {
+                            if provider_order.iter().all(|id| id != &track.id) {
+                                provider_order.push(track.id);
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(provider = %target.id(), %err, "лайки не прочитались");
+                    self.report_auth(target, &err);
+                    if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
+                        self.try_reauth(target).await;
+                    }
+                }
+            }
+        }
+        let local = self.with_cache(|c| c.liked_tracks())?;
+        let mut out: Vec<Track> = local.into_iter().map(|(track, _)| track).collect();
+        for id in provider_order {
+            if !out.iter().any(|track| track.id == id) {
+                // Метаданные только что легли в кэш, строка обязана быть.
+                if let Some(track) = self.with_cache(|c| c.track(&id))? {
+                    out.push(track);
+                }
+            }
         }
         Ok(out)
     }
@@ -322,91 +402,72 @@ impl App {
         Ok(out)
     }
 
-    /// Поставить оценку треку: локально сразу, у провайдера — в сеть.
+    /// Поставить оценку треку: локально сразу, у провайдера — зеркало.
     ///
-    /// Порядок намеренно оптимистичный: кэш пишется ДО сетевого вызова,
-    /// чтобы панель скрыла/показала трек мгновенно; при ошибке сети
-    /// локальное состояние откатывается, и человек видит ошибку, а не
-    /// расхождение панели с сервером.
+    /// Локальная оценка — источник истины: запись и событие уходят ДО
+    /// сетевого вызова, и сбой провайдера локальное состояние НЕ
+    /// откатывает (иначе панель расходилась бы с тем, что человек
+    /// нажал). Ошибка зеркала честно возвращается вызывающему и
+    /// остаётся в журнале, `Unsupported` — не сбой: провайдер оценок
+    /// не ведёт, отметка живёт только локально.
     pub(crate) async fn rate_track(
         &self,
         id: &TrackId,
         rating: Rating,
     ) -> anyhow::Result<()> {
-        let past = self.with_cache(|c| c.get_rating(id))?;
         self.with_cache(|c| c.set_rating(id, rating))?;
-
-        let provider = self.registry.get(id.provider).ok_or_else(|| {
-            anyhow::anyhow!("провайдер {} не подключён", id.provider)
-        })?;
+        self.emit(Event::RatingChanged { track: id.clone(), rating });
+        // Скрытие играющего дизлайком должно быть немедленным:
+        // человек как раз хочет, чтобы это ушло из ушей сейчас.
+        // Тот же `step`, что и у `Cmd::Next`: одна логика
+        // перехода на все пути.
+        if rating == Rating::Disliked {
+            let current = self.player.state().await.track.map(|t| t.id);
+            if current.as_ref() == Some(id) {
+                self.step(true).await?;
+            }
+        }
+        if rating == Rating::Liked {
+            // Лайк меняет плейлист лайкнутого у провайдера (после
+            // зеркала) — TTL-кэш его состава обязан протухнуть независимо
+            // от исхода зеркала.
+            let liked_playlist = PlaylistId::new(id.provider, "LM");
+            self.with_cache(|c| c.forget_playlist_sync(&liked_playlist))?;
+        }
+        // Локальные треки зеркалить некуда: отметка только локальная.
+        let Some(provider) = self.registry.get(id.provider) else {
+            return Ok(());
+        };
         match provider.catalog().rate(id, rating).await {
-            Ok(()) => {
-                self.emit(Event::RatingChanged { track: id.clone(), rating });
-                // Скрытие играющего дизлайком должно быть немедленным:
-                // человек как раз хочет, чтобы это ушло из ушей сейчас.
-                // Тот же `step`, что и у `Cmd::Next`: одна логика
-                // перехода на все пути.
-                if rating == Rating::Disliked {
-                    let current = self.player.state().await.track.map(|t| t.id);
-                    if current.as_ref() == Some(id) {
-                        self.step(true).await?;
-                    }
-                }
-                if rating == Rating::Liked {
-                    // Лайк улетел на сервер — плейлист лайкнутого там уже
-                    // изменился, и TTL-кэш его состава больше не правда.
-                    let liked_playlist = PlaylistId::new(id.provider, "LM");
-                    self.with_cache(|c| c.forget_playlist_sync(&liked_playlist))?;
-                }
+            Ok(()) => Ok(()),
+            Err(tmus_provider::ProviderError::Unsupported { .. }) => {
+                tracing::debug!(provider = %provider.id(), "провайдер не умеет оценки — отметка только локальная");
                 Ok(())
             }
             Err(err) => {
-                tracing::warn!(provider = %provider.id(), %err, "оценка не принята");
+                tracing::warn!(provider = %provider.id(), %err, "зеркало оценки не прошло; локальная отметка сохранена");
                 self.report_auth(provider, &err);
                 if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
                     self.try_reauth(provider).await;
                 }
-                // Откат: `past = None` даёт `Rating::None`, то есть
-                // удаление строки — оптимистичная запись не оставляет
-                // ложного следа.
-                self.with_cache(|c| c.set_rating(id, past.unwrap_or(Rating::None)))?;
                 Err(err.into())
             }
         }
     }
 
-    /// Адресат плейлистных операций без id плейлиста (`PlaylistCreate`).
-    /// Правило: явный provider из команды (иначе — ошибка, если такой
-    /// не подключён) → сохранённый источник каталога (та же валидация)
-    /// → первый подключённый. Create — единственная операция, у которой
-    /// нет id плейлиста, по которому можно понять провайдера.
+    /// Адресат нативного создания плейлиста (только явные удалённые:
+    /// None/"local" уходят в локальный плейлист раньше). Явное имя
+    /// обязательно: если такой провайдер не подключён — ошибка.
     fn playlist_provider(
         &self,
         explicit: Option<&str>,
     ) -> anyhow::Result<&Arc<dyn tmus_provider::Provider>> {
-        if let Some(name) = explicit {
-            return self
-                .registry
-                .get_by_str(name)
-                .ok_or_else(|| anyhow::anyhow!("провайдер {name} не подключён"));
-        }
-        let saved: Option<String> = self
-            .catalog_source
-            .lock()
-            .expect("catalog source")
-            .provider
-            .clone();
-        match saved {
-            Some(name) => self
-                .registry
-                .get_by_str(&name)
-                .ok_or_else(|| anyhow::anyhow!("провайдер {name} не подключён")),
-            None => self
-                .registry
-                .iter()
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("нет подключённых провайдеров")),
-        }
+        let Some(name) = explicit else {
+            anyhow::bail!("нативному созданию нужен явный провайдер");
+        };
+        self.registry
+            .get_by_str(name)
+            .ok_or_else(|| anyhow::anyhow!("провайдер {name} не подключён"))
     }
 
     /// Единый хвост плейлистных мутаций: auth-ошибки уходят в отчёт и
@@ -427,13 +488,19 @@ impl App {
         err.into()
     }
 
-    /// Создать плейлист у провайдера по правилу `playlist_provider`
-    /// и разослать сигнал.
+    /// Создать плейлист. None или "local" — плейлист приложения в кэше
+    /// (смешанные провайдеры, всегда доступно); явное имя удалённого —
+    /// нативный плейлист этого провайдера.
     pub(crate) async fn playlist_create(
         &self,
         title: &str,
         provider: Option<&str>,
     ) -> anyhow::Result<Playlist> {
+        if provider.is_none() || provider == Some(ProviderId::LOCAL.as_str()) {
+            let playlist = self.with_cache(|c| c.local_playlist_create(title))?;
+            self.emit(Event::PlaylistsChanged);
+            return Ok(playlist);
+        }
         let provider = self.playlist_provider(provider)?;
         match provider.catalog().playlist_create(title).await {
             Ok(playlist) => {
@@ -444,12 +511,42 @@ impl App {
         }
     }
 
+    /// Переименовать плейлист. Нативного переименования в trait
+    /// Catalog нет, поэтому у удалённых плейлистов команда — честная
+    /// ошибка, а не тихий нооп.
+    pub(crate) async fn playlist_rename(
+        &self,
+        playlist: &PlaylistId,
+        title: &str,
+    ) -> anyhow::Result<()> {
+        if playlist.provider != ProviderId::LOCAL {
+            anyhow::bail!(
+                "переименование нативного плейлиста {} не поддерживается",
+                playlist.provider
+            );
+        }
+        self.with_cache(|c| c.local_playlist_rename(playlist, title))?;
+        self.emit(Event::PlaylistsChanged);
+        Ok(())
+    }
+
     /// Добавить трек в плейлист и разослать сигнал.
     pub(crate) async fn playlist_add(
         &self,
         playlist: &PlaylistId,
         track: &TrackId,
     ) -> anyhow::Result<()> {
+        if playlist.provider == ProviderId::LOCAL {
+            // Метаданные обязаны уже лежать в кэше: чтение локального
+            // состава джойнит tracks, и непрочитаемая запись — мина.
+            // Если трек нигде не встречался, просим сначала найти/сыграть.
+            if self.with_cache(|c| c.track(track))?.is_none() {
+                anyhow::bail!("метаданных {track} нет в кэше — сначала найдите или проиграйте трек");
+            }
+            self.with_cache(|c| c.local_playlist_add(playlist, track))?;
+            self.emit(Event::PlaylistsChanged);
+            return Ok(());
+        }
         let provider = self.registry.get(playlist.provider).ok_or_else(|| {
             anyhow::anyhow!("провайдер {} не подключён", playlist.provider)
         })?;
@@ -473,6 +570,17 @@ impl App {
         playlist: &PlaylistId,
         track: &TrackId,
     ) -> anyhow::Result<()> {
+        if playlist.provider == ProviderId::LOCAL {
+            // Локально дубликаты независимы, по одному id снять их все
+            // нельзя: удаляем первую позицию трека, для точечной —
+            // `PlaylistRemoveAt`.
+            let position = self
+                .with_cache(|c| c.local_playlist_tracks(playlist))?
+                .iter()
+                .position(|t| &t.id == track)
+                .ok_or_else(|| anyhow::anyhow!("трека {track} нет в плейлисте {playlist}"))?;
+            return self.playlist_remove_at(playlist, position).await;
+        }
         let provider = self.registry.get(playlist.provider).ok_or_else(|| {
             anyhow::anyhow!("провайдер {} не подключён", playlist.provider)
         })?;
@@ -488,9 +596,30 @@ impl App {
         }
     }
 
+    /// Убрать запись плейлиста по абсолютной позиции и разослать
+    /// сигнал. Единственный способ трогать дубликаты по отдельности.
+    /// Нативного позиционного удаления у провайдеров нет — только
+    /// локальные плейлисты.
+    pub(crate) async fn playlist_remove_at(
+        &self,
+        playlist: &PlaylistId,
+        position: usize,
+    ) -> anyhow::Result<()> {
+        if playlist.provider != ProviderId::LOCAL {
+            anyhow::bail!("позиционное удаление доступно только локальным плейлистам");
+        }
+        self.with_cache(|c| c.local_playlist_remove_at(playlist, position))?;
+        self.emit(Event::PlaylistsChanged);
+        Ok(())
+    }
 
     /// Удалить плейлист и разослать сигнал.
     pub(crate) async fn playlist_delete(&self, playlist: &PlaylistId) -> anyhow::Result<()> {
+        if playlist.provider == ProviderId::LOCAL {
+            self.with_cache(|c| c.local_playlist_delete(playlist))?;
+            self.emit(Event::PlaylistsChanged);
+            return Ok(());
+        }
         let provider = self.registry.get(playlist.provider).ok_or_else(|| {
             anyhow::anyhow!("провайдер {} не подключён", playlist.provider)
         })?;

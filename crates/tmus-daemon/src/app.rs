@@ -420,10 +420,11 @@ impl App {
             }
             Cmd::Ratings => Ok(Payload::Ratings(self.with_cache(|c| c.ratings())?)),
 
-            // Плейлистные мутации идут напрямую в провайдер (кэш
-            // рейтингов их не касается), после успеха демон рассылает
-            // `PlaylistsChanged`, а список клиенты перечитывают сами —
-            // см. `playlist_*` в catalog.rs.
+            // Плейлистные мутации: локальные плейлисты (id с провайдером
+            // local) правятся в кэше демона, нативные — идут в
+            // провайдер. После успеха демон рассылает `PlaylistsChanged`,
+            // а список клиенты перечитывают сами — см. `playlist_*` в
+            // catalog.rs.
             Cmd::PlaylistCreate { title, provider } => {
                 let playlist = self.playlist_create(&title, provider.as_deref()).await?;
                 Ok(Payload::PlaylistCreated { playlist: playlist.id })
@@ -434,6 +435,14 @@ impl App {
             }
             Cmd::PlaylistRemove { playlist, track } => {
                 self.playlist_remove(&playlist, &track).await?;
+                Ok(Payload::Ack(Ack::default()))
+            }
+            Cmd::PlaylistRename { playlist, title } => {
+                self.playlist_rename(&playlist, &title).await?;
+                Ok(Payload::Ack(Ack::default()))
+            }
+            Cmd::PlaylistRemoveAt { playlist, position } => {
+                self.playlist_remove_at(&playlist, position).await?;
                 Ok(Payload::Ack(Ack::default()))
             }
             Cmd::PlaylistDelete { playlist } => {
@@ -997,42 +1006,39 @@ mod tests {
         }
     }
 
-    /// Ошибка провайдера откатывает оптимистичную запись: и прошлое
-    /// значение возвращается, и событие не разлетается.
+    /// Ошибка провайдера НЕ откатывает локальную оценку: локальная
+    /// отметка — источник истины, зеркальная ошибка доходит наружу,
+    /// событие RatingChanged уже разослано.
     #[tokio::test]
-    async fn provider_error_rolls_back_local_rating() {
+    async fn provider_error_keeps_local_rating_and_reports() {
         let (app, _dir) = app(true).await;
         let track = TrackId::new(ProviderId::YTMUSIC, "vid-1");
-        let fresh = TrackId::new(ProviderId::YTMUSIC, "vid-2");
-        app.with_cache(|c| c.set_rating(&track, Rating::Liked))
-            .expect("seed");
         let mut events = app.subscribe();
 
         let result = app
             .handle(Cmd::Rate { track: track.clone(), rating: Rating::Disliked })
             .await;
-        assert!(result.is_err(), "ошибка провайдера обязана дойти наружу");
+        assert!(result.is_err(), "ошибка зеркала обязана дойти наружу");
         assert_eq!(
             app.with_cache(|c| c.get_rating(&track)).expect("get"),
-            Some(Rating::Liked),
-            "прошлая оценка вернулась после отката"
+            Some(Rating::Disliked),
+            "локальная оценка обязана пережить сбой провайдера"
         );
 
-        // Откат из состояния «оценки не было» не оставляет строки.
-        let result = app
-            .handle(Cmd::Rate { track: fresh.clone(), rating: Rating::Liked })
-            .await;
-        assert!(result.is_err());
-        assert_eq!(app.with_cache(|c| c.get_rating(&fresh)).expect("get"), None);
-
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("событие пришло")
+            .expect("шина жива");
         assert!(
-            events.try_recv().is_err(),
-            "при ошибке сети RatingChanged вещаться не должен"
+            matches!(&event, Event::RatingChanged { track: t, rating: Rating::Disliked } if t == &track),
+            "событие локальной оценки обязано уйти до зеркала: {event:?}"
         );
     }
 
-    /// Успешное создание: провайдер получил заголовок, клиент — id
-    /// нового плейлиста, шина — сигнал перечитать список.
+    /// Создание по умолчанию (provider: None) — локальный плейлист
+    /// приложения: провайдер не вызывается, клиент получает id local:N,
+    /// шина — сигнал перечитать список. Явный удалённый по-прежнему
+    /// создаёт нативный плейлист.
     #[tokio::test]
     async fn playlist_create_returns_id_and_broadcasts() {
         let (app, provider, _dir) = app_full(false, false).await;
@@ -1041,23 +1047,38 @@ mod tests {
         let payload = app
             .handle(Cmd::PlaylistCreate { title: "Chill".into(), provider: None })
             .await
-            .expect("create");
+            .expect("create local");
+        match payload {
+            Payload::PlaylistCreated { playlist } => {
+                assert_eq!(playlist.provider, ProviderId::LOCAL);
+            }
+            other => panic!("неожиданный ответ: {other:?}"),
+        }
+        assert!(
+            provider.calls().is_empty(),
+            "локальное создание не обязано трогать провайдера"
+        );
+
+        let payload = app
+            .handle(Cmd::PlaylistCreate { title: "Native".into(), provider: Some("ytmusic".into()) })
+            .await
+            .expect("create native");
         match payload {
             Payload::PlaylistCreated { playlist } => {
                 assert_eq!(playlist, PlaylistId::new(ProviderId::YTMUSIC, "PLnew"));
             }
             other => panic!("неожиданный ответ: {other:?}"),
         }
-        assert_eq!(provider.calls(), vec!["create:Chill".to_owned()]);
+        assert_eq!(provider.calls(), vec!["create:Native".to_owned()]);
 
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
-            .await
-            .expect("событие пришло")
-            .expect("шина жива");
-        assert!(
-            matches!(event, Event::PlaylistsChanged),
-            "неожиданное событие: {event:?}"
-        );
+        // Два мутации — два сигнала.
+        for _ in 0..2 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+                .await
+                .expect("событие пришло")
+                .expect("шина жива");
+            assert!(matches!(event, Event::PlaylistsChanged));
+        }
     }
 
     /// Add/remove/delete проходят в провайдер с правильными аргументами
@@ -1095,36 +1116,44 @@ mod tests {
         assert!(events.try_recv().is_err(), "лишних событий быть не должно");
     }
 
-    /// Ошибка провайдера доходит наружу как обычная ошибка команды,
-    /// вызова-ответа `PlaylistCreated` нет, и сигнал не разлетается.
+    /// Ошибка нативного создания/удаления доходит наружу как обычная
+    /// ошибка команды, вызова-ответа `PlaylistCreated` нет, и сигнал не
+    /// разлетается. Локальное создание (provider: None) при этом не
+    /// зависит от сети и проходит.
     #[tokio::test]
     async fn playlist_provider_error_yields_err_without_event() {
         let (app, provider, _dir) = app_full(false, true).await;
         let playlist = PlaylistId::new(ProviderId::YTMUSIC, "PL1");
-        let track = TrackId::new(ProviderId::YTMUSIC, "vid-1");
         let mut events = app.subscribe();
 
         assert!(
             app.handle(Cmd::PlaylistCreate { title: "Chill".into(), provider: None })
                 .await
-                .is_err(),
-            "ошибка создания обязана дойти наружу"
+                .is_ok(),
+            "локальное создание не должно зависеть от сбоя провайдера"
         );
         assert!(
-            app.handle(Cmd::PlaylistAdd { playlist: playlist.clone(), track: track.clone() })
+            app.handle(Cmd::PlaylistCreate { title: "Native".into(), provider: Some("ytmusic".into()) })
+                .await
+                .is_err(),
+            "ошибка нативного создания обязана дойти наружу"
+        );
+        assert!(
+            app.handle(Cmd::PlaylistAdd { playlist: playlist.clone(), track: TrackId::new(ProviderId::YTMUSIC, "vid-1") })
                 .await
                 .is_err()
         );
         assert!(app.handle(Cmd::PlaylistDelete { playlist: playlist.clone() }).await.is_err());
 
-        assert!(
-            provider.calls().is_empty(),
-            "при сбое журнал вызовов обязан остаться пустым"
+        assert_eq!(
+            provider.calls(),
+            Vec::<String>::new(),
+            "при сбое нативные вызовы не должны числиться успешными"
         );
-        assert!(
-            events.try_recv().is_err(),
-            "при ошибке провайдера PlaylistsChanged вещаться не должен"
-        );
+        // Единственный сигнал — от локального создания.
+        let event = events.try_recv().expect("событие в шине");
+        assert!(matches!(event, Event::PlaylistsChanged));
+        assert!(events.try_recv().is_err(), "лишних событий быть не должно");
     }
 
     /// Поштучный запуск — новый контекст из одного трека: очередь

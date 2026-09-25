@@ -15,8 +15,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    CatalogShelf, EqState, LoopMode, PlaybackStatus, PlaylistId, Rating, SearchKind, SearchResult,
-    Track, TrackId,
+    CatalogCapabilities, CatalogShelf, EqState, LoopMode, PlaybackStatus, PlaylistId, Rating,
+    SearchKind, SearchResult, Track, TrackId,
 };
 
 /// `id`, после которого соединение переходит в режим потока событий.
@@ -140,10 +140,14 @@ pub enum Cmd {
     /// умолчанию (YouTube Music — `PRIVATE`, чтобы пользовательский
     /// выбор приватности не приходилось тащить через весь протокол).
     /// Демон отвечает [`Payload::PlaylistCreated`] с новым id.
+    ///
+    /// Адресат: `provider = None` или `"local"` — плейлист приложения
+    /// в кэше демона (смешанные провайдеры); явный удалённый — нативный
+    /// плейлист этого провайдера.
     PlaylistCreate {
         title: String,
-        /// Адресат создания: None значит «выбрать по правилу демона» —
-        /// сохранённый источник каталога, иначе первый подключённый.
+        /// Адресат создания: None или "local" — плейлист приложения;
+        /// явное имя удалённого провайдера — нативный плейлист.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
     },
@@ -155,6 +159,15 @@ pub enum Cmd {
     /// причине, что и в `PlaylistAdd`, — команда не привязана к тому,
     /// что сейчас играет или открыто на экране.
     PlaylistRemove { playlist: PlaylistId, track: TrackId },
+    /// Переименовать плейлист. Реализовано только для локальных
+    /// плейлистов (кэш демона): нативного переименования в trait
+    /// Catalog нет, и у удалённых плейлистов команда — явная ошибка.
+    PlaylistRename { playlist: PlaylistId, title: String },
+    /// Убрать из плейлиста запись по абсолютной позиции с начала
+    /// состава. Единственный способ независимо убирать дубликаты:
+    /// один и тот же `TrackId` в локальном плейлисте может стоять
+    /// несколько раз, и по id их не различить.
+    PlaylistRemoveAt { playlist: PlaylistId, position: usize },
     /// Удалить плейлист целиком вместе с содержимым.
     PlaylistDelete { playlist: PlaylistId },
 
@@ -250,7 +263,7 @@ pub struct QueueView {
     pub index: Option<usize>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProviderView {
     pub id: String,
     pub name: String,
@@ -259,6 +272,11 @@ pub struct ProviderView {
     /// иконку клиента, не зная список провайдеров.
     pub glyph: String,
     pub color: String,
+    /// Что провайдер умеет менять (`Account::capabilities`): пикер
+    /// плейлистов предлагает только операции, которые заявлены.
+    /// `default` — снапшоты старых демонов без поля продолжают парситься.
+    #[serde(default)]
+    pub capabilities: CatalogCapabilities,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -466,6 +484,32 @@ mod tests {
         let back: Request = serde_json::from_str(&remove).expect("parse");
         assert_eq!(back.cmd, Cmd::PlaylistRemove { playlist: playlist.clone(), track: track_id.clone() });
 
+        // Локальные операции: переименование и удаление по позиции.
+        let rename = line(&Request {
+            id: 25,
+            cmd: Cmd::PlaylistRename { playlist: playlist.clone(), title: "New".into() },
+        });
+        assert_eq!(
+            rename,
+            r#"{"id":25,"cmd":"playlist_rename","playlist":{"provider":"local","id":"1"},"title":"New"}"#
+        );
+        let back: Request = serde_json::from_str(&rename).expect("parse");
+        assert_eq!(
+            back.cmd,
+            Cmd::PlaylistRename { playlist: playlist.clone(), title: "New".into() }
+        );
+
+        let remove_at = line(&Request {
+            id: 26,
+            cmd: Cmd::PlaylistRemoveAt { playlist: playlist.clone(), position: 3 },
+        });
+        assert_eq!(
+            remove_at,
+            r#"{"id":26,"cmd":"playlist_remove_at","playlist":{"provider":"local","id":"1"},"position":3}"#
+        );
+        let back: Request = serde_json::from_str(&remove_at).expect("parse");
+        assert_eq!(back.cmd, Cmd::PlaylistRemoveAt { playlist: playlist.clone(), position: 3 });
+
         let delete = line(&Request { id: 23, cmd: Cmd::PlaylistDelete { playlist: playlist.clone() } });
         assert_eq!(delete, r#"{"id":23,"cmd":"playlist_delete","playlist":{"provider":"ytmusic","id":"PL1"}}"#);
         let back: Request = serde_json::from_str(&delete).expect("parse");
@@ -481,6 +525,33 @@ mod tests {
             Frame::Event(Event::PlaylistsChanged) => {}
             other => panic!("expected a playlists_changed event, got {other:?}"),
         }
+    }
+
+    /// Провайдер-вью несёт возможности; снапшот старого демона без
+    /// поля обязан парситься консервативным дефолтом (всё false).
+    #[test]
+    fn provider_view_carries_capabilities_with_backward_default() {
+        let view = ProviderView {
+            id: "ytmusic".into(),
+            name: "YouTube Music".into(),
+            auth: crate::model::AuthStatus::Ready,
+            glyph: "▶".into(),
+            color: "#ff0000".into(),
+            capabilities: CatalogCapabilities { playlist_add: true, ..Default::default() },
+        };
+        let json = line(&view);
+        assert!(
+            json.contains(r#""capabilities":{"rate":false,"playlist_create":false,"playlist_add":true,"playlist_remove":false,"playlist_delete":false}"#),
+            "capabilities обязаны уйти в провод: {json}"
+        );
+        let back: ProviderView = serde_json::from_str(&json).expect("roundtrip");
+        assert_eq!(back, view);
+
+        let stale: ProviderView = serde_json::from_str(
+            r#"{"id":"soundcloud","name":"SC","auth":"Ready","glyph":"s","color":"#ff5500"}"#,
+        )
+        .expect("старый снапшот без capabilities обязан парситься");
+        assert_eq!(stale.capabilities, CatalogCapabilities::default());
     }
 
     #[test]
