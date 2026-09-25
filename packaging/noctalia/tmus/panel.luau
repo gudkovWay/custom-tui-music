@@ -74,17 +74,19 @@ local QUEUE_WINDOW = math.floor((QUEUE_VIEWPORT_HEIGHT + QUEUE_ROW_GAP)
 local NP_SPEC_BARS = 56
 -- Home-лента рекомендаций: видимых полок по Y и карточек в
 -- горизонтальном окне полки — окна выводятся из геометрии, как везде.
--- Полка ≈ заголовок 20 + арт 110 + паддинг 16 + подписи ≈64 → 210 px;
--- ряд карточек шириной 150 в центральном столбе ≈960 px
--- (панель 1180×760, замер §17). Карточек в полке рендерим не больше
--- HOME_CARD_CAP — окно двигается, хвост не держим (счётчик честный:
--- shelf.count хранит число карточек до капа).
+-- Полка ≈ заголовок 20 + арт 110 + паддинг 16 + подписи ≈64 → 210 px.
+-- Центральный столб после rail, context и разделения 7:3 даёт около
+-- 740 px, а не полную ширину панели: бюджет 720 px гарантированно держит
+-- четыре карточки по 150 px с зазорами. Большее логическое окно заводит
+-- курсор в обрезанную справа карточку до сдвига homeLeft. Карточек в
+-- полке рендерим не больше HOME_CARD_CAP — окно двигается, хвост не держим
+-- (счётчик честный: shelf.count хранит число карточек до капа).
 local HOME_SHELF_HEIGHT = 210
 local HOME_SHELF_VIEWPORT_HEIGHT = 450
 local SHELF_WINDOW = math.floor((HOME_SHELF_VIEWPORT_HEIGHT + GAP)
   / (HOME_SHELF_HEIGHT + GAP))
 local HOME_CARD_WIDTH = 150
-local HOME_CARDS_VIEWPORT_WIDTH = 960
+local HOME_CARDS_VIEWPORT_WIDTH = 720
 local HOME_CARD_WINDOW = math.floor((HOME_CARDS_VIEWPORT_WIDTH + GAP)
   / (HOME_CARD_WIDTH + GAP))
 local HOME_CARD_CAP = 20
