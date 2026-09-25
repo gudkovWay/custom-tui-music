@@ -27,8 +27,8 @@ use tmus_core::CoreError;
 use tmus_core::config::Config;
 use tmus_core::cookies::CookieSource;
 use tmus_core::model::{
-    AuthStatus, CatalogShelf, Playlist, PlaylistId, ProviderId, Rating, SearchKind, SearchResult,
-    StreamSource, Track, TrackId,
+    AuthStatus, CatalogCapabilities, HomePage, Playlist, PlaylistId, ProviderId, RadioPage,
+    Rating, SearchKind, SearchResult, StreamSource, Track, TrackId,
 };
 use tmus_provider::ytdlp::{YtDlp, YtDlpRequest};
 use tmus_provider::{Account, Catalog, Provider, ProviderError, Resolver, Result, TrackPage};
@@ -196,6 +196,19 @@ impl Account for YtMusic {
         self.id
     }
 
+    /// Всё, что реализовано в [`crate::innertube::InnerTube`]: оценки,
+    /// создание/удаление плейлистов и правка состава. Заявлять можно
+    /// только фактически работающее — UI предлагает по этой сводке.
+    fn capabilities(&self) -> CatalogCapabilities {
+        CatalogCapabilities {
+            rate: true,
+            playlist_create: true,
+            playlist_add: true,
+            playlist_remove: true,
+            playlist_delete: true,
+        }
+    }
+
     fn display_name(&self) -> &str {
         DISPLAY_NAME
     }
@@ -349,11 +362,37 @@ impl Catalog for YtMusic {
             .await
     }
 
-    async fn home(&self) -> Result<Vec<CatalogShelf>> {
-        // Одна страница: продолжения удваивают латентность ради внеэкранных
-        // полок (см. browse_pages, если понадобится глубже).
-        let page = self.tube.browse(HOME_BROWSE).await?;
-        Ok(parse::home(&page))
+    async fn home_page(&self, cursor: Option<&str>) -> Result<HomePage> {
+        // Первая страница — FEmusic_home, продолжение — по токену из
+        // прошлого ответа, через тот же browse-продолжательный путь, что
+        // и у плейлистов. Полки каждой страницы — [`parse::home`]; без
+        // токена страница — последняя, и дозагрузки не будет.
+        let (page, next) = match cursor {
+            None => self.tube.browse_first(HOME_BROWSE).await?,
+            Some(token) => self.tube.browse_continue(token).await?,
+        };
+        Ok(HomePage {
+            shelves: parse::home(&page),
+            next,
+        })
+    }
+
+    async fn radio(&self, seed: &TrackId, cursor: Option<&str>) -> Result<RadioPage> {
+        // Чужой сид — не наше радио: провайдер отвечает только за свои
+        // идентификаторы, тот же приём, что в `rate`.
+        if seed.provider != self.id {
+            return Err(ProviderError::NoSuchTrack(seed.clone()));
+        }
+        // Старт — `next` по сид-треку без плейлист-контекста: сервис
+        // строит автоплейлист сам. Продолжение — по токену из прошлого
+        // ответа. Разбор (`parse::radio`) отдаёт только играемые треки и
+        // токен; без токена страница — последняя.
+        let page = match cursor {
+            None => self.tube.next(&seed.id, None).await?,
+            Some(token) => self.tube.next_continue(token).await?,
+        };
+        let (tracks, next) = parse::radio(&page);
+        Ok(RadioPage { tracks, next })
     }
 
     async fn rate(&self, track: &TrackId, rating: Rating) -> Result<()> {

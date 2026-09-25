@@ -357,6 +357,51 @@ pub struct CatalogShelf {
     pub items: Vec<SearchResult>,
 }
 
+/// Что провайдер умеет менять в аккаунте. Синхронная сводка: опрашивается
+/// до любой сетевой операции, чтобы UI не предлагал недоступного.
+///
+/// Поля-флаги, а не список возможностей: потребители спрашивают ровно
+/// одним предикатом, а не ищут строку в векторе. Значение по умолчанию —
+/// всё `false`: консервативная позиция — пока провайдер не заявил
+/// операцию, она недоступна. Это же значение честно рисует провайдера,
+/// который умеет только читать.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogCapabilities {
+    /// Ставить оценки трекам.
+    #[serde(default)]
+    pub rate: bool,
+    /// Создавать пустые плейлисты.
+    #[serde(default)]
+    pub playlist_create: bool,
+    /// Добавлять треки в плейлисты аккаунта.
+    #[serde(default)]
+    pub playlist_add: bool,
+    /// Убирать треки из плейлистов аккаунта.
+    #[serde(default)]
+    pub playlist_remove: bool,
+    /// Удалять плейлисты аккаунта целиком.
+    #[serde(default)]
+    pub playlist_delete: bool,
+}
+
+/// Страница домашней ленты. `next: None` — лента дочитана; провайдер без
+/// продолжений всегда отдаёт `None`, и вызов с `Some(_)` обязан закончиться
+/// пустой страницей, а не ошибкой.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HomePage {
+    pub shelves: Vec<CatalogShelf>,
+    #[serde(default)]
+    pub next: Option<String>,
+}
+
+/// Страница радио (автодополнение очереди по сид-треку).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RadioPage {
+    pub tracks: Vec<Track>,
+    #[serde(default)]
+    pub next: Option<String>,
+}
+
 /// Режим повтора. Единый для всех провайдеров: очередь смешанная.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tmus_core::model::{
-    AuthStatus, CatalogShelf, Playlist, PlaylistId, ProviderId, Rating, SearchKind, SearchResult,
-    StreamSource, Track, TrackId,
+    AuthStatus, CatalogCapabilities, HomePage, Playlist, PlaylistId, ProviderId, RadioPage, Rating,
+    SearchKind, SearchResult, StreamSource, Track, TrackId,
 };
 
 pub mod ytdlp;
@@ -76,6 +76,14 @@ pub type Result<T, E = ProviderError> = std::result::Result<T, E>;
 #[async_trait]
 pub trait Account: Send + Sync {
     fn provider(&self) -> ProviderId;
+
+    /// Что провайдер умеет менять в аккаунте. Синхронная и дешёвая:
+    /// способности известны на этапе компиляции крейта, сеть не трогается.
+    /// Дефолт — всё `false`: провайдер, не заявивший операции, не имеет
+    /// их и для вызывающего.
+    fn capabilities(&self) -> CatalogCapabilities {
+        CatalogCapabilities::default()
+    }
 
     /// Человекочитаемое имя для UI: «YouTube Music», «SoundCloud».
     fn display_name(&self) -> &str;
@@ -148,13 +156,30 @@ pub trait Catalog: Send + Sync {
     /// вызывающего это не касается.
     async fn liked(&self) -> Result<Vec<Track>>;
 
-    /// Домашняя лента рекомендаций. Дефолт `Unsupported` — не сбой:
-    /// вызывающий обязан считать её пустой лентой (см.
-    /// [`ProviderError::Unsupported`]), а не «рекомендации сломались».
-    async fn home(&self) -> Result<Vec<CatalogShelf>> {
+    /// Страница домашней ленты рекомендаций. `cursor: None` — первый
+    /// кусок, `Some(token)` — продолжение по токену от прошлого вызова.
+    ///
+    /// Дефолт `Unsupported` — не сбой: вызывающий обязан считать ленту
+    /// пустой (см. [`ProviderError::Unsupported`]), а не «рекомендации
+    /// сломались». Вызов с курсором, который провайдер не выдавал,
+    /// обязан закончиться пустой страницей — у него нет оснований
+    /// выдумывать продолжение за сервис.
+    async fn home_page(&self, _cursor: Option<&str>) -> Result<HomePage> {
         Err(ProviderError::Unsupported {
             provider: self.provider(),
             what: "домашняя лента",
+        })
+    }
+
+    /// Страница радио по сид-треку. Курсор — тот же договор, что у
+    /// [`Catalog::home_page`].
+    ///
+    /// Дефолт `Unsupported`: радио — не универсальная возможность,
+    /// провайдер без неё не должен её изображать.
+    async fn radio(&self, _seed: &TrackId, _cursor: Option<&str>) -> Result<RadioPage> {
+        Err(ProviderError::Unsupported {
+            provider: self.provider(),
+            what: "радио",
         })
     }
 
@@ -388,15 +413,36 @@ mod tests {
     }
 
     #[test]
-    fn default_home_is_unsupported() {
-        // Провайдер без переопределения `home` обязан отвечать
+    fn default_home_page_is_unsupported() {
+        // Провайдер без переопределения `home_page` обязан отвечать
         // Unsupported: вызывающий трактует это как пустую ленту.
         let stub = Stub(ProviderId::SOUNDCLOUD);
         let error = tokio::runtime::Runtime::new()
             .expect("runtime")
-            .block_on(stub.home())
+            .block_on(stub.home_page(None))
             .unwrap_err();
         assert!(matches!(error, ProviderError::Unsupported { provider, .. } if provider == ProviderId::SOUNDCLOUD));
+    }
+
+    #[test]
+    fn default_radio_is_unsupported() {
+        // Радио — не универсальная возможность; дефолт обязан быть
+        // Unsupported, а не сетевым сбоем.
+        let stub = Stub(ProviderId::SOUNDCLOUD);
+        let seed = TrackId::new(ProviderId::SOUNDCLOUD, "abc");
+        let error = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(stub.radio(&seed, None))
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::Unsupported { provider, .. } if provider == ProviderId::SOUNDCLOUD));
+    }
+
+    #[test]
+    fn default_capabilities_are_all_false() {
+        // Провайдер, не заявивший операции, консервативно не умеет ни
+        // одной: UI не предлагает недоступного.
+        let stub = Stub(ProviderId::SOUNDCLOUD);
+        assert_eq!(stub.capabilities(), CatalogCapabilities::default());
     }
 
     #[test]
