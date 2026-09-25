@@ -23,6 +23,16 @@ const PROVIDER: ProviderId = ProviderId::SOUNDCLOUD;
 /// но полагаться на «всегда» не стоит — вернём `None`).
 #[must_use]
 pub(crate) fn track(v: &Value) -> Option<Track> {
+    // Негодные для воспроизведения треки отсеиваем здесь, у входа:
+    // `policy == "SNIPPET"` — превью-отрезок вместо полного стрима,
+    // `streamable == false` — стрим отрезан вовсе (замер живого ответа:
+    // DRM-треки приходят именно так). Оба поля опциональны — без меты
+    // трек принимаем, решать «нельзя» по отсутствию поля нельзя.
+    if v.get("policy").and_then(Value::as_str) == Some("SNIPPET")
+        || v.get("streamable").and_then(Value::as_bool) == Some(false)
+    {
+        return None;
+    }
     let id = v.get("id")?.as_u64()?.to_string();
     let title = v.get("title")?.as_str()?.to_owned();
     let user = v.get("user")?;

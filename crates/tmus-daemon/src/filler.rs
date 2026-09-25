@@ -87,7 +87,25 @@ pub async fn run_cache_filler(app: Arc<App>) {
                 tracing::debug!(track = %id, "трек в кулдауне бэкоффа, пропускаю");
                 continue;
             }
+            // Невоспроизводимый трек не в кулдауне, а выбыл совсем:
+            // лестница 1м→5м→15м→1ч для постоянной причины — просто
+            // отложенные впустую запуски yt-dlp.
+            if retries.get(&id).is_some_and(|s| s.unplayable) {
+                continue;
+            }
             if let Err(err) = fetch_into_cache(&app, &id).await {
+                // `Unplayable` — терминальный исход этого трека:
+                // записываем раз, логируем и идём к следующему
+                // кандидату через обычный поток филлера; бэкофф не
+                // назначаем.
+                if err
+                    .downcast_ref::<tmus_provider::ProviderError>()
+                    .is_some_and(|e| matches!(e, tmus_provider::ProviderError::Unplayable { .. }))
+                {
+                    tracing::warn!(track = %id, %err, "трек нельзя воспроизвести — снимаю с докачки");
+                    retries.entry(id.clone()).or_default().record_unplayable();
+                    continue;
+                }
                 let now = Instant::now();
                 let state = retries.entry(id.clone()).or_default();
                 let escalated = state.record_failure(now);
@@ -154,12 +172,22 @@ fn next_delay(failures: u32) -> Duration {
 struct RetryState {
     failures: u32,
     retry_after: Option<Instant>,
+    /// Причина отказа постоянная (`Unplayable`: DRM, отрезанный стрим):
+    /// трек не на лестнице бэкоффа, а вовсе вне докачки. Повтор через
+    /// час ничего не изменит — только новый впустую запущенный yt-dlp.
+    unplayable: bool,
 }
 
 impl RetryState {
     /// Трек в кулдауне — пропускаем без сетевых попыток вовсе.
     fn in_cooldown(&self, now: Instant) -> bool {
         self.retry_after.is_some_and(|t| now < t)
+    }
+
+    /// Трек признан невоспроизводимым: терминальный исход, вне лестницы.
+    fn record_unplayable(&mut self) {
+        self.unplayable = true;
+        self.retry_after = None;
     }
 
     /// Фиксируем неудачу; возвращает true, если сменился уровень бэкоффа
@@ -175,6 +203,7 @@ impl RetryState {
     fn record_success(&mut self) {
         self.failures = 0;
         self.retry_after = None;
+        self.unplayable = false;
     }
 }
 

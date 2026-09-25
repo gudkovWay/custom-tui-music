@@ -204,6 +204,12 @@ impl YtDlp {
 /// переподключением аккаунта. Замерено, что yt-dlp отдаёт это сообщение на
 /// всех клиентах при отсутствии cookies, поэтому его нельзя отдавать как
 /// `Tool` — вызывающий должен предложить переподключение, а не «переустановить yt-dlp».
+///
+/// После бот-гейта распознаётся DRM: «This video is DRM protected» —
+/// трек существует, но стрима у него нет и повторами это не чинится.
+/// Такой исход уходит как [`ProviderError::Unplayable`], а не `Tool`:
+/// плеер обязан перепрыгнуть трек в пределах своего потолка, а не
+/// предлагать чинить инструмент. Всё остальное — прежний `Tool`.
 fn stderr_error(provider: ProviderId, stderr: &str) -> ProviderError {
     let last = stderr.lines().rev().find(|l| !l.trim().is_empty());
     let reason = last.unwrap_or("нет объяснения в stderr").trim().to_owned();
@@ -211,6 +217,8 @@ fn stderr_error(provider: ProviderId, stderr: &str) -> ProviderError {
         || stderr.contains("confirm you're not a bot");
     if bot_gate {
         ProviderError::Auth { provider, reason }
+    } else if reason.to_lowercase().contains("drm protected") {
+        ProviderError::Unplayable { provider, reason }
     } else {
         ProviderError::Tool {
             tool: "yt-dlp",

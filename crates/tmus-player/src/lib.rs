@@ -10,7 +10,7 @@ use std::time::SystemTime;
 use tokio::sync::Mutex;
 use tmus_core::model::{EqState, EQ_FREQUENCIES_HZ, EQ_GAIN_LIMIT_DB, PlaybackStatus, TrackId};
 use tmus_core::protocol::PlayerState;
-use tmus_provider::Registry;
+use tmus_provider::{ProviderError, Registry};
 
 pub mod mpv;
 pub mod queue;
@@ -258,7 +258,54 @@ impl Player {
         let source = match self.take_preloaded(track_id).await {
             // Годная предзагрузка — играем сразу, без сети.
             Some(source) if !source.is_expired(SystemTime::now()) => Some(source),
-            _ => self.resolve_fresh(track_id, my_gen).await?,
+            _ => match self.resolve_fresh(track_id, my_gen).await {
+                Ok(source) => source,
+                // Резолв-время «трек нельзя воспроизвести» (DRM и т.п.)
+                // приравнивается к провалу воспроизведения на стороне
+                // mpv: видимая причина в `last_error`, затем тот же
+                // счётчик (`failure_streak`) и тот же потолок
+                // (`MAX_AUTO_SKIPS`) — без своего пути промотки, чтобы
+                // серия не могла уйти в бесконечность. Сетевые и
+                // инструментальные сбои остаются на прежнем пути
+                // «остановиться и показать ошибку»: они чинятся
+                // повтором, а трек — нет. Промотка синхронная, а не в
+                // отдельной задаче: к этому месту семафор резолва уже
+                // отпущен (`resolve_fresh` вернулся), так что вложенный
+                // резолв следующего трека не встанет навсегда в очередь
+                // к самому себе; глубина ограничена потолком скипов.
+                Err(e @ PlayerError::Provider(ProviderError::Unplayable {
+                    ref reason,
+                    ..
+                })) => {
+                    tracing::warn!(track = %track_id, reason = %reason, "трек нельзя воспроизвести");
+                    *self.inner.last_error.lock().await = Some(reason.clone());
+                    // Окно перехода закрываем до промотки: висящий
+                    // `pending` отказавшего трека иначе пережил бы
+                    // конец очереди и залип бы в баре.
+                    self.transition_failed(track_id).await;
+                    let streak = self
+                        .inner
+                        .failure_streak
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1;
+                    match failure_action(streak) {
+                        FailureAction::Advance => {
+                            tracing::warn!(track = %track_id, streak, "трек нельзя воспроизвести — перехожу к следующему");
+                            // Исход решает цепочка промотки (вплоть до
+                            // `Stop` или конца очереди): наверх отдаём
+                            // успех, чтобы внешняя обработка сбоя не
+                            // затёрла состояние уже играющего трека.
+                            self.on_track_end().await;
+                            return Ok(());
+                        }
+                        FailureAction::Stop => {
+                            tracing::warn!("подряд нельзя воспроизвести {} треков — останавливаюсь", streak);
+                            return Err(e);
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            },
         };
         let Some(source) = source else {
             // Вытеснены более новой командой: её трек и будет играть.

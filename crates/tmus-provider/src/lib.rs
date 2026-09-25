@@ -55,6 +55,17 @@ pub enum ProviderError {
     #[error("{provider} не поддерживает {what}")]
     Unsupported { provider: ProviderId, what: &'static str },
 
+    /// Трек существует, но сыграть его нельзя: DRM, отрезанный стрим и
+    /// т.п. Не `Unsupported`: это пустая возможность каталога, а здесь
+    /// — конкретный трек, который не заиграет ни при каких повторах.
+    /// Вызывающий (плеер, филлер) обязан считать исход терминальным для
+    /// трека, а не сетевым сбоем.
+    #[error("{provider}: трек нельзя воспроизвести: {reason}")]
+    Unplayable {
+        provider: ProviderId,
+        reason: String,
+    },
+
     #[error("внешний инструмент {tool}: {reason}")]
     Tool { tool: &'static str, reason: String },
 }
