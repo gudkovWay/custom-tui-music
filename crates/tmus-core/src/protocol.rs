@@ -559,7 +559,7 @@ mod tests {
         assert_eq!(back, view);
 
         let stale: ProviderView = serde_json::from_str(
-            r#"{"id":"soundcloud","name":"SC","auth":"Ready","glyph":"s","color":"#ff5500"}"#,
+            r##"{"id":"soundcloud","name":"SC","auth":"Ready","glyph":"s","color":"#ff5500"}"##,
         )
         .expect("старый снапшот без capabilities обязан парситься");
         assert_eq!(stale.capabilities, CatalogCapabilities::default());
