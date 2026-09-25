@@ -107,6 +107,24 @@ CREATE TABLE IF NOT EXISTS ratings (
 
 -- gc ходит именно так: незакреплённые, самые старые первыми.
 CREATE INDEX IF NOT EXISTS audio_lru ON audio (pinned, accessed_at);
+CREATE TABLE IF NOT EXISTS local_playlists (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    title      TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS local_playlist_tracks (
+    playlist_id     INTEGER NOT NULL,
+    position        INTEGER NOT NULL,
+    track_provider  TEXT NOT NULL,
+    track_id        TEXT NOT NULL,
+    PRIMARY KEY (playlist_id, position),
+    FOREIGN KEY (playlist_id) REFERENCES local_playlists(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS local_playlist_track_lookup
+    ON local_playlist_tracks (playlist_id, track_provider, track_id);
 ";
 
 /// Догрузка колонок для баз, созданных до ленивой пагинации плейлистов.
@@ -227,6 +245,193 @@ impl Cache {
             paths: paths.clone(),
             limit_bytes,
         })
+    }
+    fn local_playlist_key(&self, id: &PlaylistId) -> Result<i64> {
+        if id.provider != ProviderId::LOCAL {
+            return Err(self.db_error(rusqlite::Error::InvalidParameterName(
+                "local playlist id must use provider local".into(),
+            )));
+        }
+        id.id.parse().map_err(|_| {
+            self.db_error(rusqlite::Error::InvalidParameterName(
+                "local playlist id must contain an integer row id".into(),
+            ))
+        })
+    }
+
+    fn local_title(&self, title: &str) -> Result<String> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(self.db_error(rusqlite::Error::InvalidParameterName(
+                "local playlist title must not be empty".into(),
+            )));
+        }
+        Ok(title.to_owned())
+    }
+
+    /// Создать локальный плейлист приложения.
+    pub fn local_playlist_create(&self, title: &str) -> Result<Playlist> {
+        let title = self.local_title(title)?;
+        let now = now_secs();
+        self.conn
+            .execute(
+                "INSERT INTO local_playlists (title, created_at, updated_at)
+                 VALUES (?1, ?2, ?2)",
+                params![title, now],
+            )
+            .map_err(|e| self.db_error(e))?;
+        Ok(Playlist {
+            id: PlaylistId::new(ProviderId::LOCAL, self.conn.last_insert_rowid().to_string()),
+            title,
+            subtitle: None,
+            art_url: None,
+            track_count: Some(0),
+        })
+    }
+
+    /// Переименовать локальный плейлист приложения.
+    pub fn local_playlist_rename(&self, id: &PlaylistId, title: &str) -> Result<()> {
+        let key = self.local_playlist_key(id)?;
+        let title = self.local_title(title)?;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE local_playlists SET title = ?1, updated_at = ?2 WHERE id = ?3",
+                params![title, now_secs(), key],
+            )
+            .map_err(|e| self.db_error(e))?;
+        if changed == 0 {
+            return Err(self.db_error(rusqlite::Error::QueryReturnedNoRows));
+        }
+        Ok(())
+    }
+
+    /// Удалить локальный плейлист и его записи.
+    pub fn local_playlist_delete(&self, id: &PlaylistId) -> Result<()> {
+        let key = self.local_playlist_key(id)?;
+        let deleted = self
+            .conn
+            .execute("DELETE FROM local_playlists WHERE id = ?1", [key])
+            .map_err(|e| self.db_error(e))?;
+        if deleted == 0 {
+            return Err(self.db_error(rusqlite::Error::QueryReturnedNoRows));
+        }
+        Ok(())
+    }
+
+    /// Получить локальные плейлисты приложения.
+    pub fn local_playlists(&self) -> Result<Vec<Playlist>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT p.id, p.title, COUNT(t.position)
+                 FROM local_playlists p
+                 LEFT JOIN local_playlist_tracks t ON t.playlist_id = p.id
+                 GROUP BY p.id ORDER BY p.title COLLATE NOCASE",
+            )
+            .map_err(|e| self.db_error(e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(Playlist {
+                    id: PlaylistId::new(ProviderId::LOCAL, row.get::<_, i64>(0)?.to_string()),
+                    title: row.get(1)?,
+                    subtitle: None,
+                    art_url: None,
+                    track_count: u32::try_from(row.get::<_, i64>(2)?).ok(),
+                })
+            })
+            .map_err(|e| self.db_error(e))?;
+        collect(rows, |e| self.db_error(e))
+    }
+
+    /// Добавить запись, сохранив дубликаты и порядок.
+    pub fn local_playlist_add(&self, playlist: &PlaylistId, track: &TrackId) -> Result<()> {
+        let key = self.local_playlist_key(playlist)?;
+        let tx = self.transaction()?;
+        let position: i64 = tx.query_row(
+            "SELECT IFNULL(MAX(position), -1) + 1
+             FROM local_playlist_tracks WHERE playlist_id = ?1",
+            [key], |row| row.get(0),
+        ).map_err(|e| self.db_error(e))?;
+        tx.execute(
+            "INSERT INTO local_playlist_tracks
+             VALUES (?1, ?2, ?3, ?4)",
+            params![key, position, track.provider.as_str(), track.id.as_str()],
+        ).map_err(|e| self.db_error(e))?;
+        tx.execute(
+            "UPDATE local_playlists SET updated_at = ?1 WHERE id = ?2",
+            params![now_secs(), key],
+        ).map_err(|e| self.db_error(e))?;
+        tx.commit().map_err(|e| self.db_error(e))
+    }
+
+    /// Удалить запись и атомарно уплотнить позиции.
+    pub fn local_playlist_remove_at(&self, playlist: &PlaylistId, position: usize) -> Result<()> {
+        let key = self.local_playlist_key(playlist)?;
+        let tx = self.transaction()?;
+        let removed = tx.execute(
+            "DELETE FROM local_playlist_tracks WHERE playlist_id = ?1 AND position = ?2",
+            params![key, position as i64],
+        ).map_err(|e| self.db_error(e))?;
+        if removed == 0 {
+            return Err(self.db_error(rusqlite::Error::QueryReturnedNoRows));
+        }
+        tx.execute(
+            "UPDATE local_playlist_tracks SET position = -position - 1
+             WHERE playlist_id = ?1 AND position > ?2",
+            params![key, position as i64],
+        ).map_err(|e| self.db_error(e))?;
+        tx.execute(
+            "UPDATE local_playlist_tracks SET position = -position - 2
+             WHERE playlist_id = ?1 AND position < 0",
+            [key],
+        ).map_err(|e| self.db_error(e))?;
+        tx.execute(
+            "UPDATE local_playlists SET updated_at = ?1 WHERE id = ?2",
+            params![now_secs(), key],
+        ).map_err(|e| self.db_error(e))?;
+        tx.commit().map_err(|e| self.db_error(e))
+    }
+
+    /// Прочитать локальные записи с кэшированными метаданными.
+    pub fn local_playlist_tracks(&self, playlist: &PlaylistId) -> Result<Vec<Track>> {
+        let key = self.local_playlist_key(playlist)?;
+        let sql = format!(
+            "SELECT {TRACK_COLUMNS} FROM local_playlist_tracks pt
+             JOIN tracks t ON t.provider = pt.track_provider AND t.id = pt.track_id
+             WHERE pt.playlist_id = ?1 ORDER BY pt.position"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| self.db_error(e))?;
+        let rows = stmt
+            .query_map([key], track_from_row)
+            .map_err(|e| self.db_error(e))?;
+        let tracks = collect(rows, |e| self.db_error(e))?;
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM local_playlist_tracks WHERE playlist_id = ?1",
+            [key], |row| row.get(0),
+        ).map_err(|e| self.db_error(e))?;
+        if tracks.len() as i64 != count {
+            return Err(self.db_error(rusqlite::Error::InvalidParameterName(
+                "local playlist entry has no cached track metadata".into(),
+            )));
+        }
+        Ok(tracks)
+    }
+
+    /// Прочитать локально отмеченные треки и время оценки.
+    pub fn liked_tracks(&self) -> Result<Vec<(Track, i64)>> {
+        let sql = format!(
+            "SELECT {TRACK_COLUMNS}, r.updated_at FROM ratings r
+             JOIN tracks t ON t.provider = r.provider AND t.id = r.id
+             WHERE r.kind = 'liked' ORDER BY r.updated_at DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| self.db_error(e))?;
+        let rows = stmt.query_map([], |row| Ok((track_from_row(row)?, row.get(8)?)))
+            .map_err(|e| self.db_error(e))?;
+        collect(rows, |e| self.db_error(e))
     }
 
     /// Записать треки. Существующие записи обновляются: провайдер мог

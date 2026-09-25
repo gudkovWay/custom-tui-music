@@ -53,6 +53,14 @@ local sourceReady = false
 -- Летящая догрузка хвоста плейлиста: повторный tracks-more, пока не
 -- вернулся предыдущий call, игнорируется. Сбрасывается в cb и onDone.
 local tracksMoreInFlight = false
+-- Монотонный номер запроса library-tracks: поздний ответ на старый
+-- запрос (в т.ч. повторный по тому же id) не должен затирать свежий
+-- снапшот плейлиста. Инкремент и захват — в pullTracks.
+local tracksRequestGeneration = 0
+-- Летящая догрузка home-ленты: тот же принцип, что у tracks-more.
+-- Сбрасывается также в pullHome — новая лента обнуляет продолжение,
+-- и застрявший guard не должен блокировать следующую догрузку.
+local homeMoreInFlight = false
 
 -- Метка жизни потока `tmus events`: любая строка (включая keepalive)
 -- двигает её. У runStream нет onClose, поэтому единственный след
@@ -82,7 +90,9 @@ local artDirty = false
 -- всегда парой, кроме ветки position — там достаточно лёгкого.
 local NOW_KEY = "tmus.now"
 local HOME_KEY = "tmus.home"
-local homeState = { status = "idle", shelves = {} }
+-- Лента Home: shelves — загруженные полки, next — курсор продолжения
+-- демона (nil/"" — дочитано). Статус loading/error/ok как раньше.
+local homeState = { status = "idle", shelves = {}, next = nil }
 local homeAt = 0
 local homeDirty = false
 
@@ -224,6 +234,97 @@ local function decorateHomeArt(category, obj)
   end)
 end
 
+-- Арты ленты: общее для начальной загрузки и догрузок home-more.
+-- Качаем только окно первых 14 карточек полки — панель рендерит окно,
+-- хвост полки не держит.
+local function decorateHomeShelves(shelves)
+  for _, shelf in ipairs(shelves) do
+    local items = type(shelf.items) == "table" and shelf.items or {}
+    for i, item in ipairs(items) do
+      if i > 14 then
+        break
+      end
+      if item.kind == "track" then
+        decorateHomeArt("track", item)
+      elseif item.kind == "playlist" then
+        decorateHomeArt("playlist", item)
+      end
+    end
+  end
+end
+
+-- Ключ карточки ленты для дедупликации: kind + составной id. Карточка
+-- без id (или с пустым id) ключа не имеет — nil: дедуп её не трогает,
+-- каждый экземпляр попадает в ленту (комментарию выше не противоречит).
+local function homeCardKey(item)
+  local id = type(item) == "table" and item.id or nil
+  local kind = tostring(type(item) == "table" and item.kind or "")
+  local prov, bare
+  if type(id) == "table" then
+    prov = tostring(id.provider or "")
+    bare = tostring(id.id or "")
+  else
+    bare = tostring(id or "")
+  end
+  if prov == nil and bare == "" then
+    return nil
+  end
+  if prov ~= nil and prov == "" and bare == "" then
+    return nil
+  end
+  return kind .. ":" .. (prov ~= nil and (prov .. ":") or "") .. bare
+end
+
+-- Детерминированное слияние страницы home-more в загруженную ленту.
+-- Полка матчится по title+subtitle: совпала — дополняется карточками,
+-- которых ещё НЕ БЫЛО во всей ленте (глобальный набор seen: одна и та
+-- же карточка в двух полках дважды не рисуется); новая полка —
+-- дописывается в конец в порядке демона. Существующие полки не
+-- переупорядочиваются — экран не прыгает под курсором.
+local function mergeHomeShelves(oldShelves, page)
+  local shelves = {}
+  local byTitle = {}
+  for _, s in ipairs(oldShelves) do
+    table.insert(shelves, s)
+    byTitle[tostring(s.title or "") .. "|" .. tostring(s.subtitle or "")] = s
+  end
+  local seen = {}
+  for _, s in ipairs(shelves) do
+    for _, it in ipairs(type(s.items) == "table" and s.items or {}) do
+      local ck = homeCardKey(it)
+      -- Ключа нет (карточка без id) — в seen не пишем: такие карточки
+      -- не дедуплицируются и всегда проходят.
+      if ck ~= nil then
+        seen[ck] = true
+      end
+    end
+  end
+  local pages = type(page.shelves) == "table" and page.shelves or {}
+  for _, ns in ipairs(pages) do
+    local key = tostring(ns.title or "") .. "|" .. tostring(ns.subtitle or "")
+    local target = byTitle[key]
+    if target == nil then
+      target = {}
+      for k, v in pairs(ns) do
+        target[k] = v
+      end
+      target.items = {}
+      byTitle[key] = target
+      table.insert(shelves, target)
+    end
+    for _, it in ipairs(type(ns.items) == "table" and ns.items or {}) do
+      local ck = homeCardKey(it)
+      if ck == nil or not seen[ck] then
+        if ck ~= nil then
+          seen[ck] = true
+        end
+        table.insert(target.items, it)
+      end
+    end
+  end
+  return shelves
+end
+
 local function trackFields(track)
   if type(track) ~= "table" then
     return "", "", "", "", ""
@@ -335,6 +436,27 @@ local function pullStatus()
   end, nil, true)
 end
 
+-- Нормализация capabilities провайдера: список строк или объект
+-- {playlist_create=..,playlist_add=..,...} → множество имён.
+local function capsFrom(raw)
+  local out = {}
+  if type(raw) ~= "table" then
+    return out
+  end
+  if raw[1] ~= nil then
+    for _, name in ipairs(raw) do
+      out[tostring(name)] = true
+    end
+  else
+    for name, on in pairs(raw) do
+      if on == true then
+        out[tostring(name)] = true
+      end
+    end
+  end
+  return out
+end
+
 local function pullProviders()
   call({ "providers", "--json" }, function(got)
     local out = {}
@@ -354,6 +476,12 @@ local function pullProviders()
         color = tostring(p.color or ""),
         authKind = kind,
         authHint = hint,
+        -- Возможности провайдера (snapshotCapabilities): плейлистные
+        -- операции и rate. Снимок может прийти списком строк или
+        -- объектом имя->bool — принимаем обе формы; отсутствие поля
+        -- (старый демон) = пустой набор: панель показывает локальные
+        -- адресаты, нативные прячет.
+        caps = capsFrom(p.capabilities),
       })
     end
     data.providers = out
@@ -370,34 +498,82 @@ local function pullLibrary()
   end)
 end
 
+local function pullTracks(id)
+  tracksRequestGeneration = tracksRequestGeneration + 1
+  local generation = tracksRequestGeneration
+  call({ "library-tracks", id, "--json" }, function(got)
+    -- Ответ чужой, если пока летел запрос, ушёл более новый
+    -- library-tracks (другой плейлист или повторное открытие того же).
+    if generation ~= tracksRequestGeneration then
+      return
+    end
+    local tracks = type(got) == "table" and got or {}
+    data.tracks = tracks
+    data.tracksId = id
+    data.hasMore = true
+    for _, tr in ipairs(data.tracks) do
+      decorateArt("track", tr)
+    end
+  end)
+end
+
 local function pullHome()
   homeAt = noctalia.nowMs()
-  homeState.status = "loading"
+  -- Новая лента обнуляет продолжение: застрявший guard догрузки не
+  -- должен переживать перезагрузку (путь reset/error).
+  homeMoreInFlight = false
+  homeState = { status = "loading", shelves = homeState.shelves, next = nil }
   publishHome()
   call({ "home", "--provider", data.source, "--json" }, function(got)
-    local shelves = type(got) == "table" and got or {}
-    for _, shelf in ipairs(shelves) do
-      -- Панель рендерит ленту полками; качать арты всей полки —
-      -- лишний трафик, достаточно окна первых карточек.
-      local items = type(shelf.items) == "table" and shelf.items or {}
-      for i, item in ipairs(items) do
-        if i > 14 then
-          break
-        end
-        if item.kind == "track" then
-          decorateHomeArt("track", item)
-        elseif item.kind == "playlist" then
-          decorateHomeArt("playlist", item)
-        end
-      end
-    end
-    homeState = { status = "ok", shelves = shelves, at = os.time() }
+    -- Home возвращается ОБЪЕКТОМ { shelves, next }: shelves — полки
+    -- страницы, next — курсор продолжения (nil/"" — дочитано).
+    local page = type(got) == "table" and got or {}
+    local shelves = type(page.shelves) == "table" and page.shelves or {}
+    decorateHomeShelves(shelves)
+    local next = type(page.next) == "string" and page.next ~= "" and page.next or nil
+    homeState = { status = "ok", shelves = shelves, next = next, at = os.time() }
   end, function()
     -- onDone дёргается и после успешного onOk: ошибкой считаем
     -- только случай, когда статус остался "loading".
     if homeState.status == "loading" then
       homeState.status = "error"
     end
+    publishHome()
+  end)
+end
+
+-- Догрузка home-ленты по курсору продолжения: панель стучится, когда
+-- курсор подошёл к концу загруженных полок. Повторный запрос, пока
+-- летит предыдущий, схлопывает homeMoreInFlight; cb/onDone его снимают.
+local function pullHomeMore(cursor)
+  if homeMoreInFlight or homeState.status ~= "ok" then
+    return
+  end
+  if type(homeState.next) ~= "string" or homeState.next == "" then
+    return
+  end
+  -- Панель шлёт зеркало homeState.next; протухший курсор (лента уже
+  -- перезагружена/дочитана) отвергаем явно, а не игнорируем аргумент.
+  if tostring(cursor or "") ~= homeState.next then
+    return
+  end
+  homeMoreInFlight = true
+  local want = homeState.next
+  call({ "home-more", want, "--json" }, function(got)
+    homeMoreInFlight = false
+    -- Пока летел запрос, ленту перезагрузили (pullHome): страница
+    -- чужая — вписывать её в новую ленту нельзя.
+    if homeState.status ~= "ok" or homeState.next ~= want then
+      return
+    end
+    local page = type(got) == "table" and got or {}
+    local shelves = mergeHomeShelves(homeState.shelves, page)
+    decorateHomeShelves(shelves)
+    homeState.shelves = shelves
+    homeState.next = type(page.next) == "string" and page.next ~= "" and page.next or nil
+    homeState.at = os.time()
+  end, function()
+    homeMoreInFlight = false
     publishHome()
   end)
 end
@@ -603,7 +779,7 @@ function onIpc(event, payload)
   elseif event == "play-context" and payload then
     -- Панель шлёт "<start>|<prov:id>,<prov:id>,..."; CLI —
     -- `tmus play-context <ids-через-запятую> --start <n>`. Разбор по
-    -- образцу "playlist-at"; ответ не нужен — демон разошлёт state.
+    -- образцу "play-playlist"; ответ не нужен — демон разошлёт state.
     local index, ids = tostring(payload):match("^(%d+)|(.+)$")
     if ids and ids ~= "" then
       poke({ "play-context", ids, "--start", tostring(math.max(0, tonumber(index) or 0)) })
@@ -633,20 +809,23 @@ function onIpc(event, payload)
     -- инкрементальных правок на 18 плейлистов.
     local op, rest = tostring(payload):match("^([%a]+):(.*)$")
     if op == "new" then
+      -- Интерактивный плейлист создаётся ЛОКАЛЬНЫМ по умолчанию:
+      -- CLI `pl new <title>` без --provider.
       call({ "pl", "new", rest }, nil, function() pullLibrary() end)
     elseif op == "newadd" then
-      -- Создание + немедленное добавление трека. В отличие от "new",
-      -- здесь есть контекст трека, поэтому плейлист создаём у провайдера
-      -- трека (--provider); адресата выбирает не демон. id нового
-      -- плейлиста
-      -- существует только в stdout `pl new` (голая строка, не JSON),
-      -- поэтому цепочка живёт здесь: call() прогоняет stdout через
-      -- json.decode и голый id наружу не отдаёт — runAsync напрямую,
-      -- по образцу call(). Панель слала бы add по ИМЕНИ — гонка с
-      -- дубликатами имён; в цепочке id точный.
+      -- Создание + немедленное добавление трека. Плейлист создаём
+      -- ЛОКАЛЬНЫМ (дефолт CLI): адресат по умолчанию — всегда
+      -- доступное хранилище, нативные адресата панель предлагает
+      -- только при совпадении провайдера и caps.playlist_add. id
+      -- нового плейлиста существует только в stdout `pl new` (голая
+      -- строка, не JSON), поэтому цепочка живёт здесь: call()
+      -- прогоняет stdout через json.decode и голый id наружу не
+      -- отдаёт — runAsync напрямую, по образцу call(). Панель слала
+      -- бы add по ИМЕНИ — гонка с дубликатами имён; в цепочке id
+      -- точный.
       local title, prov, tid = rest:match("^([^:]+):([^:]+):(.+)$")
       if title and prov and tid then
-        noctalia.runAsync({ TMUS, "pl", "new", title, "--provider", prov }, function(res)
+        noctalia.runAsync({ TMUS, "pl", "new", title }, function(res)
           if not res or res.exitCode ~= 0 then
             data.error = res and noctalia.string.trim(res.stderr or "") ~= ""
               and noctalia.string.trim(res.stderr) or "tmus не ответил"
@@ -657,7 +836,12 @@ function onIpc(event, payload)
           if plId == "" then
             return
           end
-          call({ "pl", "add", plId, prov .. ":" .. tid }, nil, function() pullLibrary() end)
+          call({ "pl", "add", plId, prov .. ":" .. tid }, nil, function()
+            pullLibrary()
+            if data.tracksId == plId then
+              pullTracks(plId)
+            end
+          end)
         end)
       end
     elseif op == "add" or op == "rm" then
@@ -668,15 +852,55 @@ function onIpc(event, payload)
       if plProv and plBare and track then
         call({ "pl", op, plProv .. ":" .. plBare, track }, nil, function() pullLibrary() end)
       end
+    elseif op == "rmat" then
+      -- Удаление из ЛОКАЛЬНОГО плейлиста по абсолютной позиции
+      -- (PlaylistRemoveAt): позиция, а не id трека — дубликаты
+      -- уходят ровно по одному. rest = "<prov>:<plid>:<0-based pos>";
+      -- плейлист заведомо локальный (панель шлёт rmat только для
+      -- provider == "local").
+      local plProv, plBare, pos = rest:match("^([^:]+):([^:]+):(%d+)$")
+      if plProv and plBare then
+        -- Захват до запуска: если пока летит rm-at панель открыла другой
+        -- плейлист (pullTracks уже инкрементировал поколение), поздний
+        -- рефреш не должен затирать новый запрос.
+        local generation = tracksRequestGeneration
+        call({ "pl", "rm-at", plProv .. ":" .. plBare, pos }, nil, function()
+          pullLibrary()
+          local id = plProv .. ":" .. plBare
+          if data.tracksId == id and generation == tracksRequestGeneration then
+            pullTracks(id)
+          end
+        end)
+      end
     elseif op == "del" and rest ~= "" then
       -- rest уже составной "<prov>:<id>" — CLI принимает как есть.
       call({ "pl", "del", rest }, nil, function() pullLibrary() end)
     end
-  elseif event == "playlist" and payload then
-    poke({ "play-playlist", payload, "--start", "0" })
-  elseif event == "playlist-at" and payload then
-    local index, id = tostring(payload):match("^(%d+)|(.+)$")
-    poke({ "play-playlist", id or "", "--start", tostring(math.max(0, tonumber(index) or 0)) })
+  elseif event == "play-playlist" and payload then
+    -- PlayPlaylist { playlist, track }: составной id плейлиста,
+    -- опционально "|<prov:id>" конкретного трека. CLI —
+    -- `tmus play-playlist <pl> [--track <prov:id>]`; --start больше
+    -- не существует — идентичность трека переходит границу сервиса
+    -- сама, а не через индекс отрисовки.
+    local pl, track = tostring(payload):match("^([^|]+)|(.+)$")
+    if pl and pl ~= "" then
+      poke({ "play-playlist", pl, "--track", track })
+    elseif tostring(payload) ~= "" then
+      -- Активация заголовка плейлиста: без --track.
+      poke({ "play-playlist", tostring(payload) })
+    end
+  elseif event == "radio" and payload then
+    -- Радио по треку (`tmus radio <prov:id>`): одиночная активация
+    -- строки поиска/карточки home. Контекстные жесты (плейлист,
+    -- альбом) идут прежними событиями.
+    local id = tostring(payload)
+    if id ~= "" then
+      poke({ "radio", id })
+    end
+  elseif event == "home-more" and payload ~= nil then
+    -- Курсор продолжения приходит от панели зеркалом homeState.next;
+    -- настоящий guard и слияние живут здесь (pullHomeMore).
+    pullHomeMore(tostring(payload))
   elseif event == "queue-goto" and payload then
     -- Payload панели — 0-базный индекс очереди; CLI понимает
     -- `tmus queue-goto <n>` напрямую.
@@ -709,16 +933,7 @@ function onIpc(event, payload)
       data.searchSerial = data.searchSerial + 1
     end)
   elseif event == "tracks" and payload then
-    call({ "library-tracks", tostring(payload), "--json" }, function(got)
-      data.tracks = type(got) == "table" and got or {}
-      data.tracksId = tostring(payload)
-      -- Полный список мог прийти неполным: демон режет выдачу
-      -- потолком batch — хвост добираем ленивой догрузкой.
-      data.hasMore = true
-      for _, tr in ipairs(data.tracks) do
-        decorateArt("track", tr)
-      end
-    end)
+    pullTracks(tostring(payload))
   elseif event == "tracks-more" and payload then
     -- Ленивая догрузка хвоста: панель стучится, когда курсор подошёл
     -- к концу списка. Повторный запрос, пока летит предыдущий,
@@ -728,11 +943,14 @@ function onIpc(event, payload)
     end
     tracksMoreInFlight = true
     local want = tostring(payload)
+    local generation = tracksRequestGeneration
     call({ "library-tracks-more", want, "--json" }, function(got)
       tracksMoreInFlight = false
       -- Пока летел запрос, открыли другой плейлист: страница чужая —
-      -- дописывать её в текущий список нельзя.
-      if data.tracksId ~= want then
+      -- дописывать её в текущий список нельзя. Заодно: если ушёл новый
+      -- pullTracks (даже тот же id), снапшот обновился и продолжение
+      -- старого чтения протухло.
+      if data.tracksId ~= want or generation ~= tracksRequestGeneration then
         return
       end
       local page = type(got) == "table" and got or {}

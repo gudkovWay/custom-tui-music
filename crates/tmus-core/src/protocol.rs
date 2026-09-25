@@ -15,8 +15,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    CatalogShelf, EqState, LoopMode, PlaybackStatus, PlaylistId, Rating, SearchKind, SearchResult,
-    Track, TrackId,
+    CatalogCapabilities, EqState, HomePage, LoopMode, PlaybackStatus, PlaylistId, Rating,
+    SearchKind, SearchResult, Track, TrackId,
 };
 
 /// `id`, после которого соединение переходит в режим потока событий.
@@ -54,9 +54,8 @@ pub enum Cmd {
 
     // --- воспроизведение ---
     PlayTrack { track: TrackId },
-    /// Поставить плейлист в очередь целиком; `start` — индекс трека,
-    /// с которого начать.
-    PlayPlaylist { playlist: PlaylistId, start: Option<usize> },
+    /// Поставить плейлист в очередь целиком, начиная с выбранного стабильного id.
+    PlayPlaylist { playlist: PlaylistId, #[serde(default, skip_serializing_if = "Option::is_none")] track: Option<TrackId> },
     /// Играть готовый список треков как новый контекст: очередь
     /// заменяется списком, `start` — индекс трека, с которого начать.
     /// Клиент сам владеет списком (страница поиска, лайк), поэтому
@@ -116,6 +115,16 @@ pub enum Cmd {
     Liked { provider: Option<String> },
     /// Домашняя лента рекомендаций; provider = None — из всех.
     Home { provider: Option<String> },
+    /// Следующая страница домашней ленты по непрозрачному курсору
+    /// демона. `provider` — подсказка-ограничитель; соответствие
+    /// курсора провайдеру хранит демон, и чужой провайдер с чужим
+    /// курсором — ошибка, а не тихая подмена ленты.
+    HomeMore { provider: Option<String>, cursor: String },
+    /// Запустить радио по сид-треку: очередь заменяется сидом плюс
+    /// рекомендациями провайдера сид-трека, докачка идёт по мере
+    /// приближения к хвосту очереди. Провайдер без радио отвечает
+    /// конечным воспроизведением одного трека (фолбэк демона).
+    PlayRadio { track: TrackId },
     /// Поставить оценку треку: провайдер получает лайк/дизлайк, демон
     /// сохраняет её локально и рассылает [`Event::RatingChanged`].
     Rate { track: TrackId, rating: Rating },
@@ -141,10 +150,14 @@ pub enum Cmd {
     /// умолчанию (YouTube Music — `PRIVATE`, чтобы пользовательский
     /// выбор приватности не приходилось тащить через весь протокол).
     /// Демон отвечает [`Payload::PlaylistCreated`] с новым id.
+    ///
+    /// Адресат: `provider = None` или `"local"` — плейлист приложения
+    /// в кэше демона (смешанные провайдеры); явный удалённый — нативный
+    /// плейлист этого провайдера.
     PlaylistCreate {
         title: String,
-        /// Адресат создания: None значит «выбрать по правилу демона» —
-        /// сохранённый источник каталога, иначе первый подключённый.
+        /// Адресат создания: None или "local" — плейлист приложения;
+        /// явное имя удалённого провайдера — нативный плейлист.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
     },
@@ -156,6 +169,15 @@ pub enum Cmd {
     /// причине, что и в `PlaylistAdd`, — команда не привязана к тому,
     /// что сейчас играет или открыто на экране.
     PlaylistRemove { playlist: PlaylistId, track: TrackId },
+    /// Переименовать плейлист. Реализовано только для локальных
+    /// плейлистов (кэш демона): нативного переименования в trait
+    /// Catalog нет, и у удалённых плейлистов команда — явная ошибка.
+    PlaylistRename { playlist: PlaylistId, title: String },
+    /// Убрать из плейлиста запись по абсолютной позиции с начала
+    /// состава. Единственный способ независимо убирать дубликаты:
+    /// один и тот же `TrackId` в локальном плейлисте может стоять
+    /// несколько раз, и по id их не различить.
+    PlaylistRemoveAt { playlist: PlaylistId, position: usize },
     /// Удалить плейлист целиком вместе с содержимым.
     PlaylistDelete { playlist: PlaylistId },
 
@@ -187,10 +209,11 @@ pub enum Payload {
     /// клиент видел `index` вместо `next`).
     TracksPage { tracks: Vec<Track>, next: Option<String> },
     Playlists(Vec<crate::model::Playlist>),
-    // Полка домашней ленты безопасна после Playlists: {title, subtitle,
-    // items} структурно не матчится ни с Results (нет тега kind), ни с
-    // Tracks/Playlists (нет обязательного id), ни с Ratings (не пары).
-    Home(Vec<CatalogShelf>),
+    // Полка домашней ленты безопасна после Playlists: страница —
+    // объект {shelves, next}, структурно не матчится ни с Results
+    // (нет тега kind), ни с Tracks/Playlists (нет обязательного id),
+    // ни с Ratings (не пары), ни с PlaylistCreated (другие ключи).
+    Home(HomePage),
     /// Ответ на `PlaylistCreate`: id нового плейлиста, по которому его
     /// можно сразу пополнять и открывать.
     PlaylistCreated { playlist: PlaylistId },
@@ -251,7 +274,7 @@ pub struct QueueView {
     pub index: Option<usize>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProviderView {
     pub id: String,
     pub name: String,
@@ -260,6 +283,11 @@ pub struct ProviderView {
     /// иконку клиента, не зная список провайдеров.
     pub glyph: String,
     pub color: String,
+    /// Что провайдер умеет менять (`Account::capabilities`): пикер
+    /// плейлистов предлагает только операции, которые заявлены.
+    /// `default` — снапшоты старых демонов без поля продолжают парситься.
+    #[serde(default)]
+    pub capabilities: CatalogCapabilities,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -309,7 +337,7 @@ pub enum Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ProviderId;
+    use crate::model::{CatalogShelf, ProviderId};
 
     fn line<T: Serialize>(value: &T) -> String {
         serde_json::to_string(value).expect("serialize")
@@ -467,6 +495,32 @@ mod tests {
         let back: Request = serde_json::from_str(&remove).expect("parse");
         assert_eq!(back.cmd, Cmd::PlaylistRemove { playlist: playlist.clone(), track: track_id.clone() });
 
+        // Локальные операции: переименование и удаление по позиции.
+        let rename = line(&Request {
+            id: 25,
+            cmd: Cmd::PlaylistRename { playlist: playlist.clone(), title: "New".into() },
+        });
+        assert_eq!(
+            rename,
+            r#"{"id":25,"cmd":"playlist_rename","playlist":{"provider":"local","id":"1"},"title":"New"}"#
+        );
+        let back: Request = serde_json::from_str(&rename).expect("parse");
+        assert_eq!(
+            back.cmd,
+            Cmd::PlaylistRename { playlist: playlist.clone(), title: "New".into() }
+        );
+
+        let remove_at = line(&Request {
+            id: 26,
+            cmd: Cmd::PlaylistRemoveAt { playlist: playlist.clone(), position: 3 },
+        });
+        assert_eq!(
+            remove_at,
+            r#"{"id":26,"cmd":"playlist_remove_at","playlist":{"provider":"local","id":"1"},"position":3}"#
+        );
+        let back: Request = serde_json::from_str(&remove_at).expect("parse");
+        assert_eq!(back.cmd, Cmd::PlaylistRemoveAt { playlist: playlist.clone(), position: 3 });
+
         let delete = line(&Request { id: 23, cmd: Cmd::PlaylistDelete { playlist: playlist.clone() } });
         assert_eq!(delete, r#"{"id":23,"cmd":"playlist_delete","playlist":{"provider":"ytmusic","id":"PL1"}}"#);
         let back: Request = serde_json::from_str(&delete).expect("parse");
@@ -482,6 +536,33 @@ mod tests {
             Frame::Event(Event::PlaylistsChanged) => {}
             other => panic!("expected a playlists_changed event, got {other:?}"),
         }
+    }
+
+    /// Провайдер-вью несёт возможности; снапшот старого демона без
+    /// поля обязан парситься консервативным дефолтом (всё false).
+    #[test]
+    fn provider_view_carries_capabilities_with_backward_default() {
+        let view = ProviderView {
+            id: "ytmusic".into(),
+            name: "YouTube Music".into(),
+            auth: crate::model::AuthStatus::Ready,
+            glyph: "▶".into(),
+            color: "#ff0000".into(),
+            capabilities: CatalogCapabilities { playlist_add: true, ..Default::default() },
+        };
+        let json = line(&view);
+        assert!(
+            json.contains(r#""capabilities":{"rate":false,"playlist_create":false,"playlist_add":true,"playlist_remove":false,"playlist_delete":false}"#),
+            "capabilities обязаны уйти в провод: {json}"
+        );
+        let back: ProviderView = serde_json::from_str(&json).expect("roundtrip");
+        assert_eq!(back, view);
+
+        let stale: ProviderView = serde_json::from_str(
+            r##"{"id":"soundcloud","name":"SC","auth":"Ready","glyph":"s","color":"#ff5500"}"##,
+        )
+        .expect("старый снапшот без capabilities обязан парситься");
+        assert_eq!(stale.capabilities, CatalogCapabilities::default());
     }
 
     #[test]
@@ -535,13 +616,17 @@ mod tests {
                 page_url: None,
             })],
         };
-        let response = line(&Response::Ok { id: 31, ok: Payload::Home(vec![shelf.clone()]) });
-        // Фиксируем форму untagged-контракта: полка — объект с ключом title.
-        assert!(response.contains(r#""ok":[{"title""#), "shelf must stay an object: {response}");
+        let response = line(&Response::Ok { id: 31, ok: Payload::Home(HomePage {
+            shelves: vec![shelf],
+            next: Some("FEwhat_to_watch".into()),
+        }) });
+        // Фиксируем форму untagged-контракта: страница — объект с ключом shelves.
+        assert!(response.contains(r#""ok":{"shelves""#), "home page must stay an object: {response}");
         match serde_json::from_str::<Frame>(&response).expect("parse response") {
-            Frame::Response(Response::Ok { id, ok: Payload::Home(shelves) }) => {
+            Frame::Response(Response::Ok { id, ok: Payload::Home(page) }) => {
                 assert_eq!(id, 31);
-                assert_eq!(shelves, vec![shelf]);
+                assert_eq!(page.shelves.len(), 1);
+                assert_eq!(page.next.as_deref(), Some("FEwhat_to_watch"));
             }
             other => panic!("home payload must not degrade to Results/Tracks, got {other:?}"),
         }

@@ -214,11 +214,83 @@ fn two_row_result(row: TwoRow) -> Option<SearchResult> {
     }
 }
 
+/// Страница радио из ответа `next`: треки очереди и токен продолжения.
+///
+/// Треки очереди живут в `playlistPanelVideoRenderer` — и в стартовом
+/// ответе (`playlistPanelRenderer.contents`), и в продолжении
+/// (`singleColumnMusicWatchNextResultContinuationRenderer`): обход
+/// [`renderers`] находит их в обоих. Токен — тот же
+/// `continuationItemRenderer`, что у `browse`. Записи без `videoId`
+/// пропускаются, сырой JSON наружу не выходит.
+pub(crate) fn radio(page: &Value) -> (Vec<Track>, Option<String>) {
+    let tracks = renderers(page, "playlistPanelVideoRenderer")
+        .iter()
+        .filter_map(|item| track_from_panel(item))
+        .collect();
+    (tracks, continuation_token(page))
+}
+
+/// «Песня» из `playlistPanelVideoRenderer` — форма очереди `next`.
+///
+/// В отличие от `musicResponsiveListItemRenderer` здесь плоские поля:
+/// `title`, `longBylineText`, `lengthText`, `thumbnailDetails`.
+fn track_from_panel(item: &Value) -> Option<Track> {
+    let id = item.get("videoId").and_then(Value::as_str)?;
+    if id.is_empty() {
+        return None;
+    }
+    let title = runs_text(item.get("title")?);
+    if title.is_empty() {
+        return None;
+    }
+
+    // longBylineText: «Артист • Альбом» либо «Артист — Сингл»: длина
+    // сегментов сервис не размечает, поэтому альбомом считаем последний
+    // фрагмент после разделителя, артистами — остальное.
+    let byline = item
+        .get("longBylineText")
+        .map(runs_text)
+        .unwrap_or_default();
+    let (artists, album) = split_byline(&byline);
+    Some(Track {
+        id: TrackId::new(PROVIDER, id),
+        title,
+        artists,
+        album,
+        duration: item
+            .get("lengthText")
+            .map(runs_text)
+            .and_then(|text| parse_duration(&text)),
+        art_url: largest_thumbnail(item),
+        page_url: Some(format!("{WATCH_URL}{id}")),
+    })
+}
+
+/// Разбор строки исполнителя без разметки: `«A, B • Альбом»`.
+fn split_byline(byline: &str) -> (Vec<String>, Option<String>) {
+    match byline.split_once(" • ") {
+        Some((artists, album)) => (
+            artists
+                .split(", ")
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            (!album.is_empty()).then(|| album.to_owned()),
+        ),
+        None => (
+            byline
+                .split(", ")
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            None,
+        ),
+    }
+}
+
 /// Лента Home: карусели `musicCarouselShelfRenderer` одной страницы.
 ///
-/// Одна страница, а не browse_pages: продолжения удваивают латентность
-/// ради полок, которые всё равно за пределами экрана. Артистов (и видео)
-/// выбрасываем — поверхность артиста в плеере нет, мёртвая карточка хуже
+/// Выбрасываем — поверхность артиста в плеере нет, мёртвая карточка хуже
 /// отсутствующей. Полка без заголовка или без элементов не нужна вызывающему.
 pub(crate) fn home(page: &Value) -> Vec<CatalogShelf> {
     renderers(page, "musicCarouselShelfRenderer")

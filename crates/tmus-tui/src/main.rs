@@ -113,6 +113,18 @@ enum CliCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Следующая страница домашней ленты по непрозрачному курсору
+    /// демона (из ответа `home`); пустой `next` — лента дочитана.
+    HomeMore {
+        cursor: String,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Запустить радио по сид-треку: очередь заменяется сидом плюс
+    /// рекомендациями; провайдер без радио играет один трек.
+    Radio { track: String },
     /// Перейти к треку очереди по индексу (0-базный) и играть.
     QueueGoto { index: usize },
     Loop {
@@ -137,18 +149,17 @@ enum CliCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Играть контекст: список составных id "prov:id" через запятую,
-    /// начиная с `--start` (замена очереди целиком).
+    /// Играть контекст: список составных id "prov:id" через запятую.
     PlayContext {
         tracks: String,
         #[arg(long)]
         start: usize,
     },
-    /// Играть плейлист с начала или с `--start`.
+    /// Играть плейлист с начала или с `--track`.
     PlayPlaylist {
         playlist_id: String,
         #[arg(long)]
-        start: Option<usize>,
+        track: Option<String>,
     },
     /// Работа с плейлистами. `pl`, а не `playlist`: подкоманду дергает
     /// сервис плагина noctalia на каждое действие пользователя с
@@ -180,18 +191,25 @@ enum CacheCmd {
 /// `new/add/rm/del/ls` зовутся из luau-кода ровно в такой форме.
 #[derive(Subcommand)]
 enum PlCmd {
-    /// Создать плейлист; печатает id созданного.
+    /// Создать плейлист; печатает id созданного. По умолчанию —
+    /// локальный плейлист приложения (смешанные провайдеры);
+    /// `--provider` требует нативный у конкретного клиента.
     New {
         title: String,
-        /// Кому создавать: без флага решает демон (сохранённый источник
-        /// каталога, иначе первый подключённый клиент).
+        /// Кому создавать: "local" или опущенный флаг — плейлист
+        /// приложения; имя удалённого провайдера — нативный плейлист.
         #[arg(long)]
         provider: Option<String>,
     },
     /// Добавить трек в плейлист.
     Add { playlist_id: String, track: String },
-    /// Убрать трек из плейлиста.
+    /// Убрать трек из плейлиста (нативно, по id).
     Rm { playlist_id: String, track: String },
+    /// Переименовать плейлист; локальные — в кэше демона.
+    Rename { playlist_id: String, title: String },
+    /// Убрать из локального плейлиста запись по позиции (0-базная):
+    /// дубликаты одного трека независимы.
+    RmAt { playlist_id: String, position: usize },
     /// Удалить плейлист вместе с содержимым.
     Del { playlist_id: String },
     /// Список библиотечных плейлистов; `--json` — как есть из демона.
@@ -311,6 +329,15 @@ async fn main() -> Result<()> {
             let provider = resolve_provider(&mut client, provider.as_deref()).await?;
             return print_payload(client.call(Cmd::Home { provider }).await?, json);
         }
+        CliCmd::HomeMore { cursor, provider, json } => {
+            // Курсором владеет демон и он помнит своего провайдера:
+            // сохранённый источник каталога здесь ни при чём, поэтому
+            // разбирается только явный флаг (`all` — «без провайдера»).
+            let provider = provider.as_deref().and_then(parse_provider_flag);
+            let cmd = Cmd::HomeMore { provider, cursor };
+            return print_payload(client.call(cmd).await?, json);
+        }
+        CliCmd::Radio { track } => Cmd::PlayRadio { track: parse_track_id(&track)? },
         CliCmd::Liked { json } => return print_payload(client.call(Cmd::Liked { provider: None }).await?, json),
         CliCmd::Rate { track, rating } => Cmd::Rate {
             track: parse_track_id(&track)?,
@@ -369,9 +396,9 @@ async fn main() -> Result<()> {
             }
             Cmd::PlayContext { tracks: ids, start }
         }
-        CliCmd::PlayPlaylist { playlist_id, start } => Cmd::PlayPlaylist {
+        CliCmd::PlayPlaylist { playlist_id, track } => Cmd::PlayPlaylist {
             playlist: parse_playlist_id(&playlist_id)?,
-            start: Some(start.unwrap_or(0)),
+            track: track.as_deref().map(parse_track_id).transpose()?,
         },
         CliCmd::Pl(action) => return run_pl(&mut client, action).await,
         CliCmd::Cache(cache) => match cache {
@@ -412,13 +439,13 @@ async fn main() -> Result<()> {
     print_payload(client.call(cmd).await?, false)
 }
 
-/// `tmus pl …`: пять действий над плейлистами. Все ходят в те же Cmd,
+/// `tmus pl …`: действия над плейлистами. Все ходят в те же Cmd,
 /// что и TUI; `new` разворачивает `Payload::PlaylistCreated` в голый
 /// id — потребителю (сервису плагина) больше ничего не нужно, а id он
-/// сразу передаёт в `pl add`. `--provider` выбирает, у какого клиента
-/// создавать плейлист; без флага решает демон (сохранённый источник
-/// каталога, иначе первый подключённый). `ls` переиспользует путь `library/list`
-/// (`Cmd::Library`): отдельной команды плейлистов в протоколе нет.
+/// сразу передаёт в `pl add`. По умолчанию плейлист создаётся
+/// локальным (смешанные провайдеры); `--provider <имя>` требует
+/// нативный у конкретного клиента. `ls` переиспользует путь `library/list`
+/// (`Cmd::Library`).
 async fn run_pl(client: &mut client::Client, action: PlCmd) -> Result<()> {
     match action {
         PlCmd::New { title, provider } => {
@@ -441,6 +468,20 @@ async fn run_pl(client: &mut client::Client, action: PlCmd) -> Result<()> {
             let cmd = Cmd::PlaylistRemove {
                 playlist: parse_playlist_id(&playlist_id)?,
                 track: parse_track_id(&track)?,
+            };
+            print_payload(client.call(cmd).await?, false)
+        }
+        PlCmd::Rename { playlist_id, title } => {
+            let cmd = Cmd::PlaylistRename {
+                playlist: parse_playlist_id(&playlist_id)?,
+                title,
+            };
+            print_payload(client.call(cmd).await?, false)
+        }
+        PlCmd::RmAt { playlist_id, position } => {
+            let cmd = Cmd::PlaylistRemoveAt {
+                playlist: parse_playlist_id(&playlist_id)?,
+                position,
             };
             print_payload(client.call(cmd).await?, false)
         }
@@ -589,7 +630,8 @@ fn format_payload(payload: &Payload) -> String {
             .map(|p| format!("{}: {}", p.id, p.title))
             .collect::<Vec<_>>()
             .join("\n"),
-        Payload::Home(shelves) => shelves
+        Payload::Home(page) => page
+            .shelves
             .iter()
             .map(|shelf| {
                 let head = match &shelf.subtitle {
@@ -966,16 +1008,26 @@ mod tests {
         assert!(parse_rating("meh").is_err());
     }
 
-    /// Контракт `pl`: пять подкоманд, id-строки доходят до тех же
+    /// Контракт `pl`: подкоманды, id-строки доходят до тех же
     /// парсеров, что и у соседних команд; `ls` знает `--json`.
     #[test]
     fn pl_subcommands_parse_ids_title_and_json_flag() {
         match Cli::try_parse_from(["tmus", "pl", "new", "Chill"]).expect("valid").cmd {
             Some(CliCmd::Pl(PlCmd::New { title, provider })) => {
                 assert_eq!(title, "Chill");
+                // По умолчанию — локальный плейлист приложения.
                 assert_eq!(provider, None);
             }
             _ => panic!("ожидалась подкоманда pl new"),
+        }
+        match Cli::try_parse_from(["tmus", "pl", "new", "Chill", "--provider", "ytmusic"])
+            .expect("valid")
+            .cmd
+        {
+            Some(CliCmd::Pl(PlCmd::New { provider, .. })) => {
+                assert_eq!(provider.as_deref(), Some("ytmusic"));
+            }
+            _ => panic!("ожидалась подкоманда pl new с провайдером"),
         }
         match Cli::try_parse_from(["tmus", "pl", "add", "ytmusic:PL1", "ytmusic:abc"])
             .expect("valid")
@@ -997,6 +1049,24 @@ mod tests {
             }
             _ => panic!("ожидалась подкоманда pl rm"),
         }
+        match Cli::try_parse_from(["tmus", "pl", "rename", "local:1", "New name"])
+            .expect("valid")
+            .cmd
+        {
+            Some(CliCmd::Pl(PlCmd::Rename { playlist_id, title })) => {
+                assert_eq!(parse_playlist_id(&playlist_id).expect("valid").id, "1");
+                assert_eq!(title, "New name");
+            }
+            _ => panic!("ожидалась подкоманда pl rename"),
+        }
+        match Cli::try_parse_from(["tmus", "pl", "rm-at", "local:1", "3"]).expect("valid").cmd {
+            Some(CliCmd::Pl(PlCmd::RmAt { playlist_id, position })) => {
+                assert_eq!(parse_playlist_id(&playlist_id).expect("valid").id, "1");
+                assert_eq!(position, 3);
+            }
+            _ => panic!("ожидалась подкоманда pl rm-at"),
+        }
+        assert!(Cli::try_parse_from(["tmus", "pl", "rm-at", "local:1", "x"]).is_err());
         match Cli::try_parse_from(["tmus", "pl", "del", "ytmusic:PL1"]).expect("valid").cmd {
             Some(CliCmd::Pl(PlCmd::Del { playlist_id })) => {
                 assert_eq!(parse_playlist_id(&playlist_id).expect("valid").id, "PL1");

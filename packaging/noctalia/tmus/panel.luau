@@ -40,24 +40,53 @@ local FONT = "Agave Nerd Font"
 local RAIL = 64
 local GAP = 12
 local PAD = 16
-local LIST_WINDOW = 10
-local CARD_WINDOW = 8
--- Карточек в ряду сетки Library (см. playlistCards): шаг moveY.
+-- Геометрия строк: ОДИН источник на поверхность — высота строки,
+-- зазор и бюджет вьюпорта; видимое логическое окно ВЫВОДИТСЯ из них,
+-- а не назначается вручную. Фиксированная высота ряда не даёт
+-- длинному тексту раздуть строку и рассинхронизировать скролл с
+-- отрисовкой (clampScroll получает только выведенный счётчик).
+-- Трек-строка (поиск, плейлист, клиенты): арт 32 + паддинг 6×2 = 44 px
+-- (у клиентских строк padding=12 — 44 тоже безопасный минимум).
+local TRACK_ROW_HEIGHT = 44
+local TRACK_ROW_GAP = 6
+local TRACK_VIEWPORT_HEIGHT = 420
+local LIST_WINDOW = math.floor((TRACK_VIEWPORT_HEIGHT + TRACK_ROW_GAP)
+  / (TRACK_ROW_HEIGHT + TRACK_ROW_GAP))
+-- Сетка Library: карточка = арт 120 + паддинг 24 + две подписи ≈ 200 px.
+-- Карточек в ряду сетки (см. playlistCards): шаг moveY.
 local GRID_COLS = 4
+local CARD_ROW_HEIGHT = 200
+local CARD_ROW_GAP = GAP
+local CARD_VIEWPORT_HEIGHT = 420
+local CARD_WINDOW = GRID_COLS * math.floor((CARD_VIEWPORT_HEIGHT + CARD_ROW_GAP)
+  / (CARD_ROW_HEIGHT + CARD_ROW_GAP))
 -- Окно очереди обязано ВЛЕЗАТЬ в бюджет context-колонки целиком:
 -- declarative UI не даёт scrollToIndex, «скролл» — это движущееся окно
--- строк, и контент ниже вьюпорта недостижим с клавиатуры. Замер §17:
--- header + 15 строк ≈749 px при бюджете context ≈669 px (панель
--- 1180×760) — хвост из 2 строк срезался снизу (фидбек 21.09, §19).
--- 13 строк ≈653 px — влезает с запасом.
-local QUEUE_WINDOW = 13
+-- строк, и контент ниже вьюпорта недостижим с клавиатуры. Замер §17
+-- показал, что 15 строк со зазором 12 срезались снизу (панель
+-- 1180×760, бюджет context ≈669 px, фидбек 21.09). Зазор ужат до
+-- 4 px — выведенное окно 14 строк ≈560 px входит с запасом.
+local QUEUE_ROW_HEIGHT = 36
+local QUEUE_ROW_GAP = 4
+local QUEUE_VIEWPORT_HEIGHT = 560
+local QUEUE_WINDOW = math.floor((QUEUE_VIEWPORT_HEIGHT + QUEUE_ROW_GAP)
+  / (QUEUE_ROW_HEIGHT + QUEUE_ROW_GAP))
 local NP_SPEC_BARS = 56
 -- Home-лента рекомендаций: видимых полок по Y и карточек в
--- горизонтальном окне полки. Карточек в полке рендерим не больше
+-- горизонтальном окне полки — окна выводятся из геометрии, как везде.
+-- Полка ≈ заголовок 20 + арт 110 + паддинг 16 + подписи ≈64 → 210 px;
+-- ряд карточек шириной 150 в центральном столбе ≈960 px
+-- (панель 1180×760, замер §17). Карточек в полке рендерим не больше
 -- HOME_CARD_CAP — окно двигается, хвост не держим (счётчик честный:
 -- shelf.count хранит число карточек до капа).
-local SHELF_WINDOW = 2
-local HOME_CARD_WINDOW = 6
+local HOME_SHELF_HEIGHT = 210
+local HOME_SHELF_VIEWPORT_HEIGHT = 450
+local SHELF_WINDOW = math.floor((HOME_SHELF_VIEWPORT_HEIGHT + GAP)
+  / (HOME_SHELF_HEIGHT + GAP))
+local HOME_CARD_WIDTH = 150
+local HOME_CARDS_VIEWPORT_WIDTH = 960
+local HOME_CARD_WINDOW = math.floor((HOME_CARDS_VIEWPORT_WIDTH + GAP)
+  / (HOME_CARD_WIDTH + GAP))
 local HOME_CARD_CAP = 20
 
 local VIEWS = {
@@ -124,17 +153,68 @@ local TEXT_CHARS = {
   Cyrillic_HARDSIGN = "Ъ", Cyrillic_YERU = "Ы", Cyrillic_SOFTSIGN = "Ь",
   Cyrillic_E = "Э", Cyrillic_YU = "Ю", Cyrillic_YA = "Я",
 }
--- ctrl+BackSpace в поиске: удалить слово слева от курсора, модель
--- readline/VSCode — срезать хвостовые разделители, затем слово, затем
--- снова разделители. ASCII-классы %s/%p не пересекаются с байтами
--- кириллицы (все ≥0x80), поэтому «слово» = буквы+цифры+мультибайт.
--- Автоповтор для ctrl+BackSpace сознательно не подключён: лаг одного
--- кадра съел бы полстроки.
-local function killWord(s)
-  s = string.gsub(s, "[%s%p]+$", "")
-  s = string.gsub(s, "[^%s%p]+$", "")
-  return (string.gsub(s, "[%s%p]+$", ""))
+-- ── Редактор поиска: код-поинтовая арифметика ────────────────────────
+-- Курсор queryCursor — ЧИСЛО КОД-ПОИНТОВ до каретки (0..len),
+-- queryLeft — левый край видимого окна, тоже в код-поинтах. Все
+-- мутации строки идут через utf8.offset — байтовый срез не может
+-- разрезать кириллицу. Лимит буфера — по символам, не по байтам.
+local QUERY_MAX_CHARS = 64
+local SEARCH_VIEW_CHARS = 56
+
+local function charCount(s)
+  local n = utf8.len(s)
+  return (n == nil or n < 0) and 0 or n
 end
+
+-- Байт-смещение начала код-поинта с индексом cp (0..len); cp == 0 —
+-- начало строки, cp == len — позиция за последним символом.
+local function byteOffset(s, cp)
+  if cp <= 0 then
+    return 1
+  end
+  return utf8.offset(s, cp + 1) or (#s + 1)
+end
+
+-- Все три хелпера возвращают (новая строка, новый курсор).
+local function insertAt(s, cursor, text)
+  local off = byteOffset(s, cursor)
+  return string.sub(s, 1, off - 1) .. text .. string.sub(s, off), cursor + charCount(text)
+end
+
+local function deleteBefore(s, cursor)
+  if cursor <= 0 then
+    return s, 0
+  end
+  local a = byteOffset(s, cursor - 1)
+  local b = byteOffset(s, cursor)
+  return string.sub(s, 1, a - 1) .. string.sub(s, b), cursor - 1
+end
+
+local function deleteAt(s, cursor)
+  if cursor >= charCount(s) then
+    return s, cursor
+  end
+  local a = byteOffset(s, cursor)
+  local b = byteOffset(s, cursor + 1)
+  return string.sub(s, 1, a - 1) .. string.sub(s, b), cursor
+end
+
+-- ctrl+BackSpace: удалить слово СЛЕВА ОТ КУРСОРА, модель
+-- readline/VSCode — срезать хвостовые разделители, затем слово, затем
+-- снова разделители — на префиксе до каретки. ASCII-классы %s/%p не
+-- пересекаются с байтами кириллицы (все ≥0x80), поэтому срез всегда
+-- проходит по границе код-поинта. Автоповтор сознательно не
+-- подключён: лаг одного кадра съел бы полстроки.
+local function killWordBefore(s, cursor)
+  local cursorOff = byteOffset(s, cursor)
+  local head = string.sub(s, 1, cursorOff - 1)
+  local suffix = string.sub(s, cursorOff)
+  head = string.gsub(head, "[%s%p]+$", "")
+  head = string.gsub(head, "[^%s%p]+$", "")
+  head = string.gsub(head, "[%s%p]+$", "")
+  return head .. suffix, charCount(head)
+end
+
 
 local inputMode = false
 
@@ -200,6 +280,9 @@ local plPicker = nil
 -- нового API.
 local helpShown = false
 local query = ""
+-- Курсор и левый край видимого окна поиска — в код-поинтах (0..len).
+local queryCursor = 0
+local queryLeft = 0
 local lastSearched = nil
 -- Home-лента ("tmus.home"): курсор (полка/карточка), верхнее окно
 -- полок и левые индексы горизонтальных окон по полке. homeFeed —
@@ -214,8 +297,9 @@ local homeFeed = nil
 local homeShelfCache = {}
 -- Вим-модальность поля поиска: typing=true — insert (буквы идут в
 -- запрос), false — normal (j/k листают, Enter активирует). Выход из
--- insert: Esc или пары jj/jk/oo на физических клавишах (о/л на
--- ЙЦУКЕН — это те же j/k); вход: i, / или точка.
+-- insert: Esc или пары jj/jk на физических клавишах (о/л на ЙЦУКЕН —
+-- это те же j/k); вход: i, / или точка. Латинское «oo» эскейпом
+-- БОЛЬШЕ НЕ является: обе «o» вставляются как текст.
 local typing = false
 local insertPending = nil
 local INSERT_ESCAPE_MS = 250
@@ -229,6 +313,7 @@ local doSearch -- defined below; used by chips and submitSearch
 local rows -- defined below; used by rateSelected (cursor row lookup)
 local activate -- defined below; used by trackRow onClick (клик = Enter)
 local maybeLoadMore -- defined below; used by move/g-jumps (догрузка хвоста)
+local maybeHomeMore -- defined below; used by home move/clamp (догрузка ленты)
 
 local function poke(event, payload)
   local argv = { "noctalia", "msg", "plugin", SERVICE, "all", event }
@@ -414,6 +499,46 @@ local function providerByTrack(t)
   return tostring(id or ""):match("^[^:]*") or ""
 end
 
+-- Провайдер из составного id "prov:id" (трек пикера/строки плейлиста).
+local function trackProvider(idstr)
+  return tostring(idstr or ""):match("^([^:]+):") or ""
+end
+
+-- Локальный провайдер: всегда поддерживает все плейлистные операции
+-- (playlist_create/add/remove/delete) — это собственное хранилище
+-- демона, capability-снимок для него не нужен.
+local function isLocalProvider(pid)
+  return tostring(pid or "") == "local"
+end
+
+-- Capability-снимок провайдера из snapshot.providers (сервис кладёт
+-- caps в pullProviders). Неизвестный провайдер — nil: нативные жесты
+-- для него запрещены (fail-closed), локальные доступны всегда.
+local function capsOfProvider(pid)
+  for _, p in ipairs(snapshot.providers or {}) do
+    if tostring(p.id or "") == tostring(pid or "") then
+      return p.caps
+    end
+  end
+  return nil
+end
+
+-- Плейлист доступен как адресат «добавить трек»: локальный — всегда;
+-- нативный — только когда провайдер плейлиста совпадает с провайдером
+-- трека И capability-снимок говорит playlist_add. Иначе нативный
+-- пункт в пикере не предлагается вовсе.
+local function playlistAddable(p, trackProv)
+  local prov = type(p.id) == "table" and tostring(p.id.provider or "") or ""
+  if isLocalProvider(prov) then
+    return true
+  end
+  if prov ~= trackProv then
+    return false
+  end
+  local caps = capsOfProvider(prov)
+  return type(caps) == "table" and caps.playlist_add == true
+end
+
 -- Рендер-модель home-ленты: массив полок {title, subtitle, count,
 -- cards} из homeFeed. count — ЧЕСТНОЕ число элементов полки до капа
 -- (счётчик окна показывает его), cards капятся HOME_CARD_CAP —
@@ -439,7 +564,7 @@ local function rebuildHomeShelves()
             subtitle = type(it.artists) == "table" and table.concat(it.artists, ", ") or "",
             art = tostring(it.art_path or ""),
             time = durationLabel(it.duration),
-            event = "play",
+            event = "radio",
             payload = idOf(it),
           })
         elseif kind == "playlist" then
@@ -829,6 +954,7 @@ local function trackRow(i, t, opts)
     gap = 10,
     paddingH = 10,
     paddingV = 6,
+    height = TRACK_ROW_HEIGHT,
     radius = 6,
     align = "center",
     -- Играющий трек важнее курсора: у них разные заливки, иначе
@@ -863,10 +989,14 @@ local function resultRow(r)
   }
   if kind == "track" then
     row.rating = ratingOf(snapshot, row.id)
-    row.event = "play"
+    -- Одиночная активация трека поиска — радио (`tmus radio`), не
+    -- play: контекст создаёт сам демон.
+    row.event = "radio"
     row.payload = idOf(r)
   elseif kind == "playlist" then
-    row.event = "playlist"
+    -- Активация плейлиста из выдачи — PlayPlaylist без --track
+    -- (старт с заголовка плейлиста).
+    row.event = "play-playlist"
     row.payload = idOf(r)
   end
   return row
@@ -939,12 +1069,16 @@ function rows()
           table.insert(out, {
             kind = "track",
             id = idstr,
+            -- Абсолютная позиция в плейлисте (0-базная, по data.tracks,
+            -- а не по отфильтрованному выводу): локальное удаление
+            -- (pl rm-at) бьёт по позиции — дубликаты уходят по одному.
+            pos = i - 1,
             rating = ratingOf(s, idstr),
             title = trackTitle(t),
             subtitle = tostring(t.album or ""),
             art = tostring(t.art_path or ""),
-            event = "playlist-at",
-            payload = tostring(i - 1) .. "|" .. playlistId,
+            event = "play-playlist",
+            payload = playlistId .. "|" .. idstr,
             time = durationLabel(t.duration),
           })
         end
@@ -1107,6 +1241,7 @@ local function homeMoveY(dy)
   end
   homeShelf = target
   clampHomeCursor()
+  maybeHomeMore()
   return true
 end
 
@@ -1125,30 +1260,10 @@ local function homeMoveX(dx)
   return true
 end
 
--- Контекстный запуск (решение хозяина 20.09): активация трека играет
--- весь видимый список как новый контекст, а не одиночный трек в старую
--- очередь. Сбор — только в момент активации: rows() строится на каждом
--- кадре, а трогать его нельзя. items — уже отфильтрованный порядок
--- отображения (rows() для поиска, shelf.cards для home). Возвращает
--- payload "<start>|<id1>,<id2>,..." или nil, если активный трек в
--- списке не найден (снапшот успел смениться) — вызывающий падает
--- назад на одиночный play.
-local function contextPayload(activeId, items)
-  local ids, start = {}, nil
-  for _, it in ipairs(items) do
-    if it.kind == "track" and it.id ~= nil and it.id ~= "" then
-      if it.id == activeId then
-        start = #ids
-      end
-      table.insert(ids, it.id)
-    end
-  end
-  if start == nil or #ids == 0 then
-    return nil
-  end
-  return tostring(start) .. "|" .. table.concat(ids, ",")
-end
-
+-- Одиночная активация трека (поиск, home) — радио: демон сам строит
+-- контекст (`tmus radio <prov:id>`). Контекстные жесты (плейлист,
+-- альбом) сохраняют прежнюю семантику: плейлист открывается/играется
+-- целиком (PlayPlaylist), его треки — с --track.
 local function homeActivate()
   local shelf = homeShelves()[homeShelf]
   local c = shelf and shelf.cards[homeItem]
@@ -1158,16 +1273,9 @@ local function homeActivate()
   if c.kind == "playlist" then
     openPlaylist(c)
   elseif c.kind == "track" then
-    -- Контекст всей текущей полки: трек-карточки в порядке отображения,
-    -- старт с выбранной карточки (зеркало поиска).
-    local payload = contextPayload(c.id, shelf.cards)
-    if payload then
-      poke("play-context", payload)
-    else
-      poke(c.event or "play", c.payload)
-    end
+    poke("radio", c.id)
   else
-    poke(c.event or "play", c.payload)
+    poke(c.event or "radio", c.payload)
   end
 end
 
@@ -1179,8 +1287,8 @@ function activate(row)
   if row.kind == "eq-preset" then
     -- Имя берём из живого snapshot: между рендером строки и нажатием
     -- пресет мог смениться (h/l листает соседний). preset-on, а не
-    -- preset: Enter на пресете не просто «применяет» — он включает
-    -- эквалайзер, иначе «выбрал пресет, а он всё ещё Off».
+    -- preset: выбор пресета включает эквалайзер, иначе «выбрал
+    -- пресет, а он всё ещё Off».
     local eq = snapshot.equalizer
     if type(eq) == "table" then
       poke("eq", "preset-on:" .. tostring(eq.preset or ""))
@@ -1189,17 +1297,6 @@ function activate(row)
   end
   if row.open then
     openPlaylist(row)
-  elseif row.event == "play" then
-    -- Трек-строка поиска (event "play" ставит только resultRow):
-    -- играем контекст всей видимой выдачи в порядке rows(), стартуя
-    -- с активированной строки. Плейлистные ("playlist") и вью
-    -- playlist ("playlist-at") строки не трогаем.
-    local payload = contextPayload(row.id, rows())
-    if payload then
-      poke("play-context", payload)
-    else
-      poke(row.event, row.payload)
-    end
   elseif row.event then
     poke(row.event, row.payload)
   end
@@ -1259,6 +1356,36 @@ maybeLoadMore = function()
   end
   lastMoreAt = now
   poke("tracks-more", playlistId)
+end
+
+-- Догрузка home-ленты: курсор полок подошёл к последней загруженной —
+-- просим сервис следующую страницу по курсору продолжения. Слои
+-- защиты те же, что у плейлиста: in-flight guard сервиса, исчерпание
+-- (next == nil после дочитки) и локальный дебаунс 500 мс.
+local HOME_MORE_MARGIN = 1
+local lastHomeMoreAt = 0
+maybeHomeMore = function()
+  if view ~= "home" then
+    return
+  end
+  local feed = homeFeed
+  if type(feed) ~= "table" or feed.status ~= "ok" then
+    return
+  end
+  local nextCursor = tostring(feed.next or "")
+  if nextCursor == "" then
+    return
+  end
+  local shelves = homeShelves()
+  if homeShelf < #shelves - HOME_MORE_MARGIN then
+    return
+  end
+  local now = noctalia.nowMs()
+  if now - lastHomeMoreAt < MORE_DEBOUNCE_MS then
+    return
+  end
+  lastHomeMoreAt = now
+  poke("home-more", nextCursor)
 end
 
 -- Горизонтальный/вертикальный ход по сетке Library (буфер 2):
@@ -1443,6 +1570,7 @@ local function listChildren(slice, first)
         key = "client" .. i,
         gap = 10,
         padding = 12,
+        height = TRACK_ROW_HEIGHT,
         radius = 6,
         align = "center",
         fill = (i == cursor or row.active) and COLORS.selected or COLORS.surface,
@@ -1542,6 +1670,7 @@ local function homeCardNode(shelfIndex, cardIndex, c)
   return ui.column({
     key = "hf-card-" .. shelfIndex .. "-" .. cardIndex,
     width = 150,
+    height = 174,
     gap = 6,
     padding = 8,
     radius = 6,
@@ -1553,8 +1682,8 @@ local function homeCardNode(shelfIndex, cardIndex, c)
     end,
   }, {
     artNode(c.art, 110),
-    lbl(shorten(c.title, 18), { key = "t", color = COLORS.text }),
-    lbl(shorten(c.subtitle, 22), { key = "s", color = COLORS.muted }),
+    lbl(shorten(c.title, 18), { key = "t", height = 16, color = COLORS.text }),
+    lbl(shorten(c.subtitle, 22), { key = "s", height = 16, color = COLORS.muted }),
   })
 end
 
@@ -1580,9 +1709,9 @@ local function homeFeedNode()
   for i = homeTop, last do
     local shelf = shelves[i]
     local left = homeLeft[i] or 1
-    local header = ui.row({ key = "hf-head-" .. i, gap = 8, align = "center" }, {
-      lbl(shelf.title, { key = "hf-shelf-title-" .. i, size = 13, color = COLORS.text }),
-      shelf.subtitle ~= "" and lbl(shelf.subtitle, { key = "hf-shelf-sub-" .. i, size = 11, color = COLORS.muted }) or nil,
+    local header = ui.row({ key = "hf-head-" .. i, height = 20, gap = 8, align = "center" }, {
+      lbl(shorten(shelf.title, 24), { key = "hf-shelf-title-" .. i, size = 13, height = 20, color = COLORS.text }),
+      shelf.subtitle ~= "" and lbl(shorten(shelf.subtitle, 28), { key = "hf-shelf-sub-" .. i, size = 11, height = 20, color = COLORS.muted }) or nil,
       lbl("", { key = "hf-spacer-" .. i, grow = 1 }),
       lbl("◄ " .. left .. "–" .. (left + HOME_CARD_WINDOW - 1) .. "/" .. shelf.count .. " ►", {
         key = "hf-range-" .. i,
@@ -1595,7 +1724,7 @@ local function homeFeedNode()
     for j = left, clast do
       table.insert(cards, homeCardNode(i, j, shelf.cards[j]))
     end
-    table.insert(shelfNodes, ui.column({ key = "hf-shelf-" .. i, gap = 8 }, {
+    table.insert(shelfNodes, ui.column({ key = "hf-shelf-" .. i, height = HOME_SHELF_HEIGHT, gap = 8 }, {
       header,
       ui.row({ key = "hf-cards-" .. i, gap = GAP }, cards),
     }))
@@ -1612,6 +1741,7 @@ local function playlistCards(slice, first)
     table.insert(cards, ui.column({
       key = "pl" .. i,
       width = 168,
+      height = CARD_ROW_HEIGHT,
       gap = 8,
       padding = 12,
       radius = 6,
@@ -1623,8 +1753,8 @@ local function playlistCards(slice, first)
       end,
     }, {
       artNode(row.art, 120),
-      lbl(shorten(row.title, 20), { key = "pl-title" .. i, color = COLORS.text }),
-      lbl(shorten(row.subtitle, 24), { key = "pl-sub" .. i, color = COLORS.muted }),
+      lbl(shorten(row.title, 20), { key = "pl-title" .. i, height = 16, color = COLORS.text }),
+      lbl(shorten(row.subtitle, 24), { key = "pl-sub" .. i, height = 16, color = COLORS.muted }),
     }))
   end
   local grid = {}
@@ -1700,6 +1830,7 @@ local function queueContextNode(s)
         gap = 8,
         paddingH = 8,
         paddingV = 4,
+        height = QUEUE_ROW_HEIGHT,
         radius = 6,
         align = "center",
         fill = isPlaying and COLORS.playing or (isCursor and COLORS.selected or COLORS.bg),
@@ -1733,7 +1864,7 @@ local function queueContextNode(s)
         lbl(durationLabel(t.duration) or "", { key = "q-dur" .. i, width = 44, color = COLORS.muted }),
       }))
     end
-    body = ui.column({ key = "q-rows", gap = GAP }, rowsOut)
+    body = ui.column({ key = "q-rows", gap = QUEUE_ROW_GAP }, rowsOut)
   end
   table.insert(children, ui.scroll({ key = "q-scroll", flexGrow = 1 }, { body }))
   return ui.column({ key = "queue-context", gap = GAP, flexGrow = 3 }, children)
@@ -1886,17 +2017,31 @@ local function trackForAdd()
   return nil
 end
 
+-- Пункты пикера: «+ New playlist…» (создаёт ЛОКАЛЬНЫЙ плейлист) +
+-- доступные адресата. Локальные плейлисты — всегда; нативные — только
+-- при совпадении провайдера плейлиста с провайдером трека и
+-- caps.playlist_add (playlistAddable). Пересчитывается на каждый
+-- вызов: snapshot мог обновиться, пока пикер открыт.
+local function pickerItems(s)
+  local trackProv = trackProvider(plPicker and plPicker.track or "")
+  local out = { { title = "+ New playlist…" } }
+  for _, p in ipairs(s.playlists or {}) do
+    if playlistAddable(p, trackProv) then
+      local ref = plRef(p)
+      local bare = ref:match(":(.+)$") or ref
+      table.insert(out, { ref = ref, title = tostring(p.title or ""), lm = bare == "LM" })
+    end
+  end
+  return out
+end
+
 -- Поповер «в плейлист»: отдельного оверлей-слоя у panel.render нет,
 -- поэтому рисуем карточку выбора вместо правой context-колонки —
 -- это самый дешёвый «поповер» без нового API. Состояние в plPicker
--- (track + cursor), пункты = «+ New playlist…» + snapshot.playlists.
+-- (track + cursor), пункты — pickerItems (локальные всегда, нативные
+-- по capabilities).
 local function playlistPickerNode(s)
-  local items = { { title = "+ New playlist…" } }
-  for _, p in ipairs(s.playlists or {}) do
-    local ref = plRef(p)
-    local bare = ref:match(":(.+)$") or ref
-    table.insert(items, { ref = ref, title = tostring(p.title or ""), lm = bare == "LM" })
-  end
+  local items = pickerItems(s)
   if plPicker.cursor > #items then
     plPicker.cursor = #items
   end
@@ -1931,46 +2076,121 @@ local function playlistPickerNode(s)
   return ui.column({ key = "pl-picker", gap = 6, flexGrow = 3 }, out)
 end
 
--- Строка карты подсказок: клавиша акцентом, действие приглушённым.
+-- Строка карты подсказок: фиксированная высота ряда, клавиша акцентом
+-- в чипе фикс. ширины, действие приглушённое и ОБРЕЗАНО до бюджета —
+-- перенос внутри ряда невозможен (ширина текста гарантирована
+-- shorten + фиксированной высотой ряда).
+local HELP_KEY_WIDTH = 100
+local HELP_ROW_HEIGHT = 22
+local HELP_TEXT_BUDGET = 18
 local function helpRow(id, keys, text)
-  return ui.row({ key = "help-" .. id, gap = 10, align = "center" }, {
-    lbl(keys, { key = "help-k-" .. id, width = 190, size = 12, color = COLORS.accent }),
-    lbl(text, { key = "help-t-" .. id, grow = 1, size = 12, color = COLORS.muted }),
+  return ui.row({
+    key = "help-" .. id,
+    gap = 8,
+    align = "center",
+    height = HELP_ROW_HEIGHT,
+  }, {
+    lbl(keys, { key = "help-k-" .. id, width = HELP_KEY_WIDTH, size = 11, color = COLORS.accent }),
+    lbl(shorten(text, HELP_TEXT_BUDGET), { key = "help-t-" .. id, grow = 1, size = 11, color = COLORS.muted }),
   })
+end
+
+-- Три компактные смысловые группы вместо двух плотных колонок:
+-- Навигация, Поиск, Плеер и библиотека. Каждая — равная колонка;
+-- максимум 9 рядов фиксированной высоты, описание короче бюджета,
+-- поэтому группы помещаются в центральную панель без переноса.
+local function helpGroup(key, title, rows)
+  local children = { lbl(title, { key = "help-h-" .. key, size = 12, color = COLORS.text }) }
+  for _, r in ipairs(rows) do
+    table.insert(children, helpRow(key .. "-" .. r[1], r[2], r[3]))
+  end
+  return ui.column({ key = "help-col-" .. key, gap = 4, flexGrow = 1 }, children)
 end
 
 -- Модал подсказок: перекрывает центральные виды (паттерн plPicker),
 -- rail/очередь/now-playing остаются на месте — спектр живёт и под
 -- модалом. Статичен: одна страница, без скролла и курсора.
 local function helpNode()
-  local col1 = ui.column({ key = "help-col-nav", gap = 5 }, {
-    helpRow("buf", "Tab · ctrl+h/l", "буфер центр ↔ очередь (д · р)"),
-    helpRow("views", "ctrl+j/k · 1–5", "секции (о · л)"),
-    helpRow("move", "j/k · h/l", "ход: список, сетка; в eq — полоса, ±дБ"),
-    helpRow("ends", "g", "первый/последний"),
-    helpRow("back", "BackSpace · Esc", "назад: плейлист → Library, поиск → Home, буфер 3 → 2"),
-    helpRow("search", "/ · i", "поиск: insert; jj/Esc — normal"),
-    helpRow("killword", "ctrl+BackSpace", "удалить слово в запросе"),
-    helpRow("prov", "c", "фильтр выдачи по клиенту (поиск)"),
-  })
-  local col2 = ui.column({ key = "help-col-act", gap = 5 }, {
-    helpRow("enter", "Return · Space", "открыть · играть · тумблер eq; пауза"),
-    helpRow("track", "n/p · r · s", "трек · repeat · shuffle"),
-    helpRow("vol", "< · >", "громкость"),
-    helpRow("rate", "f · d", "лайк · дизлайк играющего"),
-    helpRow("pl", "a · D", "в плейлист · удалить трек"),
-    helpRow("flat", "0", "eq: обнулить полосы (Flat)"),
-    helpRow("misc", "o · ctrl+d", "терминал TUI · скрытые плейлисты"),
-    helpRow("help", "?", "этот модал (ЙЦУКЕН: Shift+7); закрыть — любая клавиша"),
-  })
   return ui.column({ key = "help-modal", gap = GAP, flexGrow = 1 }, {
     lbl("Keymap", { key = "help-title", size = 18, color = COLORS.text }),
-    ui.row({ key = "help-cols", gap = GAP, flexGrow = 1 }, { col1, col2 }),
+    ui.row({ key = "help-cols", gap = GAP, flexGrow = 1 }, {
+      helpGroup("nav", "Навигация", {
+        { "buf", "Tab · ctrl+h/l", "буферы 2↔3" },
+        { "views", "ctrl+j/k · 1–5", "секции" },
+        { "move", "j/k · стрелки", "список/сетка" },
+        { "sides", "h/l · ←/→", "влево · вправо" },
+        { "ends", "g", "начало · конец" },
+        { "back", "BackSpace · Esc", "назад · закрыть" },
+      }),
+      helpGroup("search", "Поиск", {
+        { "ins", "/ · i · .", "ввод (insert)" },
+        { "cur", "←/→", "курсор" },
+        { "edge", "Home · End", "начало/конец" },
+        { "bs", "BackSpace", "стереть слева" },
+        { "del", "Delete", "стереть справа" },
+        { "kill", "ctrl+BackSpace", "стереть слово" },
+        { "enter", "Return", "искать" },
+        { "esc", "Esc · jj · jk", "в normal" },
+        { "prov", "c", "фильтр клиента" },
+      }),
+      helpGroup("player", "Плеер и библиотека", {
+        { "pause", "Space", "пауза" },
+        { "np", "n · p", "трек ±" },
+        { "rs", "r · s", "repeat · shuffle" },
+        { "vol", "< · >", "громкость" },
+        { "rate", "f · d", "лайк · дизлайк" },
+        { "pl", "a · D", "плейлист/удал." },
+        { "flat", "0", "eq: Flat" },
+        { "tui", "o", "терминал TUI" },
+        { "hid", "ctrl+d", "дизлайки" },
+      }),
+    }),
     lbl("любая клавиша — закрыть · медиа-клавиши работают", {
       key = "help-close",
       size = 11,
       color = COLORS.muted,
     }),
+  })
+end
+
+-- Витрина поисковой строки: before / каретка / after как отдельные
+-- метки фиксированной высоты. Каретка — символ под курсором акцентом,
+-- в конце строки — «▌»; окно queryLeft..+SEARCH_VIEW_CHARS сдвигается
+-- так, чтобы каретка оставалась видимой. Побочного роста строки нет:
+-- суммарная ширина сегментов ограничена окном в SEARCH_VIEW_CHARS+1
+-- код-поинтов.
+local function searchTextNode()
+  local len = charCount(query)
+  if queryLeft > queryCursor then
+    queryLeft = queryCursor
+  end
+  if queryCursor >= queryLeft + SEARCH_VIEW_CHARS then
+    queryLeft = queryCursor - SEARCH_VIEW_CHARS + 1
+  end
+  if queryLeft < 0 then
+    queryLeft = 0
+  end
+  local before = queryLeft < queryCursor
+    and string.sub(query, byteOffset(query, queryLeft), byteOffset(query, queryCursor) - 1)
+    or ""
+  local caretText, caretColor
+  if queryCursor < len then
+    caretText = string.sub(query, byteOffset(query, queryCursor), byteOffset(query, queryCursor + 1) - 1)
+    caretColor = COLORS.accent
+  else
+    caretText = "▌"
+    caretColor = typing and COLORS.accent or COLORS.muted
+  end
+  -- Хвост обрезается правой границей видимого окна: before+каретка+
+  -- after не могут превысить SEARCH_VIEW_CHARS код-поинтов.
+  local after = queryCursor < len
+    and string.sub(query, byteOffset(query, queryCursor + 1),
+      byteOffset(query, math.min(len, queryLeft + SEARCH_VIEW_CHARS)) - 1)
+    or ""
+  return ui.row({ key = "search-text", gap = 0, align = "center", flexGrow = 1 }, {
+    lbl(before, { key = "search-before", color = COLORS.text }),
+    lbl(caretText, { key = "search-caret", color = caretColor }),
+    lbl(after, { key = "search-after", grow = 1, color = COLORS.text }),
   })
 end
 
@@ -2048,11 +2268,16 @@ function draw()
           size = 14,
           color = typing and COLORS.accent or COLORS.muted,
         }),
-        lbl(query ~= "" and query or (typing and "Type…" or "i — ввод · j/k — навигация"), {
-          key = "search-text",
-          grow = 1,
-          color = query ~= "" and COLORS.text or COLORS.muted,
-        }),
+        -- Витрина: текст с видимой кареткой (см. searchTextNode);
+        -- пустой не-ввод — подсказка. Label-сегменты перерисовываются
+        -- каждым draw() — текст живой по определению.
+        (query ~= "" or typing)
+          and searchTextNode()
+          or lbl("i — ввод · j/k — навигация", {
+            key = "search-placeholder",
+            grow = 1,
+            color = COLORS.muted,
+          }),
         lbl(typing and "INSERT" or "NORMAL", {
           key = "search-mode",
           size = 10,
@@ -2263,9 +2488,19 @@ local function runHeld()
     move(-1)
     return true
   elseif action == "delete" then
-    -- Удержание BackSpace в поле поиска: темп — как у стрелок
-    -- (350 мс разгон, затем каждые 80 мс), а не медиа-клавиш.
-    query = string.sub(query, 1, -2)
+    -- Удержание BackSpace в поле поиска: темп — как у стрелок,
+    -- удаление слева от каретки по границе код-поинта.
+    query, queryCursor = deleteBefore(query, queryCursor)
+    return true
+  elseif action == "delete-fwd" then
+    -- Удержание Delete: удаление справа от каретки.
+    query, queryCursor = deleteAt(query, queryCursor)
+    return true
+  elseif action == "cur-left" then
+    queryCursor = math.max(0, queryCursor - 1)
+    return true
+  elseif action == "cur-right" then
+    queryCursor = math.min(charCount(query), queryCursor + 1)
     return true
   elseif action == "pl-delete" then
     -- Тот же BackSpace, но в буфере имени плейлиста.
@@ -2315,8 +2550,10 @@ function onFrameTick(deltaMs)
     return
   end
   local delay = isMediaAction(held.action) and MEDIA_DELAY_MS or NAV_DELAY_MS
+  local slow = held.action == "delete" or held.action == "delete-fwd"
+    or held.action == "cur-left" or held.action == "cur-right"
   local interval = isMediaAction(held.action) and MEDIA_REPEAT_MS
-    or (held.action == "delete" and DELETE_REPEAT_MS or NAV_REPEAT_MS)
+    or (slow and DELETE_REPEAT_MS or NAV_REPEAT_MS)
   if heldMs < delay then
     return
   end
@@ -2401,26 +2638,28 @@ function onKey(chord, pressed)
   -- уйти в ввод имени), Esc — отмена. Всё локально, демона не дёргаем
   -- до подтверждения.
   if plPicker then
-    local count = 1 + #(snapshot.playlists or {})
+    local items = pickerItems(snapshot)
+    local count = #items
     if chord == "Escape" then
       plPicker = nil
     elseif chord == "Return" then
       if plPicker.cursor == 1 then
+        -- «+ New playlist…»: плейлист создаётся ЛОКАЛЬНЫМ (сервис
+        -- шлёт `pl new <title>` без --provider), трек добавляется в
+        -- цепочке там же — id знает только сервис.
         local track = plPicker.track
         plPicker = nil
         startPlNaming(track)
       else
-        local pl = (snapshot.playlists or {})[plPicker.cursor - 1]
-        if pl then
-          local ref = plRef(pl)
-          local bare = ref:match(":(.+)$") or ref
-          if bare == "LM" then
+        local item = items[plPicker.cursor]
+        if item and item.ref then
+          if item.lm then
             -- Liked Music нельзя править через edit_playlist — он
             -- целиком выводится из лайков; подтверждение на LM = лайк
             -- трека, ради которого и открыт пикер.
             poke("rate", "like:" .. plPicker.track)
           else
-            poke("pl", "add:" .. ref .. ":" .. plPicker.track)
+            poke("pl", "add:" .. item.ref .. ":" .. plPicker.track)
           end
         end
         plPicker = nil
@@ -2476,8 +2715,9 @@ function onKey(chord, pressed)
   end
 
   -- Поиск: вим-модальность. typing=true — insert: буквы идут в
-  -- запрос, Esc или быстрые пары jj/jk/oo (физические j/k/o; на
-  -- ЙЦУКЕН это о/л/о/о) выходят в normal. typing=false — normal:
+  -- запрос на позицию курсора, Esc или быстрые пары jj/jk (физические
+  -- j/k; на ЙЦУКЕН это о/л) выходят в normal; «oo» эскейпом не
+  -- является. typing=false — normal:
   -- j/k и стрелки листают выдачу, Enter активирует строку, i/слэш/
   -- точка возвращают insert. Медиа-клавиши работают в обеих.
   -- Поиск живёт только при фокусе буфера 2: в буфере 3 (очередь)
@@ -2485,16 +2725,16 @@ function onKey(chord, pressed)
   if inputMode and focusBuf == 2 then
     local isJ = chord == "J" or chord == "Cyrillic_o"
     local isK = chord == "K" or chord == "Cyrillic_el"
-    local isO = chord == "O" or chord == "Cyrillic_shcha"
     if typing then
-      -- Детект эскейп-пары: первый символ уже вставлен в запрос —
+      -- Детект эскейп-пары jj/jk: первый j уже вставлен в запрос —
       -- при подтверждении пары он снимается. Окно 250 мс, как
-      -- repeat_delay системной клавиатуры.
+      -- repeat_delay системной клавиатуры. «oo» эскейпом больше не
+      -- является: обе «o» остаются текстом.
       if insertPending and (noctalia.nowMs() - insertPending.at) <= INSERT_ESCAPE_MS then
-        local starter = insertPending.key
-        if (starter == "j" and (isJ or isK)) or (starter == "o" and isO) then
-          query = string.sub(query, 1, -2)
+        if insertPending.key == "j" and (isJ or isK) then
+          query, queryCursor = deleteBefore(query, queryCursor)
           typing = false
+          queryCursor = charCount(query)
           insertPending = nil
           draw()
           return
@@ -2512,32 +2752,47 @@ function onKey(chord, pressed)
           activate(rows()[cursor])
         end
         typing = false
+        queryCursor = charCount(query)
         insertPending = nil
       elseif chord == "Escape" then
         typing = false
+        queryCursor = charCount(query)
+        insertPending = nil
+      elseif chord == "Left" then
+        -- Курсор ходит по код-поинтам; удержание — темп текста.
+        queryCursor = math.max(0, queryCursor - 1)
+        startHold(chord, "cur-left")
+      elseif chord == "Right" then
+        queryCursor = math.min(charCount(query), queryCursor + 1)
+        startHold(chord, "cur-right")
+      elseif chord == "Home" then
+        queryCursor = 0
+      elseif chord == "End" then
+        queryCursor = charCount(query)
       elseif lc == "ctrl+backspace" then
-        -- Удалить слово (см. killWord). Без автоповтора сознательно:
-        -- лаг одного кадра съел бы полстроки.
-        query = killWord(query)
+        -- Удалить слово слева от курсора (см. killWordBefore). Без
+        -- автоповтора сознательно: лаг одного кадра съел бы полстроки.
+        query, queryCursor = killWordBefore(query, queryCursor)
       elseif chord == "BackSpace" or chord == "Backspace" then
-        query = string.sub(query, 1, -2)
+        query, queryCursor = deleteBefore(query, queryCursor)
         startHold(chord, "delete")
+      elseif chord == "Delete" then
+        query, queryCursor = deleteAt(query, queryCursor)
+        startHold(chord, "delete-fwd")
       elseif chord == "Up" then
         move(-1)
         startHold(chord, "up")
       elseif chord == "Down" then
         move(1)
         startHold(chord, "down")
-      elseif chord == "Space" then
-        if #query < 64 then
-          query = query .. " "
-        end
       else
-        local ch = TEXT_CHARS[chord]
-        if ch and #query < 64 then
-          query = query .. ch
-          if isJ or isO then
-            insertPending = { key = isJ and "j" or "o", at = noctalia.nowMs() }
+        -- Вставка В ПОЗИЦИЮ КУРСОРА (Space — тот же текстовый символ).
+        -- Лимит буфера — по код-поинтам, не по байтам.
+        local ch = chord == "Space" and " " or TEXT_CHARS[chord]
+        if ch and charCount(query) < QUERY_MAX_CHARS then
+          query, queryCursor = insertAt(query, queryCursor, ch)
+          if isJ then
+            insertPending = { key = "j", at = noctalia.nowMs() }
           end
         end
       end
@@ -2769,22 +3024,40 @@ function onKey(chord, pressed)
     -- обновится через watch KEY "tmus".
     if view == "playlist" then
       local row = rows()[cursor]
-      local ref
-      if row and row.kind == "track" and row.id then
-        for _, pl in ipairs(snapshot.playlists or {}) do
-          if idOf(pl) == playlistId then
-            ref = plRef(pl)
-            break
+      -- Удаление из плейлиста. Локальный плейлист — по АБСОЛЮТНОЙ
+      -- позиции (pl rm-at): дубликаты уходят строго по одному, идентичность
+      -- не размывается. Нативный — только при caps.playlist_remove,
+      -- иначе по id трека (pl rm).
+      if row and row.kind == "track" and row.id and row.pos ~= nil then
+        local prov = trackProvider(playlistId)
+        if isLocalProvider(prov) then
+          poke("pl", "rmat:" .. playlistId .. ":" .. tostring(row.pos))
+        else
+          local caps = capsOfProvider(prov)
+          if type(caps) == "table" and caps.playlist_remove == true then
+            local ref
+            for _, pl in ipairs(snapshot.playlists or {}) do
+              if idOf(pl) == playlistId then
+                ref = plRef(pl)
+                break
+              end
+            end
+            if ref then
+              poke("pl", "rm:" .. ref .. ":" .. row.id)
+            end
           end
-        end
-        if ref then
-          poke("pl", "rm:" .. ref .. ":" .. row.id)
         end
       end
     elseif view == "library" then
       local row = rows()[cursor]
       if row and row.kind == "playlist" and (row.plid or "") ~= "" then
-        poke("pl", "del:" .. row.plid)
+        -- Удаление самого плейлиста: локальный — всегда; нативный —
+        -- только при caps.playlist_delete.
+        local caps = capsOfProvider(row.provider)
+        if isLocalProvider(row.provider)
+          or (type(caps) == "table" and caps.playlist_delete == true) then
+          poke("pl", "del:" .. row.plid)
+        end
       end
     end
   elseif chord == "ctrl+d" then
@@ -2876,6 +3149,8 @@ end
 
 function submitSearch(text)
   query = noctalia.string.trim(text or "")
+  queryCursor = charCount(query)
+  queryLeft = 0
   if query == "" then
     return
   end
@@ -2916,6 +3191,9 @@ noctalia.state.watch("tmus.home", function(v)
   rebuildHomeShelves()
   if view == "home" then
     clampHomeCursor()
+    -- Лента догрузилась до конца окна при открытом home: если хвост
+    -- уже на экране — запросить продолжение сразу, не дожидаясь хода.
+    maybeHomeMore()
   end
   draw()
 end)

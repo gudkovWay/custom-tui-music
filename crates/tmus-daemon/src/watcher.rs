@@ -37,6 +37,12 @@ pub async fn run_state_watcher(app: Arc<App>) {
         };
         let state = app.player.state().await;
 
+        // Радио-догрузка: переход плеера (смена трека, шаффл, конец
+        // трека) мог придвинуть очередь к хвосту — даём сессии шанс
+        // дописать рекомендации. Внутри — дешёвая проверка под замком;
+        // сетевой заход уходит в фоновую задачу.
+        app.maybe_refill_radio(state.queue_len, state.queue_index).await;
+
         let track = state.track.as_ref().map(|t| t.id.clone());
         if track != last_track {
             last_track = track;

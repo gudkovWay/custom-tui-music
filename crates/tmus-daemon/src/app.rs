@@ -25,7 +25,7 @@ use tmus_player::Player;
 use tmus_provider::Registry;
 use tokio::sync::broadcast;
 
-use crate::catalog::{resolve_catalog_source, HomeCache};
+use crate::catalog::{resolve_catalog_source, HomeCache, RadioSession};
 use crate::filler;
 
 /// Сколько событий держится в шине для отстающего подписчика.
@@ -55,6 +55,15 @@ pub struct App {
     /// параллельные `Cmd::Home` сливаются в один сетевой заход
     /// (single-flight).
     pub(crate) home_cache: tokio::sync::Mutex<Option<HomeCache>>,
+    /// Активная радио-сессия (`Cmd::PlayRadio`): провайдер, сид, курсор
+    /// догрузки и флаги исчерпания/догрузки. tokio-замок: берётся в
+    /// вахтёре и в обработчиках команд, сетевой заход идёт мимо него.
+    pub(crate) radio: tokio::sync::Mutex<Option<RadioSession>>,
+    /// Поколение радио-сессии: каждый `PlayRadio` берёт следующий номер
+    /// и сравнивает его с сессией после сетевого захода. Ответ первой
+    /// страницы, опоздавший к явной замене контекста, обязан уйти в
+    /// никуда, а не перезаписать новую очередь.
+    pub(crate) radio_generation: std::sync::atomic::AtomicU64,
     /// Сигнал «пора гаситься». Нужен, потому что `Cmd::Shutdown`
     /// приходит из задачи control-socket, а гасить обязан `main`: только
     /// он снимает файл сокета и убивает mpv. Вызов `std::process::exit`
@@ -99,6 +108,8 @@ impl App {
             events,
             catalog_source: std::sync::Mutex::new(catalog_source),
             home_cache: tokio::sync::Mutex::new(None),
+            radio: tokio::sync::Mutex::new(None),
+            radio_generation: std::sync::atomic::AtomicU64::new(0),
             shutdown: tokio::sync::Notify::new(),
             auth_retry: std::sync::Mutex::new(std::collections::HashMap::new()),
             self_arc: std::sync::OnceLock::new(),
@@ -182,8 +193,12 @@ impl App {
                 self.play_track(&track).await?;
                 Ok(Payload::Ack(Ack::default()))
             }
-            Cmd::PlayPlaylist { playlist, start } => {
-                self.play_playlist(&playlist, start.unwrap_or(0)).await?;
+            Cmd::PlayRadio { track } => {
+                self.play_radio(&track).await?;
+                Ok(Payload::Ack(Ack::default()))
+            }
+            Cmd::PlayPlaylist { playlist, track } => {
+                self.play_playlist(&playlist, track.as_ref()).await?;
                 Ok(Payload::Ack(Ack::default()))
             }
             Cmd::PlayContext { tracks, start } => {
@@ -334,6 +349,9 @@ impl App {
                 Ok(Payload::Ack(Ack::default()))
             }
             Cmd::QueueClear => {
+                // Явная замена контекста: хвост радио к пустой очереди
+                // не прирастает.
+                self.cancel_radio().await;
                 self.player.with_queue(|q| q.clear()).await;
                 self.emit(Event::QueueChanged { len: 0, index: None });
                 Ok(Payload::Ack(Ack::default()))
@@ -410,6 +428,11 @@ impl App {
                 release_memory(); // FEmusic_home — мегабайтный JSON, та же причина, что у каталожных arm'ов выше
                 Ok(Payload::Home(out))
             }
+            Cmd::HomeMore { provider, cursor } => {
+                let out = self.home_more(provider.as_deref(), &cursor).await?;
+                release_memory(); // тот же мегабайтный JSON продолжений
+                Ok(Payload::Home(out))
+            }
 
             // Оценки: список — из локального кэша, установка — через
             // оптимистичную запись и сетевой вызов провайдера
@@ -420,10 +443,11 @@ impl App {
             }
             Cmd::Ratings => Ok(Payload::Ratings(self.with_cache(|c| c.ratings())?)),
 
-            // Плейлистные мутации идут напрямую в провайдер (кэш
-            // рейтингов их не касается), после успеха демон рассылает
-            // `PlaylistsChanged`, а список клиенты перечитывают сами —
-            // см. `playlist_*` в catalog.rs.
+            // Плейлистные мутации: локальные плейлисты (id с провайдером
+            // local) правятся в кэше демона, нативные — идут в
+            // провайдер. После успеха демон рассылает `PlaylistsChanged`,
+            // а список клиенты перечитывают сами — см. `playlist_*` в
+            // catalog.rs.
             Cmd::PlaylistCreate { title, provider } => {
                 let playlist = self.playlist_create(&title, provider.as_deref()).await?;
                 Ok(Payload::PlaylistCreated { playlist: playlist.id })
@@ -434,6 +458,14 @@ impl App {
             }
             Cmd::PlaylistRemove { playlist, track } => {
                 self.playlist_remove(&playlist, &track).await?;
+                Ok(Payload::Ack(Ack::default()))
+            }
+            Cmd::PlaylistRename { playlist, title } => {
+                self.playlist_rename(&playlist, &title).await?;
+                Ok(Payload::Ack(Ack::default()))
+            }
+            Cmd::PlaylistRemoveAt { playlist, position } => {
+                self.playlist_remove_at(&playlist, position).await?;
                 Ok(Payload::Ack(Ack::default()))
             }
             Cmd::PlaylistDelete { playlist } => {
@@ -496,7 +528,19 @@ impl App {
     /// поиска жил позицией ~1001 в очереди старого плейлиста — next/prev
     /// продолжали играть старый контекст. Утверждённое решение: любой
     /// поштучный запуск — это новый контекст из одного трека.
-    async fn play_track(&self, id: &TrackId) -> anyhow::Result<()> {
+    pub(crate) async fn play_track(&self, id: &TrackId) -> anyhow::Result<()> {
+        // Любая поштучная замена контекста хоронит радио-сессию: к новой
+        // очереди хвост старого автодополнения прирастать не должен.
+        // (Для фолбэка `PlayRadio` на провайдере без радио сессия уже
+        // снята — повторная отмена безвредна.)
+        self.cancel_radio().await;
+        self.play_track_inner(id).await
+    }
+
+    /// Тело play_track без отмены радио. Отдельно, потому что фолбэк
+    /// радио зовёт его, держа замок радио в руках: inner замок не
+    /// берёт, повторного захвата (и deadlock) не случается.
+    pub(crate) async fn play_track_inner(&self, id: &TrackId) -> anyhow::Result<()> {
         // `Player::state()` берёт текущий трек из очереди по индексу, и
         // без добавления в очередь `tmus play <id>` играл бы «в никуда»:
         // музыка идёт, а `status`, MPRIS и Discord показывают пустоту.
@@ -524,7 +568,7 @@ impl App {
 
     /// Запуск трека, который гарантированно уже в очереди: только
     /// навигация и резолв, очередь не трогаем.
-    async fn play_known(&self, id: &TrackId) -> anyhow::Result<()> {
+    pub(crate) async fn play_known(&self, id: &TrackId) -> anyhow::Result<()> {
         let index = match self.player.with_queue(|q| q.find_index(id)).await {
             Some(index) => index,
             None => anyhow::bail!("трека {id} нет в очереди"),
@@ -537,6 +581,8 @@ impl App {
     /// Контекст из готового списка треков — обобщение `play_playlist`
     /// без чтения плейлиста: список приносит сам клиент.
     async fn play_context(&self, ids: Vec<TrackId>, start: usize) -> anyhow::Result<()> {
+        // Явная замена контекста хоронит радио-сессию.
+        self.cancel_radio().await;
         if ids.is_empty() {
             anyhow::bail!("пустой контекст воспроизведения");
         }
@@ -558,18 +604,14 @@ impl App {
         self.play_known(&current).await
     }
 
-    async fn play_playlist(&self, id: &PlaylistId, start: usize) -> anyhow::Result<()> {
+    async fn play_playlist(&self, id: &PlaylistId, requested: Option<&TrackId>) -> anyhow::Result<()> {
+        // Явная замена контекста хоронит радио-сессию.
+        self.cancel_radio().await;
         let mut tracks = self.playlist_tracks(id).await?;
         if tracks.is_empty() {
             anyhow::bail!("плейлист {id} пуст");
         }
-        // Панель шлёт позицию из своего снапшота, а тот мог видеть
-        // больше страниц, чем лежит в свежем срезе кэша: TTL протух
-        // или демон перезапущен, и полное чтение взяло только батч
-        // первых страниц. Догружаем до запрошенной позиции, а не
-        // клампим молча в хвост среза — иначе играет «какой-то трек»,
-        // а не выбранный человеком.
-        while start >= tracks.len() {
+        while requested.is_some_and(|track| !tracks.iter().any(|candidate| &candidate.id == track)) {
             let (page, next) = self.playlist_tracks_page(id).await?;
             if page.is_empty() {
                 break;
@@ -579,12 +621,11 @@ impl App {
                 break;
             }
         }
-        if start >= tracks.len() {
-            anyhow::bail!(
-                "позиция {start} вне плейлиста {id}: загружено {} треков",
-                tracks.len()
-            );
-        }
+        let start = match requested {
+            None => 0,
+            Some(track) => tracks.iter().position(|candidate| &candidate.id == track)
+                .ok_or_else(|| anyhow::anyhow!("трек {track} больше не входит в плейлист {id}"))?,
+        };
         let first = tracks[start].id.clone();
         let len = self
             .player
@@ -598,8 +639,6 @@ impl App {
             })
             .await;
         self.emit(Event::QueueChanged { len, index: Some(start) });
-        // Трек уже поставлен в очередь выше: `play_track` здесь нельзя —
-        // он теперь заменяет очередь однотрековым контекстом.
         self.play_known(&first).await
     }
 
@@ -629,7 +668,7 @@ impl App {
     /// нужно (его метаданные приедут при воспроизведении), а падать на
     /// «нет в кэше» значило бы требовать от клиента заранее прогреть
     /// базу.
-    fn hydrate(&self, ids: &[TrackId]) -> anyhow::Result<Vec<Track>> {
+    pub(crate) fn hydrate(&self, ids: &[TrackId]) -> anyhow::Result<Vec<Track>> {
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
             let track = self.with_cache(|c| c.track(id))?.unwrap_or_else(|| Track {
@@ -1006,42 +1045,39 @@ mod tests {
         }
     }
 
-    /// Ошибка провайдера откатывает оптимистичную запись: и прошлое
-    /// значение возвращается, и событие не разлетается.
+    /// Ошибка провайдера НЕ откатывает локальную оценку: локальная
+    /// отметка — источник истины, зеркальная ошибка доходит наружу,
+    /// событие RatingChanged уже разослано.
     #[tokio::test]
-    async fn provider_error_rolls_back_local_rating() {
+    async fn provider_error_keeps_local_rating_and_reports() {
         let (app, _dir) = app(true).await;
         let track = TrackId::new(ProviderId::YTMUSIC, "vid-1");
-        let fresh = TrackId::new(ProviderId::YTMUSIC, "vid-2");
-        app.with_cache(|c| c.set_rating(&track, Rating::Liked))
-            .expect("seed");
         let mut events = app.subscribe();
 
         let result = app
             .handle(Cmd::Rate { track: track.clone(), rating: Rating::Disliked })
             .await;
-        assert!(result.is_err(), "ошибка провайдера обязана дойти наружу");
+        assert!(result.is_err(), "ошибка зеркала обязана дойти наружу");
         assert_eq!(
             app.with_cache(|c| c.get_rating(&track)).expect("get"),
-            Some(Rating::Liked),
-            "прошлая оценка вернулась после отката"
+            Some(Rating::Disliked),
+            "локальная оценка обязана пережить сбой провайдера"
         );
 
-        // Откат из состояния «оценки не было» не оставляет строки.
-        let result = app
-            .handle(Cmd::Rate { track: fresh.clone(), rating: Rating::Liked })
-            .await;
-        assert!(result.is_err());
-        assert_eq!(app.with_cache(|c| c.get_rating(&fresh)).expect("get"), None);
-
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("событие пришло")
+            .expect("шина жива");
         assert!(
-            events.try_recv().is_err(),
-            "при ошибке сети RatingChanged вещаться не должен"
+            matches!(&event, Event::RatingChanged { track: t, rating: Rating::Disliked } if t == &track),
+            "событие локальной оценки обязано уйти до зеркала: {event:?}"
         );
     }
 
-    /// Успешное создание: провайдер получил заголовок, клиент — id
-    /// нового плейлиста, шина — сигнал перечитать список.
+    /// Создание по умолчанию (provider: None) — локальный плейлист
+    /// приложения: провайдер не вызывается, клиент получает id local:N,
+    /// шина — сигнал перечитать список. Явный удалённый по-прежнему
+    /// создаёт нативный плейлист.
     #[tokio::test]
     async fn playlist_create_returns_id_and_broadcasts() {
         let (app, provider, _dir) = app_full(false, false).await;
@@ -1050,23 +1086,38 @@ mod tests {
         let payload = app
             .handle(Cmd::PlaylistCreate { title: "Chill".into(), provider: None })
             .await
-            .expect("create");
+            .expect("create local");
+        match payload {
+            Payload::PlaylistCreated { playlist } => {
+                assert_eq!(playlist.provider, ProviderId::LOCAL);
+            }
+            other => panic!("неожиданный ответ: {other:?}"),
+        }
+        assert!(
+            provider.calls().is_empty(),
+            "локальное создание не обязано трогать провайдера"
+        );
+
+        let payload = app
+            .handle(Cmd::PlaylistCreate { title: "Native".into(), provider: Some("ytmusic".into()) })
+            .await
+            .expect("create native");
         match payload {
             Payload::PlaylistCreated { playlist } => {
                 assert_eq!(playlist, PlaylistId::new(ProviderId::YTMUSIC, "PLnew"));
             }
             other => panic!("неожиданный ответ: {other:?}"),
         }
-        assert_eq!(provider.calls(), vec!["create:Chill".to_owned()]);
+        assert_eq!(provider.calls(), vec!["create:Native".to_owned()]);
 
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
-            .await
-            .expect("событие пришло")
-            .expect("шина жива");
-        assert!(
-            matches!(event, Event::PlaylistsChanged),
-            "неожиданное событие: {event:?}"
-        );
+        // Два мутации — два сигнала.
+        for _ in 0..2 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+                .await
+                .expect("событие пришло")
+                .expect("шина жива");
+            assert!(matches!(event, Event::PlaylistsChanged));
+        }
     }
 
     /// Add/remove/delete проходят в провайдер с правильными аргументами
@@ -1104,36 +1155,44 @@ mod tests {
         assert!(events.try_recv().is_err(), "лишних событий быть не должно");
     }
 
-    /// Ошибка провайдера доходит наружу как обычная ошибка команды,
-    /// вызова-ответа `PlaylistCreated` нет, и сигнал не разлетается.
+    /// Ошибка нативного создания/удаления доходит наружу как обычная
+    /// ошибка команды, вызова-ответа `PlaylistCreated` нет, и сигнал не
+    /// разлетается. Локальное создание (provider: None) при этом не
+    /// зависит от сети и проходит.
     #[tokio::test]
     async fn playlist_provider_error_yields_err_without_event() {
         let (app, provider, _dir) = app_full(false, true).await;
         let playlist = PlaylistId::new(ProviderId::YTMUSIC, "PL1");
-        let track = TrackId::new(ProviderId::YTMUSIC, "vid-1");
         let mut events = app.subscribe();
 
         assert!(
             app.handle(Cmd::PlaylistCreate { title: "Chill".into(), provider: None })
                 .await
-                .is_err(),
-            "ошибка создания обязана дойти наружу"
+                .is_ok(),
+            "локальное создание не должно зависеть от сбоя провайдера"
         );
         assert!(
-            app.handle(Cmd::PlaylistAdd { playlist: playlist.clone(), track: track.clone() })
+            app.handle(Cmd::PlaylistCreate { title: "Native".into(), provider: Some("ytmusic".into()) })
+                .await
+                .is_err(),
+            "ошибка нативного создания обязана дойти наружу"
+        );
+        assert!(
+            app.handle(Cmd::PlaylistAdd { playlist: playlist.clone(), track: TrackId::new(ProviderId::YTMUSIC, "vid-1") })
                 .await
                 .is_err()
         );
         assert!(app.handle(Cmd::PlaylistDelete { playlist: playlist.clone() }).await.is_err());
 
-        assert!(
-            provider.calls().is_empty(),
-            "при сбое журнал вызовов обязан остаться пустым"
+        assert_eq!(
+            provider.calls(),
+            Vec::<String>::new(),
+            "при сбое нативные вызовы не должны числиться успешными"
         );
-        assert!(
-            events.try_recv().is_err(),
-            "при ошибке провайдера PlaylistsChanged вещаться не должен"
-        );
+        // Единственный сигнал — от локального создания.
+        let event = events.try_recv().expect("событие в шине");
+        assert!(matches!(event, Event::PlaylistsChanged));
+        assert!(events.try_recv().is_err(), "лишних событий быть не должно");
     }
 
     /// Поштучный запуск — новый контекст из одного трека: очередь
@@ -1259,13 +1318,13 @@ mod tests {
         );
     }
 
-    /// Выбор позиции глубже свежего среза обязан догрузиться до неё, а
-    /// не играть хвост батча: панель шлёт `--start` из снапшота, который
-    /// пережил TTL кэша. Раньше `start.min(len-1)` молча клампил в
+    /// Выбор трека глубже свежего среза обязан догрузиться до него, а
+    /// не играть хвост батча: панель шлёт стабильный TrackId из
+    /// снапшота, который пережил TTL кэша. Раньше позиция клампилась в
     /// последний трек батча — человек выбирал трек на 11-й странице, а
     /// играл последний из первых десяти.
     #[tokio::test]
-    async fn play_playlist_fetches_pages_until_requested_start() {
+    async fn play_playlist_fetches_pages_until_requested_track_found() {
         let (app, provider, _dir) = app_full(false, false).await;
         provider.set_pages((0..11).map(|i| page_of(i, 1)).collect());
         let playlist = PlaylistId::new(ProviderId::YTMUSIC, "LM");
@@ -1274,9 +1333,12 @@ mod tests {
         let slice = app.playlist_tracks(&playlist).await.expect("full read");
         assert_eq!(slice.len(), 10, "свежий срез — только батч");
 
-        app.handle(Cmd::PlayPlaylist { playlist: playlist.clone(), start: Some(10) })
-            .await
-            .expect("play at 10");
+        app.handle(Cmd::PlayPlaylist {
+            playlist: playlist.clone(),
+            track: Some(TrackId::new(ProviderId::YTMUSIC, "v10")),
+        })
+        .await
+        .expect("play v10");
 
         let state = app.player.state().await;
         assert_eq!(
@@ -1288,19 +1350,35 @@ mod tests {
         assert_eq!(state.queue_index, Some(10));
     }
 
-    /// Позиция за пределами реального состава — честная ошибка, а не
-    /// тихий сдвиг на последний трек.
+    /// Запрошенный id исчез из состава (или его не было) — честная
+    /// ошибка, а не тихий сдвиг на другой трек; старая очередь при этом
+    /// не трогается.
     #[tokio::test]
-    async fn play_playlist_rejects_start_beyond_listing() {
+    async fn play_playlist_rejects_missing_track_and_keeps_queue() {
         let (app, provider, _dir) = app_full(false, false).await;
         provider.set_pages((0..3).map(|i| page_of(i, 1)).collect());
         let playlist = PlaylistId::new(ProviderId::YTMUSIC, "LM");
 
-        let err = app
-            .handle(Cmd::PlayPlaylist { playlist: playlist.clone(), start: Some(50) })
+        // Заранее наполняем очередь, чтобы убедиться: провал не мутирует её.
+        app.handle(Cmd::PlayPlaylist { playlist: playlist.clone(), track: None })
             .await
-            .expect_err("позиция вне состава — отказ");
-        assert!(err.to_string().contains("вне плейлиста"), "неожиданная ошибка: {err}");
+            .expect("play whole playlist");
+        let before = app.player.state().await;
+
+        let err = app
+            .handle(Cmd::PlayPlaylist {
+                playlist: playlist.clone(),
+                track: Some(TrackId::new(ProviderId::YTMUSIC, "v99")),
+            })
+            .await
+            .expect_err("трека нет в плейлисте — отказ");
+        assert!(
+            err.to_string().contains("не входит в плейлист"),
+            "неожиданная ошибка: {err}"
+        );
+        let after = app.player.state().await;
+        assert_eq!(after.queue_len, before.queue_len, "очередь обязана остаться прежней");
+        assert_eq!(after.track.as_ref().map(|t| &t.id), before.track.as_ref().map(|t| &t.id), "играющий трек не обязан меняться");
     }
 
     /// Полное чтение с исчерпанием фиксирует «дочитано»: курсор None.

@@ -90,22 +90,20 @@ impl InnerTube {
         self.post("browse", json!({ "browseId": browse_id })).await
     }
 
-    /// Полный ответ страницы watch/очереди плейлиста.
-    ///
-    /// Очередь воспроизведения и радио: их продолжения живут в
-    /// `playlistPanelRenderer`, которого в ответе `browse` нет. Пока
-    /// вызывающего внутри крейта нет — очередь ведёт демон, — но метод
-    /// обязан работать, а не быть заглушкой.
-    #[expect(
-        dead_code,
-        reason = "эндпоинт очереди: внутри крейта пока не вызывается, нужен вызывающему сверху"
-    )]
+    /// Ответ `next`: стартовая очередь по сид-треку (радио) — с
+    /// опциональным плейлистом-контекстом.
     pub async fn next(&self, video_id: &str, playlist_id: Option<&str>) -> Result<Value> {
         let mut body = json!({ "videoId": video_id });
         if let Some(playlist_id) = playlist_id {
             body["playlistId"] = Value::String(playlist_id.to_owned());
         }
         self.post("next", body).await
+    }
+
+    /// Одна страница `next` по токену продолжения: тело — только токен,
+    /// эндпоинт тот же (см. `browse_continue` — тот же договор).
+    pub async fn next_continue(&self, token: &str) -> Result<Value> {
+        self.post("next", json!({ "continuation": token })).await
     }
 
     /// Ответ `player` для прямого резолва потока: клиент VISIONOS

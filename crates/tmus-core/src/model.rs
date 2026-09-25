@@ -12,10 +12,14 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-/// Идентификатор провайдера: `"ytmusic"`, `"soundcloud"`, `"spotify"`, …
+/// Идентификатор стабильного пространства источника: `"ytmusic"`,
+/// `"soundcloud"`, `"local"`, …
 ///
 /// Строка, а не enum: типы, на которые смотрят плеер, демон и TUI, не
-/// обязаны знать список провайдеров, и `match` по нему в них запрещён.
+/// обязаны знать список источников, и `match` по нему в них запрещён.
+///
+/// `local` — пространство имён локальных коллекций приложения, а не
+/// зарегистрированный аккаунт или внешний провайдер.
 ///
 /// Почему `&'static str`, а разбор строки — через [`ProviderId::ALL`].
 /// Провайдер — это крейт, то есть сущность времени компиляции; хранить
@@ -25,19 +29,19 @@ use serde::{Deserialize, Serialize};
 /// литералом. `Box::leak` здесь запрещён — на неизвестном имени из
 /// внешних данных он течёт без предела.
 ///
-/// Цена решения — одна строка в [`ProviderId::ALL`] на новый провайдер.
-/// Это единственное место в ядре, которое провайдер правит о себе.
+/// Цена решения — одна строка в [`ProviderId::ALL`] на новый источник.
+/// Это единственное место в ядре, которое источник правит о себе.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ProviderId(pub &'static str);
 
 impl ProviderId {
+    pub const LOCAL: Self = Self("local");
     pub const YTMUSIC: Self = Self("ytmusic");
     pub const SOUNDCLOUD: Self = Self("soundcloud");
 
-    /// Все известные ядру провайдеры. Служит таблицей разбора имён из
-    /// внешних данных — протокола и базы.
-    pub const ALL: &'static [Self] = &[Self::YTMUSIC, Self::SOUNDCLOUD];
+    /// Все известные источники, включая локальное пространство приложения.
+    pub const ALL: &'static [Self] = &[Self::LOCAL, Self::YTMUSIC, Self::SOUNDCLOUD];
 
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -351,6 +355,51 @@ pub struct CatalogShelf {
     #[serde(default)]
     pub subtitle: Option<String>,
     pub items: Vec<SearchResult>,
+}
+
+/// Что провайдер умеет менять в аккаунте. Синхронная сводка: опрашивается
+/// до любой сетевой операции, чтобы UI не предлагал недоступного.
+///
+/// Поля-флаги, а не список возможностей: потребители спрашивают ровно
+/// одним предикатом, а не ищут строку в векторе. Значение по умолчанию —
+/// всё `false`: консервативная позиция — пока провайдер не заявил
+/// операцию, она недоступна. Это же значение честно рисует провайдера,
+/// который умеет только читать.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogCapabilities {
+    /// Ставить оценки трекам.
+    #[serde(default)]
+    pub rate: bool,
+    /// Создавать пустые плейлисты.
+    #[serde(default)]
+    pub playlist_create: bool,
+    /// Добавлять треки в плейлисты аккаунта.
+    #[serde(default)]
+    pub playlist_add: bool,
+    /// Убирать треки из плейлистов аккаунта.
+    #[serde(default)]
+    pub playlist_remove: bool,
+    /// Удалять плейлисты аккаунта целиком.
+    #[serde(default)]
+    pub playlist_delete: bool,
+}
+
+/// Страница домашней ленты. `next: None` — лента дочитана; провайдер без
+/// продолжений всегда отдаёт `None`, и вызов с `Some(_)` обязан закончиться
+/// пустой страницей, а не ошибкой.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HomePage {
+    pub shelves: Vec<CatalogShelf>,
+    #[serde(default)]
+    pub next: Option<String>,
+}
+
+/// Страница радио (автодополнение очереди по сид-треку).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RadioPage {
+    pub tracks: Vec<Track>,
+    #[serde(default)]
+    pub next: Option<String>,
 }
 
 /// Режим повтора. Единый для всех провайдеров: очередь смешанная.

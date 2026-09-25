@@ -27,8 +27,8 @@ use tmus_core::config::Config;
 use tmus_core::cookies::CookieSource;
 use tmus_core::error::CoreError;
 use tmus_core::model::{
-    AuthStatus, CatalogShelf, Playlist, PlaylistId, ProviderId, Rating, SearchKind, SearchResult,
-    StreamSource, Track, TrackId,
+    AuthStatus, CatalogCapabilities, HomePage, Playlist, PlaylistId, ProviderId, Rating,
+    SearchKind, SearchResult, StreamSource, Track, TrackId,
 };
 use tmus_provider::ytdlp::{YtDlp, YtDlpRequest};
 use tmus_provider::{
@@ -100,6 +100,19 @@ impl SoundCloud {
 impl Account for SoundCloud {
     fn provider(&self) -> ProviderId {
         self.id
+    }
+
+    /// Реализовано: оценки и создание/удаление плейлистов. Правка
+    /// состава (add/remove) не заявляется: JSON-протокол PUT-правки
+    /// сервис отвергает 400, см. `playlist_add`.
+    fn capabilities(&self) -> CatalogCapabilities {
+        CatalogCapabilities {
+            rate: true,
+            playlist_create: true,
+            playlist_add: false,
+            playlist_remove: false,
+            playlist_delete: true,
+        }
     }
 
     fn display_name(&self) -> &str {
@@ -249,9 +262,19 @@ impl Catalog for SoundCloud {
         Ok(all)
     }
 
-    async fn home(&self) -> Result<Vec<CatalogShelf>> {
+    /// Поток — одним куском: у стрима SoundCloud продолжения курсором
+    /// в [`Catalog::home_page`] не заводим. Повторный вызов с чужим
+    /// или истёкшим токеном обязан кончиться пустой страницей, а не
+    /// сетевым ходом или ошибкой.
+    async fn home_page(&self, cursor: Option<&str>) -> Result<HomePage> {
+        if cursor.is_some() {
+            return Ok(HomePage { shelves: Vec::new(), next: None });
+        }
         let page = self.api.stream().await?;
-        Ok(parse::stream_shelves(&page))
+        Ok(HomePage {
+            shelves: parse::stream_shelves(&page),
+            next: None,
+        })
     }
 
     async fn rate(&self, id: &TrackId, rating: Rating) -> Result<()> {

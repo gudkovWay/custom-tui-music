@@ -10,7 +10,7 @@ use std::time::SystemTime;
 use tokio::sync::Mutex;
 use tmus_core::model::{EqState, EQ_FREQUENCIES_HZ, EQ_GAIN_LIMIT_DB, PlaybackStatus, TrackId};
 use tmus_core::protocol::PlayerState;
-use tmus_provider::Registry;
+use tmus_provider::{ProviderError, Registry};
 
 pub mod mpv;
 pub mod queue;
@@ -140,6 +140,22 @@ fn failure_action(streak: u32) -> FailureAction {
     }
 }
 
+/// Итог одной попытки запустить трек внутри [`Self::resolve_and_play`].
+///
+/// Цикл промотки итеративный: вместо вложенного вызова
+/// `on_track_end -> resolve_and_play` (рекурсивный async-цикл будущих)
+/// попытка сообщает «трек нельзя играть — двигай очередь», и внешний
+/// цикл сам берёт следующий трек. Потолок серии по-прежнему общий
+/// `failure_streak`/`MAX_AUTO_SKIPS`, так что итераций не больше
+/// четырёх.
+enum PlayOutcome {
+    /// Трек играет (или команда вытеснена более новой) — цикл закончен.
+    Playing,
+    /// Резолв-время «трек нельзя воспроизвести» при streak в пределах
+    /// потолка: внешний цикл проматывает очередь и пробует следующий.
+    Advance,
+}
+
 /// Собрать lavfi-граф эквалайзера для mpv-фильтра `af`.
 ///
 /// Выключенный эквалайзер — пустой `af` (см. [`Mpv::set_audio_filter`]);
@@ -230,7 +246,56 @@ impl Player {
 
     /// Зарезолвить трек и играть его. Существующий `StreamSource`
     /// (из предзагрузки) переиспользуется, если он ещё не истёк.
+    ///
+    /// Резолв-время «трек нельзя воспроизвести» проматывается итеративным
+    /// циклом (см. [`PlayOutcome`]): без вложенных future — рекурсивный
+    /// путь `resolve_and_play -> on_track_end -> resolve_and_play`
+    /// вырастал бы стек будущих на каждый битый трек. Серия ограничена
+    /// `MAX_AUTO_SKIPS` общим `failure_streak`.
     pub async fn resolve_and_play(&self, track_id: &TrackId) -> Result<(), PlayerError> {
+        let mut id = track_id.clone();
+        loop {
+            match self.play_one(&id).await {
+                Ok(PlayOutcome::Playing) => return Ok(()),
+                Ok(PlayOutcome::Advance) => {
+                    // Те же шаги, что делал `on_track_end` для следующего
+                    // трека: позиция прошлого файла не имеет смысла,
+                    // окно перехода взводится до резолва, чтобы
+                    // mpv-idle не мигал «■ остановлено».
+                    *self.inner.position.lock().await = None;
+                    let next = {
+                        let mut queue = self.inner.queue.lock().await;
+                        queue.next_natural().map(|t| t.id.clone())
+                    };
+                    match next {
+                        Some(next_id) => {
+                            self.inner
+                                .advancing
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            id = next_id;
+                        }
+                        None => {
+                            // Очередь кончилась: то же терминальное
+                            // состояние, что и у `on_track_end`.
+                            *self.inner.status.lock().await = PlaybackStatus::Stopped;
+                            *self.inner.current.lock().await = None;
+                            if let Err(e) = self.inner.mpv.stop().await {
+                                tracing::debug!(error = %e, "stop после конца очереди не удался");
+                            }
+                            self.inner.changed.notify_one();
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Одна попытка запустить трек: заявить, зарезолвить, загрузить в
+    /// mpv. Промотку не выполняет — решает вызывающий цикл
+    /// [`Self::resolve_and_play`].
+    async fn play_one(&self, track_id: &TrackId) -> Result<PlayOutcome, PlayerError> {
         let my_gen = self.next_generation();
         // Новая команда гасит отложенный запуск серии скипов: явный
         // выбор важнее накопленных нажатий. Свой (тот же трек) не гасим:
@@ -258,18 +323,70 @@ impl Player {
         let source = match self.take_preloaded(track_id).await {
             // Годная предзагрузка — играем сразу, без сети.
             Some(source) if !source.is_expired(SystemTime::now()) => Some(source),
-            _ => self.resolve_fresh(track_id, my_gen).await?,
+            _ => match self.resolve_fresh(track_id, my_gen).await {
+                Ok(source) => source,
+                // Резолв-время «трек нельзя воспроизвести» (DRM и т.п.)
+                // приравнивается к провалу воспроизведения на стороне
+                // mpv: видимая причина в `last_error`, затем тот же
+                // счётчик (`failure_streak`) и тот же потолок
+                // (`MAX_AUTO_SKIPS`) — без своего пути промотки, чтобы
+                // серия не могла уйти в бесконечность. Сетевые и
+                // инструментальные сбои остаются на прежнем пути
+                // «остановиться и показать ошибку»: они чинятся
+                // повтором, а трек — нет. Промотка итеративная: попытка
+                // возвращает [`PlayOutcome::Advance`], и цикл
+                // `resolve_and_play` сам берёт следующий трек — без
+                // вложенных future и без рекурсии. К этому моменту
+                // семафор резолва уже отпущен (`resolve_fresh`
+                // вернулся), так что резолв следующего трека не встанет
+                // навсегда в очередь к самому себе.
+                Err(PlayerError::Provider(ProviderError::Unplayable {
+                    provider,
+                    reason,
+                })) => {
+                    tracing::warn!(track = %track_id, reason = %reason, "трек нельзя воспроизвести");
+                    *self.inner.last_error.lock().await = Some(reason.clone());
+                    // Окно перехода закрываем до промотки: висящий
+                    // `pending` отказавшего трека иначе пережил бы
+                    // конец очереди и залип бы в баре.
+                    self.transition_failed(track_id).await;
+                    let streak = self
+                        .inner
+                        .failure_streak
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1;
+                    match failure_action(streak) {
+                        FailureAction::Advance => {
+                            tracing::warn!(track = %track_id, streak, "трек нельзя воспроизвести — перехожу к следующему");
+                            // Исход решает цикл промотки в
+                            // `resolve_and_play` (вплоть до `Stop` или
+                            // конца очереди): на этой попытке ошибку не
+                            // отдаём наверх, чтобы внешняя обработка
+                            // сбоя не затёрла состояние.
+                            return Ok(PlayOutcome::Advance);
+                        }
+                        FailureAction::Stop => {
+                            tracing::warn!("подряд нельзя воспроизвести {} треков — останавливаюсь", streak);
+                            return Err(PlayerError::Provider(ProviderError::Unplayable {
+                                provider,
+                                reason,
+                            }));
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            },
         };
         let Some(source) = source else {
             // Вытеснены более новой командой: её трек и будет играть.
-            return Ok(());
+            return Ok(PlayOutcome::Playing);
         };
 
         // Последняя проверка перед mpv.load: устаревшая команда не должна
         // перебить свежий трек. Status/position/duration тоже выставляем
         // только здесь — раньше они портили бы состояние живой команды.
         if self.generation() != my_gen {
-            return Ok(());
+            return Ok(PlayOutcome::Playing);
         }
         *self.inner.status.lock().await = PlaybackStatus::Playing;
         *self.inner.paused.lock().await = false;
@@ -353,7 +470,7 @@ impl Player {
             });
             *self.inner.preload_task.lock().await = Some((next_id, handle));
         }
-        Ok(())
+        Ok(PlayOutcome::Playing)
     }
 
     /// Текущий номер поколения команд воспроизведения.
