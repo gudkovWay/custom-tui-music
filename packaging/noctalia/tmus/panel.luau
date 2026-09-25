@@ -206,12 +206,15 @@ end
 -- проходит по границе код-поинта. Автоповтор сознательно не
 -- подключён: лаг одного кадра съел бы полстроки.
 local function killWordBefore(s, cursor)
-  local head = string.sub(s, 1, byteOffset(s, cursor) - 1)
+  local cursorOff = byteOffset(s, cursor)
+  local head = string.sub(s, 1, cursorOff - 1)
+  local suffix = string.sub(s, cursorOff)
   head = string.gsub(head, "[%s%p]+$", "")
   head = string.gsub(head, "[^%s%p]+$", "")
   head = string.gsub(head, "[%s%p]+$", "")
-  return head, charCount(head)
+  return head .. suffix, charCount(head)
 end
+
 
 local inputMode = false
 
