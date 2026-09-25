@@ -310,6 +310,7 @@ local doSearch -- defined below; used by chips and submitSearch
 local rows -- defined below; used by rateSelected (cursor row lookup)
 local activate -- defined below; used by trackRow onClick (клик = Enter)
 local maybeLoadMore -- defined below; used by move/g-jumps (догрузка хвоста)
+local maybeHomeMore -- defined below; used by home move/clamp (догрузка ленты)
 
 local function poke(event, payload)
   local argv = { "noctalia", "msg", "plugin", SERVICE, "all", event }
@@ -495,6 +496,46 @@ local function providerByTrack(t)
   return tostring(id or ""):match("^[^:]*") or ""
 end
 
+-- Провайдер из составного id "prov:id" (трек пикера/строки плейлиста).
+local function trackProvider(idstr)
+  return tostring(idstr or ""):match("^([^:]+):") or ""
+end
+
+-- Локальный провайдер: всегда поддерживает все плейлистные операции
+-- (playlist_create/add/remove/delete) — это собственное хранилище
+-- демона, capability-снимок для него не нужен.
+local function isLocalProvider(pid)
+  return tostring(pid or "") == "local"
+end
+
+-- Capability-снимок провайдера из snapshot.providers (сервис кладёт
+-- caps в pullProviders). Неизвестный провайдер — nil: нативные жесты
+-- для него запрещены (fail-closed), локальные доступны всегда.
+local function capsOfProvider(pid)
+  for _, p in ipairs(snapshot.providers or {}) do
+    if tostring(p.id or "") == tostring(pid or "") then
+      return p.caps
+    end
+  end
+  return nil
+end
+
+-- Плейлист доступен как адресат «добавить трек»: локальный — всегда;
+-- нативный — только когда провайдер плейлиста совпадает с провайдером
+-- трека И capability-снимок говорит playlist_add. Иначе нативный
+-- пункт в пикере не предлагается вовсе.
+local function playlistAddable(p, trackProv)
+  local prov = type(p.id) == "table" and tostring(p.id.provider or "") or ""
+  if isLocalProvider(prov) then
+    return true
+  end
+  if prov ~= trackProv then
+    return false
+  end
+  local caps = capsOfProvider(prov)
+  return type(caps) == "table" and caps.playlist_add == true
+end
+
 -- Рендер-модель home-ленты: массив полок {title, subtitle, count,
 -- cards} из homeFeed. count — ЧЕСТНОЕ число элементов полки до капа
 -- (счётчик окна показывает его), cards капятся HOME_CARD_CAP —
@@ -520,7 +561,7 @@ local function rebuildHomeShelves()
             subtitle = type(it.artists) == "table" and table.concat(it.artists, ", ") or "",
             art = tostring(it.art_path or ""),
             time = durationLabel(it.duration),
-            event = "play",
+            event = "radio",
             payload = idOf(it),
           })
         elseif kind == "playlist" then
@@ -945,10 +986,14 @@ local function resultRow(r)
   }
   if kind == "track" then
     row.rating = ratingOf(snapshot, row.id)
-    row.event = "play"
+    -- Одиночная активация трека поиска — радио (`tmus radio`), не
+    -- play: контекст создаёт сам демон.
+    row.event = "radio"
     row.payload = idOf(r)
   elseif kind == "playlist" then
-    row.event = "playlist"
+    -- Активация плейлиста из выдачи — PlayPlaylist без --track
+    -- (старт с заголовка плейлиста).
+    row.event = "play-playlist"
     row.payload = idOf(r)
   end
   return row
@@ -1021,12 +1066,16 @@ function rows()
           table.insert(out, {
             kind = "track",
             id = idstr,
+            -- Абсолютная позиция в плейлисте (0-базная, по data.tracks,
+            -- а не по отфильтрованному выводу): локальное удаление
+            -- (pl rm-at) бьёт по позиции — дубликаты уходят по одному.
+            pos = i - 1,
             rating = ratingOf(s, idstr),
             title = trackTitle(t),
             subtitle = tostring(t.album or ""),
             art = tostring(t.art_path or ""),
-            event = "playlist-at",
-            payload = tostring(i - 1) .. "|" .. playlistId,
+            event = "play-playlist",
+            payload = playlistId .. "|" .. idstr,
             time = durationLabel(t.duration),
           })
         end
@@ -1189,6 +1238,7 @@ local function homeMoveY(dy)
   end
   homeShelf = target
   clampHomeCursor()
+  maybeHomeMore()
   return true
 end
 
@@ -1207,30 +1257,10 @@ local function homeMoveX(dx)
   return true
 end
 
--- Контекстный запуск (решение хозяина 20.09): активация трека играет
--- весь видимый список как новый контекст, а не одиночный трек в старую
--- очередь. Сбор — только в момент активации: rows() строится на каждом
--- кадре, а трогать его нельзя. items — уже отфильтрованный порядок
--- отображения (rows() для поиска, shelf.cards для home). Возвращает
--- payload "<start>|<id1>,<id2>,..." или nil, если активный трек в
--- списке не найден (снапшот успел смениться) — вызывающий падает
--- назад на одиночный play.
-local function contextPayload(activeId, items)
-  local ids, start = {}, nil
-  for _, it in ipairs(items) do
-    if it.kind == "track" and it.id ~= nil and it.id ~= "" then
-      if it.id == activeId then
-        start = #ids
-      end
-      table.insert(ids, it.id)
-    end
-  end
-  if start == nil or #ids == 0 then
-    return nil
-  end
-  return tostring(start) .. "|" .. table.concat(ids, ",")
-end
-
+-- Одиночная активация трека (поиск, home) — радио: демон сам строит
+-- контекст (`tmus radio <prov:id>`). Контекстные жесты (плейлист,
+-- альбом) сохраняют прежнюю семантику: плейлист открывается/играется
+-- целиком (PlayPlaylist), его треки — с --track.
 local function homeActivate()
   local shelf = homeShelves()[homeShelf]
   local c = shelf and shelf.cards[homeItem]
@@ -1240,16 +1270,9 @@ local function homeActivate()
   if c.kind == "playlist" then
     openPlaylist(c)
   elseif c.kind == "track" then
-    -- Контекст всей текущей полки: трек-карточки в порядке отображения,
-    -- старт с выбранной карточки (зеркало поиска).
-    local payload = contextPayload(c.id, shelf.cards)
-    if payload then
-      poke("play-context", payload)
-    else
-      poke(c.event or "play", c.payload)
-    end
+    poke("radio", c.id)
   else
-    poke(c.event or "play", c.payload)
+    poke(c.event or "radio", c.payload)
   end
 end
 
@@ -1261,8 +1284,8 @@ function activate(row)
   if row.kind == "eq-preset" then
     -- Имя берём из живого snapshot: между рендером строки и нажатием
     -- пресет мог смениться (h/l листает соседний). preset-on, а не
-    -- preset: Enter на пресете не просто «применяет» — он включает
-    -- эквалайзер, иначе «выбрал пресет, а он всё ещё Off».
+    -- preset: выбор пресета включает эквалайзер, иначе «выбрал
+    -- пресет, а он всё ещё Off».
     local eq = snapshot.equalizer
     if type(eq) == "table" then
       poke("eq", "preset-on:" .. tostring(eq.preset or ""))
@@ -1271,17 +1294,6 @@ function activate(row)
   end
   if row.open then
     openPlaylist(row)
-  elseif row.event == "play" then
-    -- Трек-строка поиска (event "play" ставит только resultRow):
-    -- играем контекст всей видимой выдачи в порядке rows(), стартуя
-    -- с активированной строки. Плейлистные ("playlist") и вью
-    -- playlist ("playlist-at") строки не трогаем.
-    local payload = contextPayload(row.id, rows())
-    if payload then
-      poke("play-context", payload)
-    else
-      poke(row.event, row.payload)
-    end
   elseif row.event then
     poke(row.event, row.payload)
   end
@@ -1341,6 +1353,36 @@ maybeLoadMore = function()
   end
   lastMoreAt = now
   poke("tracks-more", playlistId)
+end
+
+-- Догрузка home-ленты: курсор полок подошёл к последней загруженной —
+-- просим сервис следующую страницу по курсору продолжения. Слои
+-- защиты те же, что у плейлиста: in-flight guard сервиса, исчерпание
+-- (next == nil после дочитки) и локальный дебаунс 500 мс.
+local HOME_MORE_MARGIN = 1
+local lastHomeMoreAt = 0
+maybeHomeMore = function()
+  if view ~= "home" then
+    return
+  end
+  local feed = homeFeed
+  if type(feed) ~= "table" or feed.status ~= "ok" then
+    return
+  end
+  local nextCursor = tostring(feed.next or "")
+  if nextCursor == "" then
+    return
+  end
+  local shelves = homeShelves()
+  if homeShelf < #shelves - HOME_MORE_MARGIN then
+    return
+  end
+  local now = noctalia.nowMs()
+  if now - lastHomeMoreAt < MORE_DEBOUNCE_MS then
+    return
+  end
+  lastHomeMoreAt = now
+  poke("home-more", nextCursor)
 end
 
 -- Горизонтальный/вертикальный ход по сетке Library (буфер 2):
@@ -1970,17 +2012,31 @@ local function trackForAdd()
   return nil
 end
 
+-- Пункты пикера: «+ New playlist…» (создаёт ЛОКАЛЬНЫЙ плейлист) +
+-- доступные адресата. Локальные плейлисты — всегда; нативные — только
+-- при совпадении провайдера плейлиста с провайдером трека и
+-- caps.playlist_add (playlistAddable). Пересчитывается на каждый
+-- вызов: snapshot мог обновиться, пока пикер открыт.
+local function pickerItems(s)
+  local trackProv = trackProvider(plPicker and plPicker.track or "")
+  local out = { { title = "+ New playlist…" } }
+  for _, p in ipairs(s.playlists or {}) do
+    if playlistAddable(p, trackProv) then
+      local ref = plRef(p)
+      local bare = ref:match(":(.+)$") or ref
+      table.insert(out, { ref = ref, title = tostring(p.title or ""), lm = bare == "LM" })
+    end
+  end
+  return out
+end
+
 -- Поповер «в плейлист»: отдельного оверлей-слоя у panel.render нет,
 -- поэтому рисуем карточку выбора вместо правой context-колонки —
 -- это самый дешёвый «поповер» без нового API. Состояние в plPicker
--- (track + cursor), пункты = «+ New playlist…» + snapshot.playlists.
+-- (track + cursor), пункты — pickerItems (локальные всегда, нативные
+-- по capabilities).
 local function playlistPickerNode(s)
-  local items = { { title = "+ New playlist…" } }
-  for _, p in ipairs(s.playlists or {}) do
-    local ref = plRef(p)
-    local bare = ref:match(":(.+)$") or ref
-    table.insert(items, { ref = ref, title = tostring(p.title or ""), lm = bare == "LM" })
-  end
+  local items = pickerItems(s)
   if plPicker.cursor > #items then
     plPicker.cursor = #items
   end
@@ -2577,26 +2633,28 @@ function onKey(chord, pressed)
   -- уйти в ввод имени), Esc — отмена. Всё локально, демона не дёргаем
   -- до подтверждения.
   if plPicker then
-    local count = 1 + #(snapshot.playlists or {})
+    local items = pickerItems(snapshot)
+    local count = #items
     if chord == "Escape" then
       plPicker = nil
     elseif chord == "Return" then
       if plPicker.cursor == 1 then
+        -- «+ New playlist…»: плейлист создаётся ЛОКАЛЬНЫМ (сервис
+        -- шлёт `pl new <title>` без --provider), трек добавляется в
+        -- цепочке там же — id знает только сервис.
         local track = plPicker.track
         plPicker = nil
         startPlNaming(track)
       else
-        local pl = (snapshot.playlists or {})[plPicker.cursor - 1]
-        if pl then
-          local ref = plRef(pl)
-          local bare = ref:match(":(.+)$") or ref
-          if bare == "LM" then
+        local item = items[plPicker.cursor]
+        if item and item.ref then
+          if item.lm then
             -- Liked Music нельзя править через edit_playlist — он
             -- целиком выводится из лайков; подтверждение на LM = лайк
             -- трека, ради которого и открыт пикер.
             poke("rate", "like:" .. plPicker.track)
           else
-            poke("pl", "add:" .. ref .. ":" .. plPicker.track)
+            poke("pl", "add:" .. item.ref .. ":" .. plPicker.track)
           end
         end
         plPicker = nil
@@ -2961,22 +3019,40 @@ function onKey(chord, pressed)
     -- обновится через watch KEY "tmus".
     if view == "playlist" then
       local row = rows()[cursor]
-      local ref
-      if row and row.kind == "track" and row.id then
-        for _, pl in ipairs(snapshot.playlists or {}) do
-          if idOf(pl) == playlistId then
-            ref = plRef(pl)
-            break
+      -- Удаление из плейлиста. Локальный плейлист — по АБСОЛЮТНОЙ
+      -- позиции (pl rm-at): дубликаты уходят строго по одному, идентичность
+      -- не размывается. Нативный — только при caps.playlist_remove,
+      -- иначе по id трека (pl rm).
+      if row and row.kind == "track" and row.id and row.pos ~= nil then
+        local prov = trackProvider(playlistId)
+        if isLocalProvider(prov) then
+          poke("pl", "rmat:" .. playlistId .. ":" .. tostring(row.pos))
+        else
+          local caps = capsOfProvider(prov)
+          if type(caps) == "table" and caps.playlist_remove == true then
+            local ref
+            for _, pl in ipairs(snapshot.playlists or {}) do
+              if idOf(pl) == playlistId then
+                ref = plRef(pl)
+                break
+              end
+            end
+            if ref then
+              poke("pl", "rm:" .. ref .. ":" .. row.id)
+            end
           end
-        end
-        if ref then
-          poke("pl", "rm:" .. ref .. ":" .. row.id)
         end
       end
     elseif view == "library" then
       local row = rows()[cursor]
       if row and row.kind == "playlist" and (row.plid or "") ~= "" then
-        poke("pl", "del:" .. row.plid)
+        -- Удаление самого плейлиста: локальный — всегда; нативный —
+        -- только при caps.playlist_delete.
+        local caps = capsOfProvider(row.provider)
+        if isLocalProvider(row.provider)
+          or (type(caps) == "table" and caps.playlist_delete == true) then
+          poke("pl", "del:" .. row.plid)
+        end
       end
     end
   elseif chord == "ctrl+d" then
@@ -3110,6 +3186,9 @@ noctalia.state.watch("tmus.home", function(v)
   rebuildHomeShelves()
   if view == "home" then
     clampHomeCursor()
+    -- Лента догрузилась до конца окна при открытом home: если хвост
+    -- уже на экране — запросить продолжение сразу, не дожидаясь хода.
+    maybeHomeMore()
   end
   draw()
 end)
