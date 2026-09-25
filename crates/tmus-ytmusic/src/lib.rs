@@ -383,12 +383,13 @@ impl Catalog for YtMusic {
         if seed.provider != self.id {
             return Err(ProviderError::NoSuchTrack(seed.clone()));
         }
-        // Старт — `next` по сид-треку без плейлист-контекста: сервис
-        // строит автоплейлист сам. Продолжение — по токену из прошлого
-        // ответа. Разбор (`parse::radio`) отдаёт только играемые треки и
-        // токен; без токена страница — последняя.
+        // Старт — стартовое радио по сид-треку: тело несёт сгенерированный
+        // `RDAMVM`-плейлист и automix-флаги, которыми сервис строит
+        // автоплейлист сам. Продолжение — по токену из прошлого ответа.
+        // Разбор (`parse::radio`) отдаёт только играемые треки и токен;
+        // без токена страница — последняя.
         let page = match cursor {
-            None => self.tube.next(&seed.id, None).await?,
+            None => self.tube.radio(&seed.id).await?,
             Some(token) => self.tube.next_continue(token).await?,
         };
         let (tracks, next) = parse::radio(&page);

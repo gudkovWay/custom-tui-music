@@ -90,14 +90,12 @@ impl InnerTube {
         self.post("browse", json!({ "browseId": browse_id })).await
     }
 
-    /// Ответ `next`: стартовая очередь по сид-треку (радио) — с
-    /// опциональным плейлистом-контекстом.
-    pub async fn next(&self, video_id: &str, playlist_id: Option<&str>) -> Result<Value> {
-        let mut body = json!({ "videoId": video_id });
-        if let Some(playlist_id) = playlist_id {
-            body["playlistId"] = Value::String(playlist_id.to_owned());
-        }
-        self.post("next", body).await
+    /// Ответ `next`: стартовая очередь радио по сид-треку. Тело строит
+    /// [`radio_body`] — сгенерированный `RDAMVM`-плейлист микса и
+    /// automix-флаги: без них сервис отвечает одиночным watch-ответом,
+    /// а не очередью автоплейлиста.
+    pub async fn radio(&self, video_id: &str) -> Result<Value> {
+        self.post("next", radio_body(video_id)).await
     }
 
     /// Одна страница `next` по токену продолжения: тело — только токен,
@@ -375,6 +373,29 @@ fn like_endpoint(rating: Rating) -> &'static str {
 /// Тело запроса оценки: единственное поле — идентификатор видео.
 fn like_body(video_id: &str) -> Value {
     json!({ "target": { "videoId": video_id } })
+}
+
+/// Префикс плейлиста-микса YouTube Music: `RDAMVM` плюс идентификатор
+/// сид-трека.
+const RADIO_MIX_PREFIX: &str = "RDAMVM";
+
+/// Тело стартового запроса радио по сид-треку.
+///
+/// Автоплейлист от трека YouTube Music запускает не «голым» `videoId`:
+/// сервису нужен сгенерированный `playlistId` микса (`RDAMVM<videoId>`),
+/// `params=wAEB`, `enablePersistentPlaylistPanel`, `isAudioOnly` и
+/// `tunerSettingValue=AUTOMIX_SETTING_NORMAL`. Без плейлиста и этих
+/// флагов `next` отвечает одиночным watch-ответом вроде «похожего»
+/// видео, без очереди.
+fn radio_body(video_id: &str) -> Value {
+    json!({
+        "videoId": video_id,
+        "playlistId": format!("{RADIO_MIX_PREFIX}{video_id}"),
+        "params": "wAEB",
+        "enablePersistentPlaylistPanel": true,
+        "isAudioOnly": true,
+        "tunerSettingValue": "AUTOMIX_SETTING_NORMAL",
+    })
 }
 
 /// Тело создания плейлиста: заголовок плюс `PRIVATE` — плейлист создаётся
