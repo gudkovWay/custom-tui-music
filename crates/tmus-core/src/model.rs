@@ -12,10 +12,14 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-/// Идентификатор провайдера: `"ytmusic"`, `"soundcloud"`, `"spotify"`, …
+/// Идентификатор стабильного пространства источника: `"ytmusic"`,
+/// `"soundcloud"`, `"local"`, …
 ///
 /// Строка, а не enum: типы, на которые смотрят плеер, демон и TUI, не
-/// обязаны знать список провайдеров, и `match` по нему в них запрещён.
+/// обязаны знать список источников, и `match` по нему в них запрещён.
+///
+/// `local` — пространство имён локальных коллекций приложения, а не
+/// зарегистрированный аккаунт или внешний провайдер.
 ///
 /// Почему `&'static str`, а разбор строки — через [`ProviderId::ALL`].
 /// Провайдер — это крейт, то есть сущность времени компиляции; хранить
@@ -25,19 +29,19 @@ use serde::{Deserialize, Serialize};
 /// литералом. `Box::leak` здесь запрещён — на неизвестном имени из
 /// внешних данных он течёт без предела.
 ///
-/// Цена решения — одна строка в [`ProviderId::ALL`] на новый провайдер.
-/// Это единственное место в ядре, которое провайдер правит о себе.
+/// Цена решения — одна строка в [`ProviderId::ALL`] на новый источник.
+/// Это единственное место в ядре, которое источник правит о себе.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ProviderId(pub &'static str);
 
 impl ProviderId {
+    pub const LOCAL: Self = Self("local");
     pub const YTMUSIC: Self = Self("ytmusic");
     pub const SOUNDCLOUD: Self = Self("soundcloud");
 
-    /// Все известные ядру провайдеры. Служит таблицей разбора имён из
-    /// внешних данных — протокола и базы.
-    pub const ALL: &'static [Self] = &[Self::YTMUSIC, Self::SOUNDCLOUD];
+    /// Все известные источники, включая локальное пространство приложения.
+    pub const ALL: &'static [Self] = &[Self::LOCAL, Self::YTMUSIC, Self::SOUNDCLOUD];
 
     #[must_use]
     pub const fn as_str(self) -> &'static str {
