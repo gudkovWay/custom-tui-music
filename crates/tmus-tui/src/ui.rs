@@ -17,8 +17,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 
-use tmus_core::model::{AuthStatus, LoopMode, PlaybackStatus, Playlist, PlaylistId, ProviderId, Rating, SearchResult, Track, TrackId};
-use tmus_core::protocol::{CatalogCapabilities, CatalogSource, Cmd, Event, Payload, PlayerState};
+use tmus_core::model::{AuthStatus, CatalogCapabilities, LoopMode, PlaybackStatus, Playlist, PlaylistId, ProviderId, Rating, SearchResult, Track, TrackId};
+use tmus_core::protocol::{CatalogSource, Cmd, Event, Payload, PlayerState};
 use tmus_core::Paths;
 
 use crate::client::Client;
@@ -803,19 +803,51 @@ async fn playlist_remove_or_delete(app: &mut App) {
             }
             call_quiet(app, Cmd::PlaylistRemoveAt { playlist: id, position }).await;
         } else {
-            let Some(track) = selected_track(app) else { return };
-            app.playlist_tracks.retain(|t| t.id != track);
-            if let Some((tracks, _)) = app.playlist_cache.get_mut(&id) {
-                tracks.retain(|t| t.id != track);
+            let supported = app
+                .capabilities
+                .get(id.provider.as_str())
+                .is_some_and(|c| c.playlist_remove);
+            if !supported {
+                app.notice = Some("провайдер не поддерживает удаление треков".to_owned());
+                return;
             }
-            call_quiet(app, Cmd::PlaylistRemove { playlist: id, track }).await;
+            let Some(track) = selected_track(app) else { return };
+            match app.client.call(Cmd::PlaylistRemove { playlist: id.clone(), track: track.clone() }).await {
+                Ok(_) => {
+                    app.playlist_tracks.retain(|t| t.id != track);
+                    if let Some((tracks, _)) = app.playlist_cache.get_mut(&id) {
+                        tracks.retain(|t| t.id != track);
+                    }
+                    app.notice = None;
+                }
+                Err(e) => app.notice = Some(e.to_string()),
+            }
         }
     } else if app.nav.focus == Focus::Panel && app.nav.panel == Panel::Library {
         let Some(idx) = app.nav.library_sel.selected() else { return };
         let Some(playlist) = app.playlists.get(idx) else { return };
         let id = playlist.id.clone();
-        app.playlist_cache.remove(&id);
-        call_quiet(app, Cmd::PlaylistDelete { playlist: id }).await;
+        if id.provider != ProviderId::LOCAL
+            && !app
+                .capabilities
+                .get(id.provider.as_str())
+                .is_some_and(|c| c.playlist_delete)
+        {
+            app.notice = Some("провайдер не поддерживает удаление плейлистов".to_owned());
+            return;
+        }
+        if id.provider == ProviderId::LOCAL {
+            app.playlist_cache.remove(&id);
+            call_quiet(app, Cmd::PlaylistDelete { playlist: id }).await;
+        } else {
+            match app.client.call(Cmd::PlaylistDelete { playlist: id.clone() }).await {
+                Ok(_) => {
+                    app.playlist_cache.remove(&id);
+                    app.notice = None;
+                }
+                Err(e) => app.notice = Some(e.to_string()),
+            }
+        }
     }
 }
 
