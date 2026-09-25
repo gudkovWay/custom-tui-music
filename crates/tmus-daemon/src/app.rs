@@ -59,6 +59,10 @@ pub struct App {
     /// догрузки и флаги исчерпания/догрузки. tokio-замок: берётся в
     /// вахтёре и в обработчиках команд, сетевой заход идёт мимо него.
     pub(crate) radio: tokio::sync::Mutex<Option<RadioSession>>,
+    /// Single-flight пейджинга виртуального `local:liked` и прямого
+    /// нативного `ytmusic:LM`: сетевые чтения и запись курсоров не могут
+    /// пересечься с инвалидацией рейтинга.
+    pub(crate) liked_pager: tokio::sync::Mutex<()>,
     /// Поколение радио-сессии: каждый `PlayRadio` берёт следующий номер
     /// и сравнивает его с сессией после сетевого захода. Ответ первой
     /// страницы, опоздавший к явной замене контекста, обязан уйти в
@@ -109,6 +113,7 @@ impl App {
             catalog_source: std::sync::Mutex::new(catalog_source),
             home_cache: tokio::sync::Mutex::new(None),
             radio: tokio::sync::Mutex::new(None),
+            liked_pager: tokio::sync::Mutex::new(()),
             radio_generation: std::sync::atomic::AtomicU64::new(0),
             shutdown: tokio::sync::Notify::new(),
             auth_retry: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -608,18 +613,34 @@ impl App {
         // Явная замена контекста хоронит радио-сессию.
         self.cancel_radio().await;
         let mut tracks = self.playlist_tracks(id).await?;
-        if tracks.is_empty() {
-            anyhow::bail!("плейлист {id} пуст");
-        }
-        while requested.is_some_and(|track| !tracks.iter().any(|candidate| &candidate.id == track)) {
+        let mut empty_nonterminal = 0usize;
+        while tracks.is_empty()
+            || requested.is_some_and(|track| !tracks.iter().any(|candidate| &candidate.id == track))
+        {
             let (page, next) = self.playlist_tracks_page(id).await?;
             if page.is_empty() {
-                break;
+                // Пустая страница не обязана значить конец: провайдер
+                // может отдать пустой батч с живым курсором. Терминален
+                // только `next=None`; непустые страницы сбрасывают счётчик,
+                // серия пустых ограничена — вечный цикл на упорном сбое
+                // провайдера исключён.
+                if next.is_none() {
+                    break;
+                }
+                empty_nonterminal += 1;
+                if empty_nonterminal >= 3 {
+                    break;
+                }
+                continue;
             }
+            empty_nonterminal = 0;
             tracks.extend(page);
             if next.is_none() {
                 break;
             }
+        }
+        if tracks.is_empty() {
+            anyhow::bail!("плейлист {id} пуст");
         }
         let start = match requested {
             None => 0,

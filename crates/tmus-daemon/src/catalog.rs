@@ -15,12 +15,20 @@ use crate::app::App;
 /// свежести каждый заход — секунды ожидания InnerTube.
 const PLAYLIST_TTL_SECS: i64 = 600;
 
-/// Потолок страниц при ПОЛНОМ перечитывании состава плейлиста.
-/// Зеркалит `MAX_PAGES` провайдера: batch-путь — страховка от вечного
-/// цикла, а не замена ленивой догрузке. Если все страницы взяты, а токен
-/// остался, он сохраняется — хвост дозагружается через
-/// `playlist_tracks_page`.
-const PLAYLIST_BATCH_PAGES: usize = 10;
+/// Идентификатор виртуального плейлиста «понравившихся»: агрегат
+/// локальных отметок и провайдерских лайков, всегда `local:liked`.
+/// Состав собирает сам демон, мутациям он не подлежит.
+const LIKED_PLAYLIST_ID: &str = "liked";
+
+/// Нативный плейлист лайкнутого у YTM (`ytmusic:LM`). Из объединённой
+/// библиотеки прячется — вместо него показывается виртуальный
+/// `local:liked`, — но по прямому адресу продолжает читаться.
+const YTM_LIKED_PLAYLIST_ID: &str = "LM";
+
+/// Курсор виртуального плейлиста, выдаваемый клиенту. Состояние пейджинга
+/// демон держит в кэше ([`LikedCursor`] в `playlist_sync.continuation`),
+/// клиенту оно не нужно: непрозрачная метка «есть ещё страницы».
+const LIKED_NEXT_CURSOR: &str = "liked:next";
 
 /// Сколько домашняя лента считается свежей без похода в сеть (ротация
 /// рекомендаций терпит устаревание).
@@ -97,12 +105,77 @@ pub(crate) struct RadioSession {
     refill_in_flight: bool,
 }
 
+/// Состояние пейджинга агрегата `local:liked`: по записи на провайдера.
+///
+/// - `Some(токен)` — у провайдера есть ещё страницы, токен живой;
+/// - `None` — провайдер дочитан;
+/// - ключа нет — прошлый заход провайдера не удался: он НЕ считается
+///   исчерпанным и остаётся к повтору при следующей странице.
+///
+/// Наружу состояние не утекает: сериализованный JSON демон хранит в
+/// `playlist_sync.continuation` под `local:liked`, клиенту достаётся
+/// лишь [`LIKED_NEXT_CURSOR`].
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct LikedCursor {
+    providers: HashMap<String, Option<String>>,
+}
+
+impl LikedCursor {
+    fn parse(raw: &str) -> Self {
+        serde_json::from_str(raw).unwrap_or_default()
+    }
+
+    fn encode(&self) -> String {
+        serde_json::to_string(self).expect("состояние курсора лайков сериализуемо")
+    }
+
+    /// Все ли подключённые провайдеры дочитаны. Отсутствующий ключ при
+    /// непустом списке — неудача, а не исчерпание; без провайдеров
+    /// агрегат состоит только из локальных оценок и уже дочитан.
+    fn exhausted(&self, connected: &[ProviderId]) -> bool {
+        connected
+            .iter()
+            .all(|id| matches!(self.providers.get(id.as_str()), Some(None)))
+    }
+}
+
+/// Виртуальный плейлист «понравившихся».
+fn liked_playlist() -> PlaylistId {
+    PlaylistId::new(ProviderId::LOCAL, LIKED_PLAYLIST_ID)
+}
+
+/// Прямой нативный плейлист лайков YTM. Виртуальный `local:liked`
+/// намеренно не совпадает с ним.
+fn is_native_liked(id: &PlaylistId) -> bool {
+    id.provider == ProviderId::YTMUSIC && id.id == YTM_LIKED_PLAYLIST_ID
+}
+
+/// Маршрут-предикат: этот id — виртуальный агрегат, а не локальный
+/// плейлист с числовым ключом.
+fn is_liked_virtual(id: &PlaylistId) -> bool {
+    id.provider == ProviderId::LOCAL && id.id == LIKED_PLAYLIST_ID
+}
+
+
 /// Кулдаун попыток перечитать cookies браузера: одна на провайдера,
 /// чтобы ливень auth-ошибок не превратился в ливень перечитываний
 /// профиля.
 const REAUTH_COOLDOWN: Duration = Duration::from_secs(300);
 
 impl App {
+    /// Сбросить виртуальный liked и, для YTM, нативный LM под тем же
+    /// single-flight замком, что защищает их сетевые чтения.
+    async fn invalidate_liked_cache(&self, provider: ProviderId) -> anyhow::Result<()> {
+        let _guard = self.liked_pager.lock().await;
+        let liked = liked_playlist();
+        self.with_cache(|c| c.forget_playlist_sync(&liked))?;
+        if provider == ProviderId::YTMUSIC {
+            let native = PlaylistId::new(ProviderId::YTMUSIC, YTM_LIKED_PLAYLIST_ID);
+            self.with_cache(|c| c.forget_playlist_sync(&native))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn providers(&self) -> Vec<ProviderView> {
         self.registry
             .iter()
@@ -214,14 +287,43 @@ impl App {
         } else {
             self.with_cache(|c| c.put_playlists(&remote))?;
         }
+        // Объединённая библиотека: локальные плейлисты, виртуальный
+        // агрегат лайков и провайдерские. Нативный `ytmusic:LM` из
+        // показа прячется — его заменяет виртуальный `local:liked`;
+        // по прямому адресу плейлист по-прежнему читается.
         let mut out = locals;
+        if provider.is_none() {
+            remote.retain(|playlist| {
+                !(playlist.id.provider == ProviderId::YTMUSIC
+                    && playlist.id.id == YTM_LIKED_PLAYLIST_ID)
+            });
+            out.push(Playlist {
+                id: liked_playlist(),
+                title: "Liked Music".to_owned(),
+                subtitle: None,
+                art_url: None,
+                track_count: None,
+            });
+        }
         out.extend(remote);
         Ok(out)
     }
 
     pub(crate) async fn playlist_tracks(&self, id: &PlaylistId) -> anyhow::Result<Vec<Track>> {
+        // Виртуальный агрегат лайков идёт через свой пейджинг-стейт-машин.
+        // Повторное открытие возвращает уже накопленный срез, а не
+        // продвигает курсор; хвост двигает только playlist_tracks_page.
+        if is_liked_virtual(id) {
+            return self.liked_virtual_tracks().await;
+        }
+        let _liked_guard = if is_native_liked(id) {
+            Some(self.liked_pager.lock().await)
+        } else {
+            None
+        };
         // Локальный плейлист живёт целиком в кэше: метаданные записаны
-        // при добавлении, Registry не при делах.
+        // при добавлении, Registry не при делах. Виртуальный `liked`
+        // отсюда уже ушёл: ключ локального плейлиста — число.
         if id.provider == ProviderId::LOCAL {
             return Ok(self.with_cache(|c| c.local_playlist_tracks(id))?);
         }
@@ -234,33 +336,19 @@ impl App {
         if let Some(tracks) = self.with_cache(|c| c.playlist_tracks_if_fresh(id, PLAYLIST_TTL_SECS))? {
             return Ok(tracks);
         }
-        // Полное чтение идёт через постраничный API, а не через
-        // `playlist_tracks`: только так после последней взятой страницы
-        // остаётся токен, и хвост плейлиста (LM длиннее тысячи треков
-        // не влезает в батч) доступен ленивой догрузке.
+        // Полное чтение — одна страница провайдера: состав нужен быстро
+        // (панель дёргает его на каждый шаг курсора), а хвост с токеном
+        // дозагружается лениво через `playlist_tracks_page`.
         let catalog = provider.catalog();
         let mut tracks = Vec::new();
-        let mut cursor: Option<String> = None;
         let mut last_token: Option<String> = None;
         let mut failure = None;
-        for _ in 0..PLAYLIST_BATCH_PAGES {
-            match catalog.playlist_tracks_page(id, cursor.as_deref()).await {
-                Ok(page) => {
-                    last_token = page.next.clone();
-                    cursor = page.next;
-                    tracks.extend(page.tracks);
-                    // Провайдеры без пагинации (дефолт трейта) отдают
-                    // всё сразу с next=None — цикл кончается первой же
-                    // итерацией.
-                    if last_token.is_none() {
-                        break;
-                    }
-                }
-                Err(err) => {
-                    failure = Some(err);
-                    break;
-                }
+        match catalog.playlist_tracks_page(id, None).await {
+            Ok(page) => {
+                last_token = page.next;
+                tracks.extend(page.tracks);
             }
+            Err(err) => failure = Some(err),
         }
         match failure {
             None => {
@@ -297,6 +385,17 @@ impl App {
         &self,
         id: &PlaylistId,
     ) -> anyhow::Result<(Vec<Track>, Option<String>)> {
+        // Виртуальный агрегат: та же стейт-машина, что и у первого
+        // чтения, — воспроизведение догружает страницы, пока не найдёт
+        // запрошенный трек.
+        if is_liked_virtual(id) {
+            return self.liked_virtual_page().await;
+        }
+        let _liked_guard = if is_native_liked(id) {
+            Some(self.liked_pager.lock().await)
+        } else {
+            None
+        };
         // Локальный состав всегда прочитан целиком: догрузить нечего.
         if id.provider == ProviderId::LOCAL {
             return Ok((Vec::new(), None));
@@ -330,6 +429,173 @@ impl App {
             )
         })?;
         Ok((page.tracks, page.next))
+    }
+
+    /// Открыть виртуальный агрегат `local:liked`. Первый или протухший
+    /// заход собирает начальный срез; повторный в пределах TTL отдаёт
+    /// весь уже накопленный кэш и не двигает курсоры провайдеров.
+    async fn liked_virtual_tracks(&self) -> anyhow::Result<Vec<Track>> {
+        let _guard = self.liked_pager.lock().await;
+        let liked = liked_playlist();
+        if let Some(tracks) =
+            self.with_cache(|c| c.playlist_tracks_if_fresh(&liked, PLAYLIST_TTL_SECS))?
+        {
+            return Ok(tracks);
+        }
+        self.liked_virtual_first(&liked).await.map(|(tracks, _)| tracks)
+    }
+
+    /// Одна страница виртуального агрегата `local:liked`. tokio-замок
+    /// сливает параллельные вызовы в один сетевой заход (single-flight,
+    /// как у домашней ленты): состояние курсора в кэше — на запись, и
+    /// две гонки дописали бы дубликаты.
+    async fn liked_virtual_page(&self) -> anyhow::Result<(Vec<Track>, Option<String>)> {
+        let _guard = self.liked_pager.lock().await;
+        let liked = liked_playlist();
+        let stored = self.with_cache(|c| {
+            c.playlist_continuation(ProviderId::LOCAL.as_str(), &liked)
+        })?;
+        match stored {
+            Some(raw) => {
+                self.liked_virtual_next(&liked, LikedCursor::parse(&raw))
+                    .await
+            }
+            None => self.liked_virtual_first(&liked).await,
+        }
+    }
+
+    /// Первая страница агрегата: локальные отметки (по свежести) плюс
+    /// по странице от каждого успешного провайдера, дедуп по TrackId.
+    /// Сбой провайдера не стирает ни локальные, ни чужие треки и не
+    /// помечает его исчерпанным — ключа в состоянии просто нет.
+    async fn liked_virtual_first(
+        &self,
+        liked: &PlaylistId,
+    ) -> anyhow::Result<(Vec<Track>, Option<String>)> {
+        let mut tracks: Vec<Track> = self
+            .with_cache(|c| c.liked_tracks())?
+            .into_iter()
+            .map(|(track, _)| track)
+            .collect();
+        let mut seen: HashSet<TrackId> = tracks.iter().map(|t| t.id.clone()).collect();
+        let mut state = LikedCursor::default();
+        let targets = self.targets(None)?;
+        let results = futures_util::future::join_all(targets.iter().map(|target| async move {
+            (*target, target.catalog().liked_page(None).await)
+        }))
+        .await;
+        for (target, result) in results {
+            match result {
+                Ok(page) => {
+                    state
+                        .providers
+                        .insert(target.id().as_str().to_owned(), page.next);
+                    for track in page.tracks {
+                        if seen.insert(track.id.clone()) {
+                            tracks.push(track);
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        provider = %target.id(), %err, "страница лайков не прочиталась"
+                    );
+                    self.report_auth(target, &err);
+                    if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
+                        self.try_reauth(target).await;
+                    }
+                }
+            }
+        }
+        self.with_cache(|c| {
+            c.put_playlist_tracks(liked, &tracks)?;
+            c.put_playlist_continuation(
+                ProviderId::LOCAL.as_str(),
+                liked,
+                Some(&state.encode()),
+                tracks.len(),
+            )
+        })?;
+        let connected: Vec<ProviderId> = targets.iter().map(|p| p.id()).collect();
+        let next = (!state.exhausted(&connected)).then(|| LIKED_NEXT_CURSOR.to_owned());
+        Ok((tracks, next))
+    }
+
+    /// Продолжение агрегата: только провайдеры с живым курсором
+    /// (`Some(токен)`) или с неудавшейся прошлой попыткой (ключа нет —
+    /// повтор первой страницы). Перед дописыванием дедуп против уже
+    /// кэшированных id и внутри пришедших страниц.
+    async fn liked_virtual_next(
+        &self,
+        liked: &PlaylistId,
+        mut state: LikedCursor,
+    ) -> anyhow::Result<(Vec<Track>, Option<String>)> {
+        let targets = self.targets(None)?;
+        let pending: Vec<_> = targets
+            .iter()
+            .filter(|target| {
+                !matches!(state.providers.get(target.id().as_str()), Some(None))
+            })
+            .collect();
+        if pending.is_empty() {
+            return Ok((Vec::new(), None));
+        }
+        // Карта провайдеров берётся ссылкой до замыкания: `async move`
+        // иначе попытался бы утащить состояние по значению.
+        let cursors = &state.providers;
+        let results = futures_util::future::join_all(pending.iter().map(|target| async move {
+            let cursor = cursors.get(target.id().as_str()).cloned().flatten();
+            (*target, target.catalog().liked_page(cursor.as_deref()).await)
+        }))
+        .await;
+        let mut seen: HashSet<TrackId> = self
+            .with_cache(|c| c.playlist_tracks(liked))?
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        let mut fresh: Vec<Track> = Vec::new();
+        for (target, result) in results {
+            let key = target.id().as_str().to_owned();
+            match result {
+                Ok(page) => {
+                    state.providers.insert(key, page.next);
+                    for track in page.tracks {
+                        if seen.insert(track.id.clone()) {
+                            fresh.push(track);
+                        }
+                    }
+                }
+                Err(err) => {
+                    // Ключ убирается: провайдер остаётся к повтору,
+                    // а не помечается дочитанным.
+                    state.providers.remove(&key);
+                    tracing::warn!(
+                        provider = %target.id(), %err, "страница лайков не прочиталась"
+                    );
+                    self.report_auth(target, &err);
+                    if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
+                        self.try_reauth(target).await;
+                    }
+                }
+            }
+        }
+        if !fresh.is_empty() {
+            self.with_cache(|c| {
+                c.append_playlist_tracks(ProviderId::LOCAL.as_str(), liked, &fresh)
+            })?;
+        }
+        let fetched = self.with_cache(|c| c.playlist_tracks(liked))?.len();
+        self.with_cache(|c| {
+            c.put_playlist_continuation(
+                ProviderId::LOCAL.as_str(),
+                liked,
+                Some(&state.encode()),
+                fetched,
+            )
+        })?;
+        let connected: Vec<ProviderId> = targets.iter().map(|p| p.id()).collect();
+        let next = (!state.exhausted(&connected)).then(|| LIKED_NEXT_CURSOR.to_owned());
+        Ok((fresh, next))
     }
 
     pub(crate) async fn liked(&self, provider: Option<&str>) -> anyhow::Result<Vec<Track>> {
@@ -857,6 +1123,11 @@ impl App {
     ) -> anyhow::Result<()> {
         self.with_cache(|c| c.set_rating(id, rating))?;
         self.emit(Event::RatingChanged { track: id.clone(), rating });
+        // Инвалидация сериализована с любым чтением/записью liked-кэшей.
+        if let Err(err) = self.invalidate_liked_cache(id.provider).await {
+            self.emit(Event::PlaylistsChanged);
+            return Err(err);
+        }
         // Скрытие играющего дизлайком должно быть немедленным:
         // человек как раз хочет, чтобы это ушло из ушей сейчас.
         // Тот же `step`, что и у `Cmd::Next`: одна логика
@@ -864,28 +1135,44 @@ impl App {
         if rating == Rating::Disliked {
             let current = self.player.state().await.track.map(|t| t.id);
             if current.as_ref() == Some(id) {
-                self.step(true).await?;
+                if let Err(err) = self.step(true).await {
+                    self.emit(Event::PlaylistsChanged);
+                    return Err(err);
+                }
             }
-        }
-        if rating == Rating::Liked {
-            // Лайк меняет плейлист лайкнутого у провайдера (после
-            // зеркала) — TTL-кэш его состава обязан протухнуть независимо
-            // от исхода зеркала.
-            let liked_playlist = PlaylistId::new(id.provider, "LM");
-            self.with_cache(|c| c.forget_playlist_sync(&liked_playlist))?;
         }
         // Локальные треки зеркалить некуда: отметка только локальная.
         // Удалённому треку провайдер обязателен: без реестра зеркалить
         // некому, и это видимая ошибка — локальная отметка выше уже
         // сохранена и не откатывается.
         if id.provider == ProviderId::LOCAL {
+            // Локальная отметка уже могла изменить состав виртуального
+            // `local:liked` — клиенту нужен сигнал обновить его.
+            self.emit(Event::PlaylistsChanged);
             return Ok(());
         }
-        let provider = self
-            .registry
-            .get(id.provider)
-            .ok_or_else(|| anyhow::anyhow!("провайдер {} не подключён", id.provider))?;
-        match provider.catalog().rate(id, rating).await {
+        let provider = match self.registry.get(id.provider) {
+            Some(provider) => provider,
+            None => {
+                // Зеркалить некому, но локальный состав агрегата менялся:
+                // сигнал обновления обязан уйти и на этом пути.
+                self.emit(Event::PlaylistsChanged);
+                return Err(anyhow::anyhow!(
+                    "провайдер {} не подключён",
+                    id.provider
+                ));
+            }
+        };
+        let mirrored = provider.catalog().rate(id, rating).await;
+        // Зеркало завершено (успех, Unsupported или ошибка): членство
+        // в лайкнутом могло измениться и локально, и у провайдера —
+        // событие обновления плейлистов уходит до возврата любого исхода.
+        if let Err(err) = self.invalidate_liked_cache(id.provider).await {
+            self.emit(Event::PlaylistsChanged);
+            return Err(err);
+        }
+        self.emit(Event::PlaylistsChanged);
+        match mirrored {
             Ok(()) => Ok(()),
             Err(tmus_provider::ProviderError::Unsupported { .. }) => {
                 tracing::debug!(provider = %provider.id(), "провайдер не умеет оценки — отметка только локальная");
@@ -966,6 +1253,9 @@ impl App {
         playlist: &PlaylistId,
         title: &str,
     ) -> anyhow::Result<()> {
+        if is_liked_virtual(playlist) {
+            anyhow::bail!("плейлист {playlist} виртуальный — состав собирает демон");
+        }
         if playlist.provider != ProviderId::LOCAL {
             anyhow::bail!(
                 "переименование нативного плейлиста {} не поддерживается",
@@ -983,6 +1273,9 @@ impl App {
         playlist: &PlaylistId,
         track: &TrackId,
     ) -> anyhow::Result<()> {
+        if is_liked_virtual(playlist) {
+            anyhow::bail!("плейлист {playlist} виртуальный — меняйте лайк оценкой трека");
+        }
         if playlist.provider == ProviderId::LOCAL {
             // Метаданные обязаны уже лежать в кэше: чтение локального
             // состава джойнит tracks, и непрочитаемая запись — мина.
@@ -1017,6 +1310,9 @@ impl App {
         playlist: &PlaylistId,
         track: &TrackId,
     ) -> anyhow::Result<()> {
+        if is_liked_virtual(playlist) {
+            anyhow::bail!("плейлист {playlist} виртуальный — меняйте лайк оценкой трека");
+        }
         if playlist.provider == ProviderId::LOCAL {
             // Локально дубликаты независимы, по одному id снять их все
             // нельзя: удаляем первую позицию трека, для точечной —
@@ -1052,6 +1348,9 @@ impl App {
         playlist: &PlaylistId,
         position: usize,
     ) -> anyhow::Result<()> {
+        if is_liked_virtual(playlist) {
+            anyhow::bail!("плейлист {playlist} виртуальный — меняйте лайк оценкой трека");
+        }
         if playlist.provider != ProviderId::LOCAL {
             anyhow::bail!("позиционное удаление доступно только локальным плейлистам");
         }
@@ -1062,6 +1361,9 @@ impl App {
 
     /// Удалить плейлист и разослать сигнал.
     pub(crate) async fn playlist_delete(&self, playlist: &PlaylistId) -> anyhow::Result<()> {
+        if is_liked_virtual(playlist) {
+            anyhow::bail!("плейлист {playlist} виртуальный — удалять нечего");
+        }
         if playlist.provider == ProviderId::LOCAL {
             self.with_cache(|c| c.local_playlist_delete(playlist))?;
             self.emit(Event::PlaylistsChanged);
