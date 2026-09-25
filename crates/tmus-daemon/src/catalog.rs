@@ -662,6 +662,21 @@ impl App {
             seen.push(track.id.clone());
             tracks.push(track);
         }
+        // Метаданные принятых рекомендаций пишутся в кэш ДО попадания в
+        // очередь: иначе «добавить в локальный плейлист» сразу после
+        // старта радио упрётся в непрочитанную запись. Сюда доходят
+        // только ответы текущего поколения — опоздавший ответ вышел
+        // выше, чужую страницу в кэш не положит.
+        if tracks.len() > 1 {
+            if let Err(err) = self.with_cache(|c| c.put_tracks(&tracks[1..])) {
+                // Кэш не принял страницу — треки не имеют права стать
+                // видимыми (добавление в локальный плейлист упёрлось бы
+                // в непрочитанную запись). Снимаем только свою сессию и
+                // выходим с ошибкой ДО мутации очереди.
+                *radio = None;
+                return Err(err.into());
+            }
+        }
         let len = self
             .player
             .with_queue(|q| {
@@ -767,10 +782,46 @@ impl App {
         if session.generation != generation {
             return;
         }
+        // Принятые треки фильтруются против текущей очереди в момент
+        // записи (пока страница ехала, очередь могла измениться) и
+        // против дубликатов внутри самой страницы. Кэш пишется ДО
+        // появления треков в очереди; поколение проверено выше, чужая
+        // страница сюда не доходит.
+        let mut accepted: Vec<Track> = Vec::new();
+        let mut page_seen: Vec<TrackId> = Vec::new();
+        self.player
+            .with_queue(|q| {
+                for track in page.tracks {
+                    if q.find_index(&track.id).is_some() || page_seen.contains(&track.id) {
+                        continue;
+                    }
+                    page_seen.push(track.id.clone());
+                    accepted.push(track);
+                }
+            })
+            .await;
+        if !accepted.is_empty() {
+            if let Err(err) = self.with_cache(|c| c.put_tracks(&accepted)) {
+                // Страница не закэшировалась — в очередь её не
+                // дописываем: видимые треки обязаны быть
+                // кэш-обеспеченными. Сессию помечаем исчерпанной и
+                // гасим in-flight (без retry-цикла), только если она
+                // всё ещё наша.
+                tracing::warn!(%err, "кэширование страницы радио не удалось — автодополнение остановлено");
+                if let Some(session) = radio.as_mut().filter(|s| s.generation == generation) {
+                    session.exhausted = true;
+                    session.refill_in_flight = false;
+                }
+                return;
+            }
+        }
         let (len, index) = self
             .player
             .with_queue(|q| {
-                for track in page.tracks {
+                for track in accepted {
+                    // После кэширования очередь могла измениться
+                    // (QueueAppend): дубль-проверка — атомарно с
+                    // вставкой, под тем же замком.
                     if q.find_index(&track.id).is_some() {
                         continue;
                     }

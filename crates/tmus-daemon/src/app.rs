@@ -540,7 +540,7 @@ impl App {
     /// Тело play_track без отмены радио. Отдельно, потому что фолбэк
     /// радио зовёт его, держа замок радио в руках: inner замок не
     /// берёт, повторного захвата (и deadlock) не случается.
-    async fn play_track_inner(&self, id: &TrackId) -> anyhow::Result<()> {
+    pub(crate) async fn play_track_inner(&self, id: &TrackId) -> anyhow::Result<()> {
         // `Player::state()` берёт текущий трек из очереди по индексу, и
         // без добавления в очередь `tmus play <id>` играл бы «в никуда»:
         // музыка идёт, а `status`, MPRIS и Discord показывают пустоту.
@@ -668,7 +668,7 @@ impl App {
     /// нужно (его метаданные приедут при воспроизведении), а падать на
     /// «нет в кэше» значило бы требовать от клиента заранее прогреть
     /// базу.
-    fn hydrate(&self, ids: &[TrackId]) -> anyhow::Result<Vec<Track>> {
+    pub(crate) fn hydrate(&self, ids: &[TrackId]) -> anyhow::Result<Vec<Track>> {
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
             let track = self.with_cache(|c| c.track(id))?.unwrap_or_else(|| Track {
