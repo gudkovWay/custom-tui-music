@@ -174,14 +174,13 @@ impl App {
     pub(crate) async fn library(&self, provider: Option<&str>) -> anyhow::Result<Vec<Playlist>> {
         // Явный local — только плейлисты приложения, сеть не трогаем.
         if provider == Some(ProviderId::LOCAL.as_str()) {
-            return self.with_cache(|c| c.local_playlists());
+            return Ok(self.with_cache(|c| c.local_playlists())?);
         }
-        // Смешанный запрос (None) начинается с плейлистов приложения:
-        // они всегда доступны, даже когда сеть лежит целиком.
-        let locals = match provider {
-            None => self.with_cache(|c| c.local_playlists())?,
-            Some(_) => Vec::new(),
-        };
+        // Локальные плейлисты приложения доступны при любом фокусе:
+        // сфокусированный удалённый провайдер их не отменяет (явный
+        // "local" отсюда уже не доходит — вышел раньше). Кэш-фолбэк
+        // ниже фильтруется по провайдеру и локальных не приносит.
+        let locals = self.with_cache(|c| c.local_playlists())?;
         // Fan-out параллельно: поиск и библиотека — самые частые
         // мультисессионные запросы, последовательная сумма латентностей
         // недопустима.
@@ -224,7 +223,7 @@ impl App {
         // Локальный плейлист живёт целиком в кэше: метаданные записаны
         // при добавлении, Registry не при делах.
         if id.provider == ProviderId::LOCAL {
-            return self.with_cache(|c| c.local_playlist_tracks(id));
+            return Ok(self.with_cache(|c| c.local_playlist_tracks(id))?);
         }
         let provider = self
             .registry
