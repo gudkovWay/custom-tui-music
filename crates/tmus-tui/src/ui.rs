@@ -17,7 +17,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 
-use tmus_core::model::{AuthStatus, LoopMode, PlaybackStatus, Playlist, Rating, SearchResult, Track, TrackId};
+use tmus_core::model::{AuthStatus, LoopMode, PlaybackStatus, Playlist, PlaylistId, Rating, SearchResult, Track, TrackId};
 use tmus_core::protocol::{CatalogSource, Cmd, Event, Payload, PlayerState};
 use tmus_core::Paths;
 
@@ -77,7 +77,7 @@ enum Focus {
 struct Nav {
     panel: Panel,
     focus: Focus,
-    open_playlist: Option<usize>,
+    open_playlist: Option<PlaylistId>,
     library_sel: ListState,
     queue_sel: ListState,
     search_sel: ListState,
@@ -97,18 +97,14 @@ impl Nav {
         }
     }
 
-    fn enter_playlist(&mut self, playlists_len: usize) -> bool {
+    fn enter_playlist(&mut self, playlists: &[Playlist]) -> bool {
         if self.focus != Focus::Panel || self.panel != Panel::Library {
             return false;
         }
-        let Some(idx) = self.library_sel.selected() else {
-            return false;
-        };
-        if idx >= playlists_len {
-            return false;
-        }
+        let Some(idx) = self.library_sel.selected() else { return false };
+        let Some(playlist) = playlists.get(idx) else { return false };
         self.focus = Focus::Tracks;
-        self.open_playlist = Some(idx);
+        self.open_playlist = Some(playlist.id.clone());
         self.playlist_sel.select(Some(0));
         true
     }
@@ -143,10 +139,9 @@ impl Nav {
         sel.select(Some(next as usize));
     }
 
-    fn track_play_sel(&self) -> Option<(usize, usize)> {
-        let idx = self.open_playlist?;
-        let start = self.playlist_sel.selected()?;
-        Some((idx, start))
+    fn track_play_sel(&self) -> Option<usize> {
+        self.open_playlist.as_ref()?;
+        self.playlist_sel.selected()
     }
 }
 
@@ -444,6 +439,7 @@ async fn apply_event(app: &mut App, event: Event) -> bool {
             if let Ok(Payload::Playlists(ps)) =
                 app.client.call(Cmd::Library { provider: app.source.provider.clone() }).await
             {
+                reconcile_open_playlist(app, &ps);
                 app.playlists = ps;
             }
             true
@@ -456,6 +452,24 @@ async fn apply_event(app: &mut App, event: Event) -> bool {
             refresh_provider_badges(app).await;
             true
         }
+    }
+}
+
+/// После перечитывания библиотеки открытый вид жив, только пока его
+/// PlaylistId остался в списке; иначе закрываем вид и сбрасываем выбор
+/// треков.
+fn reconcile_open_playlist(app: &mut App, playlists: &[Playlist]) {
+    let open_gone = app
+        .nav
+        .open_playlist
+        .as_ref()
+        .is_some_and(|id| !playlists.iter().any(|p| &p.id == id));
+    if open_gone {
+        app.nav.open_playlist = None;
+        app.nav.playlist_sel.select(None);
+        app.nav.focus = Focus::Panel;
+        app.playlist_tracks.clear();
+        app.pending_load = None;
     }
 }
 
@@ -473,7 +487,7 @@ async fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Re
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return Ok(true),
         KeyCode::Tab => app.nav.tab(),
         KeyCode::Char('l') | KeyCode::Right => {
-            if app.nav.enter_playlist(app.playlists.len()) {
+            if app.nav.enter_playlist(&app.playlists) {
                 load_selected_playlist(app).await;
             }
         }
@@ -558,6 +572,7 @@ async fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Re
             if let Ok(Payload::Playlists(ps)) =
                 app.client.call(Cmd::Library { provider: app.source.provider.clone() }).await
             {
+                reconcile_open_playlist(app, &ps);
                 app.playlists = ps;
             }
             if !app.search_results.is_empty() && !app.search_input.is_empty() {
@@ -742,9 +757,7 @@ async fn create_and_add(app: &mut App) {
 /// плейлиста; в списке плейлистов библиотеки — удалить плейлист.
 async fn playlist_remove_or_delete(app: &mut App) {
     if app.nav.focus == Focus::Tracks {
-        let Some(idx) = app.nav.open_playlist else { return };
-        let Some(playlist) = app.playlists.get(idx) else { return };
-        let id = playlist.id.clone();
+        let Some(id) = app.nav.open_playlist.clone() else { return };
         let Some(track) = selected_track(app) else { return };
         // Кэш и открытый список правим локально: PlaylistsChanged треки
         // не несёт, иначе убранный трек висел бы до протухания TTL.
@@ -816,11 +829,10 @@ async fn flush_pending_load(app: &mut App) -> bool {
 }
 
 fn track_cmd(app: &App) -> Option<Cmd> {
-    let (idx, start) = app.nav.track_play_sel()?;
-    let playlist = app.playlists.get(idx)?;
-    // Курсор ходит по отфильтрованному списку: маппим в индекс полного.
-    let start = *app.track_view.get(start)?;
-    Some(Cmd::PlayPlaylist { playlist: playlist.id.clone(), start: Some(start) })
+    let playlist = app.nav.open_playlist.clone()?;
+    let selected = app.nav.track_play_sel()?;
+    let track = app.track_view.get(selected).and_then(|&idx| app.playlist_tracks.get(idx))?;
+    Some(Cmd::PlayPlaylist { playlist, track: Some(track.id.clone()) })
 }
 
 /// Маркер рейтинга перед названием трека в списках: нет оценки —
@@ -832,7 +844,6 @@ fn rating_marker(rating: Option<&Rating>) -> &'static str {
         _ => "",
     }
 }
-
 /// Видимость трека в списках: дизлайкнутые по умолчанию спрятаны,
 /// ctrl+d возвращает их. Чистая функция ради тестов.
 fn track_visible(rating: Option<&Rating>, show_disliked: bool) -> bool {
@@ -951,7 +962,7 @@ async fn play_selected(app: &mut App) {
         Panel::Library => {
             let Some(idx) = app.nav.library_sel.selected() else { return };
             let Some(playlist) = app.playlists.get(idx) else { return };
-            fire(app, Cmd::PlayPlaylist { playlist: playlist.id.clone(), start: Some(0) });
+            fire(app, Cmd::PlayPlaylist { playlist: playlist.id.clone(), track: None });
         }
         Panel::Queue => {
             if let Some(idx) = app.nav.queue_sel.selected() {
@@ -1071,7 +1082,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     // курсором, иначе очередь. Источник трека виден в списке: очередь
     // смешанная, без колонки провайдера она нечитаема.
     if app.nav.focus == Focus::Tracks {
-        let title = match app.nav.open_playlist.and_then(|i| app.playlists.get(i)) {
+        let title = match app.nav.open_playlist.as_ref().and_then(|id| {
+            app.playlists.iter().find(|playlist| &playlist.id == id)
+        }) {
             Some(p) => format!("Плейлист: {} [h D]", p.title),
             None => "Плейлист [h]".to_owned(),
         };
@@ -1364,20 +1377,22 @@ mod tests {
 
     #[test]
     fn enter_opens_playlist_tracks_with_cursor_at_top() {
+        let playlists = vec![pl("a"), pl("b"), pl("c")];
         let mut nav = nav_at(Some(1));
-        assert!(nav.enter_playlist(3));
+        assert!(nav.enter_playlist(&playlists));
         assert_eq!(nav.focus, Focus::Tracks);
-        assert_eq!(nav.open_playlist, Some(1));
+        assert_eq!(nav.open_playlist.as_ref().map(|id| id.id.as_str()), Some("b"));
         assert_eq!(nav.playlist_sel.selected(), Some(0));
         assert_eq!(nav.library_sel.selected(), Some(1));
-        assert!(!nav_at(None).enter_playlist(3));
-        assert!(!nav_at(Some(5)).enter_playlist(3));
+        assert!(!nav_at(None).enter_playlist(&playlists));
+        assert!(!nav_at(Some(5)).enter_playlist(&playlists));
     }
 
     #[test]
     fn back_restores_panel_focus_and_library_cursor() {
+        let playlists = vec![pl("a"), pl("b"), pl("c")];
         let mut nav = nav_at(Some(2));
-        assert!(nav.enter_playlist(3));
+        assert!(nav.enter_playlist(&playlists));
         nav.leave_playlist();
         assert_eq!(nav.focus, Focus::Panel);
         assert_eq!(nav.library_sel.selected(), Some(2));
@@ -1387,8 +1402,9 @@ mod tests {
 
     #[test]
     fn tab_clears_open_playlist() {
+        let playlists = vec![pl("a"), pl("b"), pl("c")];
         let mut nav = nav_at(Some(0));
-        nav.enter_playlist(3);
+        nav.enter_playlist(&playlists);
         nav.tab();
         assert_eq!(nav.focus, Focus::Panel);
         assert_eq!(nav.open_playlist, None);
@@ -1397,8 +1413,9 @@ mod tests {
 
     #[test]
     fn tab_rotates_panels_and_leaves_playlist_focus() {
+        let playlists = vec![pl("a"), pl("b"), pl("c")];
         let mut nav = nav_at(Some(0));
-        nav.enter_playlist(3);
+        nav.enter_playlist(&playlists);
         nav.tab();
         assert_eq!(nav.focus, Focus::Panel);
         assert_eq!(nav.panel, Panel::Queue);
@@ -1410,11 +1427,12 @@ mod tests {
 
     #[test]
     fn movement_targets_active_list_only() {
+        let playlists = vec![pl("a"), pl("b"), pl("c")];
         let mut nav = nav_at(Some(0));
         nav.move_active(1, 3, 0, 0, 0);
         assert_eq!(nav.library_sel.selected(), Some(1));
 
-        nav.enter_playlist(3);
+        nav.enter_playlist(&playlists);
         nav.move_active(1, 3, 0, 0, 5);
         nav.move_active(1, 3, 0, 0, 5);
         assert_eq!(nav.playlist_sel.selected(), Some(2));
@@ -1441,15 +1459,14 @@ mod tests {
     }
 
     #[test]
-    fn track_play_cmd_uses_selected_index_and_full_playlist() {
+    fn track_play_sel_reports_cursor_while_playlist_is_open() {
         let playlists = vec![pl("a"), pl("b")];
         let mut nav = nav_at(Some(0));
-        assert!(nav.enter_playlist(2));
+        assert!(nav.enter_playlist(&playlists));
         nav.move_active(2, 2, 0, 0, 5);
-        assert_eq!(nav.track_play_sel(), Some((0, 2)));
-        let (idx, start) = nav.track_play_sel().unwrap();
-        assert_eq!(playlists[idx].id.id, "a");
-        assert_eq!(start, 2);
+        assert_eq!(nav.track_play_sel(), Some(2));
+        // Открыт плейлист под курсором библиотеки, а не индекс в vec.
+        assert_eq!(nav.open_playlist.as_ref().map(|id| id.id.as_str()), Some("a"));
         nav.leave_playlist();
         assert_eq!(nav.track_play_sel(), None);
     }

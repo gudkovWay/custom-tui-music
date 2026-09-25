@@ -182,8 +182,8 @@ impl App {
                 self.play_track(&track).await?;
                 Ok(Payload::Ack(Ack::default()))
             }
-            Cmd::PlayPlaylist { playlist, start } => {
-                self.play_playlist(&playlist, start.unwrap_or(0)).await?;
+            Cmd::PlayPlaylist { playlist, track } => {
+                self.play_playlist(&playlist, track.as_ref()).await?;
                 Ok(Payload::Ack(Ack::default()))
             }
             Cmd::PlayContext { tracks, start } => {
@@ -558,18 +558,12 @@ impl App {
         self.play_known(&current).await
     }
 
-    async fn play_playlist(&self, id: &PlaylistId, start: usize) -> anyhow::Result<()> {
+    async fn play_playlist(&self, id: &PlaylistId, requested: Option<&TrackId>) -> anyhow::Result<()> {
         let mut tracks = self.playlist_tracks(id).await?;
         if tracks.is_empty() {
             anyhow::bail!("плейлист {id} пуст");
         }
-        // Панель шлёт позицию из своего снапшота, а тот мог видеть
-        // больше страниц, чем лежит в свежем срезе кэша: TTL протух
-        // или демон перезапущен, и полное чтение взяло только батч
-        // первых страниц. Догружаем до запрошенной позиции, а не
-        // клампим молча в хвост среза — иначе играет «какой-то трек»,
-        // а не выбранный человеком.
-        while start >= tracks.len() {
+        while requested.is_some_and(|track| !tracks.iter().any(|candidate| &candidate.id == track)) {
             let (page, next) = self.playlist_tracks_page(id).await?;
             if page.is_empty() {
                 break;
@@ -579,12 +573,11 @@ impl App {
                 break;
             }
         }
-        if start >= tracks.len() {
-            anyhow::bail!(
-                "позиция {start} вне плейлиста {id}: загружено {} треков",
-                tracks.len()
-            );
-        }
+        let start = match requested {
+            None => 0,
+            Some(track) => tracks.iter().position(|candidate| &candidate.id == track)
+                .ok_or_else(|| anyhow::anyhow!("трек {track} больше не входит в плейлист {id}"))?,
+        };
         let first = tracks[start].id.clone();
         let len = self
             .player
@@ -598,8 +591,6 @@ impl App {
             })
             .await;
         self.emit(Event::QueueChanged { len, index: Some(start) });
-        // Трек уже поставлен в очередь выше: `play_track` здесь нельзя —
-        // он теперь заменяет очередь однотрековым контекстом.
         self.play_known(&first).await
     }
 
@@ -1259,13 +1250,13 @@ mod tests {
         );
     }
 
-    /// Выбор позиции глубже свежего среза обязан догрузиться до неё, а
-    /// не играть хвост батча: панель шлёт `--start` из снапшота, который
-    /// пережил TTL кэша. Раньше `start.min(len-1)` молча клампил в
+    /// Выбор трека глубже свежего среза обязан догрузиться до него, а
+    /// не играть хвост батча: панель шлёт стабильный TrackId из
+    /// снапшота, который пережил TTL кэша. Раньше позиция клампилась в
     /// последний трек батча — человек выбирал трек на 11-й странице, а
     /// играл последний из первых десяти.
     #[tokio::test]
-    async fn play_playlist_fetches_pages_until_requested_start() {
+    async fn play_playlist_fetches_pages_until_requested_track_found() {
         let (app, provider, _dir) = app_full(false, false).await;
         provider.set_pages((0..11).map(|i| page_of(i, 1)).collect());
         let playlist = PlaylistId::new(ProviderId::YTMUSIC, "LM");
@@ -1274,9 +1265,12 @@ mod tests {
         let slice = app.playlist_tracks(&playlist).await.expect("full read");
         assert_eq!(slice.len(), 10, "свежий срез — только батч");
 
-        app.handle(Cmd::PlayPlaylist { playlist: playlist.clone(), start: Some(10) })
-            .await
-            .expect("play at 10");
+        app.handle(Cmd::PlayPlaylist {
+            playlist: playlist.clone(),
+            track: Some(TrackId::new(ProviderId::YTMUSIC, "v10")),
+        })
+        .await
+        .expect("play v10");
 
         let state = app.player.state().await;
         assert_eq!(
@@ -1288,19 +1282,35 @@ mod tests {
         assert_eq!(state.queue_index, Some(10));
     }
 
-    /// Позиция за пределами реального состава — честная ошибка, а не
-    /// тихий сдвиг на последний трек.
+    /// Запрошенный id исчез из состава (или его не было) — честная
+    /// ошибка, а не тихий сдвиг на другой трек; старая очередь при этом
+    /// не трогается.
     #[tokio::test]
-    async fn play_playlist_rejects_start_beyond_listing() {
+    async fn play_playlist_rejects_missing_track_and_keeps_queue() {
         let (app, provider, _dir) = app_full(false, false).await;
         provider.set_pages((0..3).map(|i| page_of(i, 1)).collect());
         let playlist = PlaylistId::new(ProviderId::YTMUSIC, "LM");
 
-        let err = app
-            .handle(Cmd::PlayPlaylist { playlist: playlist.clone(), start: Some(50) })
+        // Заранее наполняем очередь, чтобы убедиться: провал не мутирует её.
+        app.handle(Cmd::PlayPlaylist { playlist: playlist.clone(), track: None })
             .await
-            .expect_err("позиция вне состава — отказ");
-        assert!(err.to_string().contains("вне плейлиста"), "неожиданная ошибка: {err}");
+            .expect("play whole playlist");
+        let before = app.player.state().await;
+
+        let err = app
+            .handle(Cmd::PlayPlaylist {
+                playlist: playlist.clone(),
+                track: Some(TrackId::new(ProviderId::YTMUSIC, "v99")),
+            })
+            .await
+            .expect_err("трека нет в плейлисте — отказ");
+        assert!(
+            err.to_string().contains("не входит в плейлист"),
+            "неожиданная ошибка: {err}"
+        );
+        let after = app.player.state().await;
+        assert_eq!(after.queue_len, before.queue_len, "очередь обязана остаться прежней");
+        assert_eq!(after.track.as_ref().map(|t| &t.id), before.track.as_ref().map(|t| &t.id), "играющий трек не обязан меняться");
     }
 
     /// Полное чтение с исчерпанием фиксирует «дочитано»: курсор None.

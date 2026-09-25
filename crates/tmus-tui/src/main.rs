@@ -137,18 +137,17 @@ enum CliCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Играть контекст: список составных id "prov:id" через запятую,
-    /// начиная с `--start` (замена очереди целиком).
+    /// Играть контекст: список составных id "prov:id" через запятую.
     PlayContext {
         tracks: String,
         #[arg(long)]
         start: usize,
     },
-    /// Играть плейлист с начала или с `--start`.
+    /// Играть плейлист с начала или с `--track`.
     PlayPlaylist {
         playlist_id: String,
         #[arg(long)]
-        start: Option<usize>,
+        track: Option<String>,
     },
     /// Работа с плейлистами. `pl`, а не `playlist`: подкоманду дергает
     /// сервис плагина noctalia на каждое действие пользователя с
@@ -369,9 +368,9 @@ async fn main() -> Result<()> {
             }
             Cmd::PlayContext { tracks: ids, start }
         }
-        CliCmd::PlayPlaylist { playlist_id, start } => Cmd::PlayPlaylist {
+        CliCmd::PlayPlaylist { playlist_id, track } => Cmd::PlayPlaylist {
             playlist: parse_playlist_id(&playlist_id)?,
-            start: Some(start.unwrap_or(0)),
+            track: track.as_deref().map(parse_track_id).transpose()?,
         },
         CliCmd::Pl(action) => return run_pl(&mut client, action).await,
         CliCmd::Cache(cache) => match cache {

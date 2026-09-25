@@ -54,9 +54,8 @@ pub enum Cmd {
 
     // --- воспроизведение ---
     PlayTrack { track: TrackId },
-    /// Поставить плейлист в очередь целиком; `start` — индекс трека,
-    /// с которого начать.
-    PlayPlaylist { playlist: PlaylistId, start: Option<usize> },
+    /// Поставить плейлист в очередь целиком, начиная с выбранного стабильного id.
+    PlayPlaylist { playlist: PlaylistId, #[serde(default, skip_serializing_if = "Option::is_none")] track: Option<TrackId> },
     /// Играть готовый список треков как новый контекст: очередь
     /// заменяется списком, `start` — индекс трека, с которого начать.
     /// Клиент сам владеет списком (страница поиска, лайк), поэтому
