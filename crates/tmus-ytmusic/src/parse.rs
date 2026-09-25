@@ -219,15 +219,57 @@ fn two_row_result(row: TwoRow) -> Option<SearchResult> {
 /// Треки очереди живут в `playlistPanelVideoRenderer` — и в стартовом
 /// ответе (`playlistPanelRenderer.contents`), и в продолжении
 /// (`singleColumnMusicWatchNextResultContinuationRenderer`): обход
-/// [`renderers`] находит их в обоих. Токен — тот же
-/// `continuationItemRenderer`, что у `browse`. Записи без `videoId`
-/// пропускаются, сырой JSON наружу не выходит.
+/// [`renderers`] находит их в обоих. Токен берётся из
+/// [`radio_continuation`], а не из общего [`continuation_token`]: очередь
+/// кладёт курсор отдельным полем. Записи без `videoId` пропускаются,
+/// сырой JSON наружу не выходит.
 pub(crate) fn radio(page: &Value) -> (Vec<Track>, Option<String>) {
     let tracks = renderers(page, "playlistPanelVideoRenderer")
         .iter()
         .filter_map(|item| track_from_panel(item))
         .collect();
-    (tracks, continuation_token(page))
+    (tracks, radio_continuation(page))
+}
+
+/// Токен продолжения очереди радио.
+///
+/// Канонический курсор лежит в
+/// `playlistPanelRenderer.continuations[*].nextRadioContinuationData.continuation`;
+/// устаревшая форма того же места — `nextContinuationData.continuation`.
+/// Обход [`renderers`] достаёт курсор и из стартового ответа, и из
+/// ответа-продолжения: тот заворачивает очередь в свои рендереры
+/// (`singleColumnMusicWatchNextResultContinuationRenderer` и т.п.), но
+/// само поле не переименовывает.
+///
+/// Общий `continuationItemRenderer` остаётся запасным источником: часть
+/// ответов отдаёт токен только им, и без запасного пути очередь вставала
+/// бы. Пустой токен — как отсутствующий.
+fn radio_continuation(page: &Value) -> Option<String> {
+    renderers(page, "playlistPanelRenderer")
+        .iter()
+        .filter_map(|panel| panel.get("continuations")?.as_array())
+        .flatten()
+        .find_map(queue_cursor)
+        .or_else(|| {
+            renderers(page, "nextRadioContinuationData")
+                .iter()
+                .find_map(|data| non_empty_str(data.get("continuation")))
+        })
+        .map(str::to_owned)
+        .or_else(|| continuation_token(page))
+}
+
+/// Курсор из элемента `continuations` очереди: сначала канонический
+/// `nextRadioContinuationData`, затем устаревший `nextContinuationData`.
+fn queue_cursor(entry: &Value) -> Option<&str> {
+    const KEYS: [&str; 2] = ["nextRadioContinuationData", "nextContinuationData"];
+
+    KEYS.iter().find_map(|key| non_empty_str(entry.get(key)?.get("continuation")))
+}
+
+/// Строка поля, если оно непустое: пустой токен равнозначен отсутствию.
+fn non_empty_str(value: Option<&Value>) -> Option<&str> {
+    value.and_then(Value::as_str).filter(|token| !token.is_empty())
 }
 
 /// «Песня» из `playlistPanelVideoRenderer` — форма очереди `next`.
@@ -353,7 +395,9 @@ pub(crate) fn suggestions(page: &Value) -> Vec<String> {
     found
 }
 
-/// Токен следующей страницы, если сервис её предложил.
+/// Токен следующей страницы, если сервис её предложил: общий
+/// `continuationItemRenderer`, которым пользуются `browse` и `search`.
+/// Очередь радио курсор так не отдаёт — у неё [`radio_continuation`].
 pub(crate) fn continuation_token(page: &Value) -> Option<String> {
     renderers(page, "continuationItemRenderer")
         .iter()

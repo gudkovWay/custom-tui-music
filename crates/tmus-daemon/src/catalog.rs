@@ -702,9 +702,13 @@ impl App {
     /// Точка догрузки из вахтёра: по transitions плеера смотрим, не
     /// подошла ли очередь к хвосту, и в фоне дописываем рекомендации.
     /// Дешёвая проверка под замком; сетевой заход уходит в задачу.
-    pub(crate) async fn maybe_refill_radio(self: &Arc<Self>, queue_len: usize, queue_index: Option<usize>) {
-        let Some(index) = queue_index else { return };
-        if index + Self::RADIO_REFILL_AHEAD < queue_len {
+    /// Порог считается по позициям порядка обхода (курсор очереди), а не
+    /// по индексу в векторе: при shuffle это разные числа, и только
+    /// позиция обхода предсказывает, сколько треков реально осталось
+    /// до конца прослушивания.
+    pub(crate) async fn maybe_refill_radio(self: &Arc<Self>) {
+        let remaining = self.player.with_queue(|q| q.positions_remaining()).await;
+        if remaining > Self::RADIO_REFILL_AHEAD {
             return;
         }
         let job = {
@@ -779,6 +783,16 @@ impl App {
         // Поколение — единственная защита от подмены сессии: два радио
         // по одному сиду различаются номерами, курсор же может совпасть.
         if session.generation != generation {
+            return;
+        }
+        // Пустая страница при живом курсоре: провайдер отдал продолжение
+        // без треков. Ставить такой курсор нельзя — вахтёр через секунду
+        // дочитает следующую пустую страницу, и петля станет вечной.
+        // Поколение исчерпывается, in-flight гасится, очередь и курсор
+        // не трогаются — до кэша и дописывания дело не доходит.
+        if page.tracks.is_empty() {
+            session.exhausted = true;
+            session.refill_in_flight = false;
             return;
         }
         // Принятые треки фильтруются против текущей очереди в момент
