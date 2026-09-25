@@ -15,7 +15,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    CatalogCapabilities, CatalogShelf, EqState, LoopMode, PlaybackStatus, PlaylistId, Rating,
+    CatalogCapabilities, EqState, HomePage, LoopMode, PlaybackStatus, PlaylistId, Rating,
     SearchKind, SearchResult, Track, TrackId,
 };
 
@@ -115,6 +115,16 @@ pub enum Cmd {
     Liked { provider: Option<String> },
     /// Домашняя лента рекомендаций; provider = None — из всех.
     Home { provider: Option<String> },
+    /// Следующая страница домашней ленты по непрозрачному курсору
+    /// демона. `provider` — подсказка-ограничитель; соответствие
+    /// курсора провайдеру хранит демон, и чужой провайдер с чужим
+    /// курсором — ошибка, а не тихая подмена ленты.
+    HomeMore { provider: Option<String>, cursor: String },
+    /// Запустить радио по сид-треку: очередь заменяется сидом плюс
+    /// рекомендациями провайдера сид-трека, докачка идёт по мере
+    /// приближения к хвосту очереди. Провайдер без радио отвечает
+    /// конечным воспроизведением одного трека (фолбэк демона).
+    PlayRadio { track: TrackId },
     /// Поставить оценку треку: провайдер получает лайк/дизлайк, демон
     /// сохраняет её локально и рассылает [`Event::RatingChanged`].
     Rate { track: TrackId, rating: Rating },
@@ -199,10 +209,11 @@ pub enum Payload {
     /// клиент видел `index` вместо `next`).
     TracksPage { tracks: Vec<Track>, next: Option<String> },
     Playlists(Vec<crate::model::Playlist>),
-    // Полка домашней ленты безопасна после Playlists: {title, subtitle,
-    // items} структурно не матчится ни с Results (нет тега kind), ни с
-    // Tracks/Playlists (нет обязательного id), ни с Ratings (не пары).
-    Home(Vec<CatalogShelf>),
+    // Полка домашней ленты безопасна после Playlists: страница —
+    // объект {shelves, next}, структурно не матчится ни с Results
+    // (нет тега kind), ни с Tracks/Playlists (нет обязательного id),
+    // ни с Ratings (не пары), ни с PlaylistCreated (другие ключи).
+    Home(HomePage),
     /// Ответ на `PlaylistCreate`: id нового плейлиста, по которому его
     /// можно сразу пополнять и открывать.
     PlaylistCreated { playlist: PlaylistId },
@@ -326,7 +337,7 @@ pub enum Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ProviderId;
+    use crate::model::{CatalogShelf, ProviderId};
 
     fn line<T: Serialize>(value: &T) -> String {
         serde_json::to_string(value).expect("serialize")
@@ -605,13 +616,17 @@ mod tests {
                 page_url: None,
             })],
         };
-        let response = line(&Response::Ok { id: 31, ok: Payload::Home(vec![shelf.clone()]) });
-        // Фиксируем форму untagged-контракта: полка — объект с ключом title.
-        assert!(response.contains(r#""ok":[{"title""#), "shelf must stay an object: {response}");
+        let response = line(&Response::Ok { id: 31, ok: Payload::Home(HomePage {
+            shelves: vec![shelf],
+            next: Some("FEwhat_to_watch".into()),
+        }) });
+        // Фиксируем форму untagged-контракта: страница — объект с ключом shelves.
+        assert!(response.contains(r#""ok":{"shelves""#), "home page must stay an object: {response}");
         match serde_json::from_str::<Frame>(&response).expect("parse response") {
-            Frame::Response(Response::Ok { id, ok: Payload::Home(shelves) }) => {
+            Frame::Response(Response::Ok { id, ok: Payload::Home(page) }) => {
                 assert_eq!(id, 31);
-                assert_eq!(shelves, vec![shelf]);
+                assert_eq!(page.shelves.len(), 1);
+                assert_eq!(page.next.as_deref(), Some("FEwhat_to_watch"));
             }
             other => panic!("home payload must not degrade to Results/Tracks, got {other:?}"),
         }

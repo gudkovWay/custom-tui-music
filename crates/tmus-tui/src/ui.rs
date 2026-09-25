@@ -1017,22 +1017,10 @@ async fn play_selected(app: &mut App) {
             let Some(sel) = app.nav.search_sel.selected() else { return };
             let Some(&sel) = app.search_view.get(sel) else { return };
             let Some(SearchResult::Track(track)) = app.search_results.get(sel) else { return };
-            let selected = track.id.clone();
-            // Контекстный запуск: Enter играет весь видимый список
-            // результатов (тот же search_view, по которому ходит курсор
-            // и рендер), стартуя с выбранного, — плейлист целиком
-            // заменяется, а не дописывается (решение хозяина).
-            let tracks: Vec<TrackId> = app
-                .search_view
-                .iter()
-                .filter_map(|&i| app.search_results.get(i))
-                .filter_map(|r| match r {
-                    SearchResult::Track(t) => Some(t.id.clone()),
-                    _ => None,
-                })
-                .collect();
-            let start = tracks.iter().position(|id| id == &selected).unwrap_or(0);
-            fire(app, Cmd::PlayContext { tracks, start });
+            // Один трек из поиска — радио по нему: провайдер с радио
+            // достроит очередь рекомендациями, без радио демон играет
+            // сам трек (конечный фолбэк), так что веток не нужно.
+            fire(app, Cmd::PlayRadio { track: track.id.clone() });
         }
     }
 }

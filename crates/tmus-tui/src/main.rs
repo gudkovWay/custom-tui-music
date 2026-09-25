@@ -113,6 +113,18 @@ enum CliCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Следующая страница домашней ленты по непрозрачному курсору
+    /// демона (из ответа `home`); пустой `next` — лента дочитана.
+    HomeMore {
+        cursor: String,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Запустить радио по сид-треку: очередь заменяется сидом плюс
+    /// рекомендациями; провайдер без радио играет один трек.
+    Radio { track: String },
     /// Перейти к треку очереди по индексу (0-базный) и играть.
     QueueGoto { index: usize },
     Loop {
@@ -317,6 +329,15 @@ async fn main() -> Result<()> {
             let provider = resolve_provider(&mut client, provider.as_deref()).await?;
             return print_payload(client.call(Cmd::Home { provider }).await?, json);
         }
+        CliCmd::HomeMore { cursor, provider, json } => {
+            // Курсором владеет демон и он помнит своего провайдера:
+            // сохранённый источник каталога здесь ни при чём, поэтому
+            // разбирается только явный флаг (`all` — «без провайдера»).
+            let provider = provider.as_deref().and_then(parse_provider_flag);
+            let cmd = Cmd::HomeMore { provider, cursor };
+            return print_payload(client.call(cmd).await?, json);
+        }
+        CliCmd::Radio { track } => Cmd::PlayRadio { track: parse_track_id(&track)? },
         CliCmd::Liked { json } => return print_payload(client.call(Cmd::Liked { provider: None }).await?, json),
         CliCmd::Rate { track, rating } => Cmd::Rate {
             track: parse_track_id(&track)?,
@@ -609,7 +630,8 @@ fn format_payload(payload: &Payload) -> String {
             .map(|p| format!("{}: {}", p.id, p.title))
             .collect::<Vec<_>>()
             .join("\n"),
-        Payload::Home(shelves) => shelves
+        Payload::Home(page) => page
+            .shelves
             .iter()
             .map(|shelf| {
                 let head = match &shelf.subtitle {

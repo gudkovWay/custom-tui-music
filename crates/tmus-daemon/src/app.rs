@@ -25,7 +25,7 @@ use tmus_player::Player;
 use tmus_provider::Registry;
 use tokio::sync::broadcast;
 
-use crate::catalog::{resolve_catalog_source, HomeCache};
+use crate::catalog::{resolve_catalog_source, HomeCache, RadioSession};
 use crate::filler;
 
 /// Сколько событий держится в шине для отстающего подписчика.
@@ -55,6 +55,15 @@ pub struct App {
     /// параллельные `Cmd::Home` сливаются в один сетевой заход
     /// (single-flight).
     pub(crate) home_cache: tokio::sync::Mutex<Option<HomeCache>>,
+    /// Активная радио-сессия (`Cmd::PlayRadio`): провайдер, сид, курсор
+    /// догрузки и флаги исчерпания/догрузки. tokio-замок: берётся в
+    /// вахтёре и в обработчиках команд, сетевой заход идёт мимо него.
+    pub(crate) radio: tokio::sync::Mutex<Option<RadioSession>>,
+    /// Поколение радио-сессии: каждый `PlayRadio` берёт следующий номер
+    /// и сравнивает его с сессией после сетевого захода. Ответ первой
+    /// страницы, опоздавший к явной замене контекста, обязан уйти в
+    /// никуда, а не перезаписать новую очередь.
+    pub(crate) radio_generation: std::sync::atomic::AtomicU64,
     /// Сигнал «пора гаситься». Нужен, потому что `Cmd::Shutdown`
     /// приходит из задачи control-socket, а гасить обязан `main`: только
     /// он снимает файл сокета и убивает mpv. Вызов `std::process::exit`
@@ -99,6 +108,8 @@ impl App {
             events,
             catalog_source: std::sync::Mutex::new(catalog_source),
             home_cache: tokio::sync::Mutex::new(None),
+            radio: tokio::sync::Mutex::new(None),
+            radio_generation: std::sync::atomic::AtomicU64::new(0),
             shutdown: tokio::sync::Notify::new(),
             auth_retry: std::sync::Mutex::new(std::collections::HashMap::new()),
             self_arc: std::sync::OnceLock::new(),
@@ -180,6 +191,10 @@ impl App {
 
             Cmd::PlayTrack { track } => {
                 self.play_track(&track).await?;
+                Ok(Payload::Ack(Ack::default()))
+            }
+            Cmd::PlayRadio { track } => {
+                self.play_radio(&track).await?;
                 Ok(Payload::Ack(Ack::default()))
             }
             Cmd::PlayPlaylist { playlist, track } => {
@@ -334,6 +349,9 @@ impl App {
                 Ok(Payload::Ack(Ack::default()))
             }
             Cmd::QueueClear => {
+                // Явная замена контекста: хвост радио к пустой очереди
+                // не прирастает.
+                self.cancel_radio().await;
                 self.player.with_queue(|q| q.clear()).await;
                 self.emit(Event::QueueChanged { len: 0, index: None });
                 Ok(Payload::Ack(Ack::default()))
@@ -408,6 +426,11 @@ impl App {
             Cmd::Home { provider } => {
                 let out = self.home(provider.as_deref()).await?;
                 release_memory(); // FEmusic_home — мегабайтный JSON, та же причина, что у каталожных arm'ов выше
+                Ok(Payload::Home(out))
+            }
+            Cmd::HomeMore { provider, cursor } => {
+                let out = self.home_more(provider.as_deref(), &cursor).await?;
+                release_memory(); // тот же мегабайтный JSON продолжений
                 Ok(Payload::Home(out))
             }
 
@@ -505,7 +528,19 @@ impl App {
     /// поиска жил позицией ~1001 в очереди старого плейлиста — next/prev
     /// продолжали играть старый контекст. Утверждённое решение: любой
     /// поштучный запуск — это новый контекст из одного трека.
-    async fn play_track(&self, id: &TrackId) -> anyhow::Result<()> {
+    pub(crate) async fn play_track(&self, id: &TrackId) -> anyhow::Result<()> {
+        // Любая поштучная замена контекста хоронит радио-сессию: к новой
+        // очереди хвост старого автодополнения прирастать не должен.
+        // (Для фолбэка `PlayRadio` на провайдере без радио сессия уже
+        // снята — повторная отмена безвредна.)
+        self.cancel_radio().await;
+        self.play_track_inner(id).await
+    }
+
+    /// Тело play_track без отмены радио. Отдельно, потому что фолбэк
+    /// радио зовёт его, держа замок радио в руках: inner замок не
+    /// берёт, повторного захвата (и deadlock) не случается.
+    async fn play_track_inner(&self, id: &TrackId) -> anyhow::Result<()> {
         // `Player::state()` берёт текущий трек из очереди по индексу, и
         // без добавления в очередь `tmus play <id>` играл бы «в никуда»:
         // музыка идёт, а `status`, MPRIS и Discord показывают пустоту.
@@ -533,7 +568,7 @@ impl App {
 
     /// Запуск трека, который гарантированно уже в очереди: только
     /// навигация и резолв, очередь не трогаем.
-    async fn play_known(&self, id: &TrackId) -> anyhow::Result<()> {
+    pub(crate) async fn play_known(&self, id: &TrackId) -> anyhow::Result<()> {
         let index = match self.player.with_queue(|q| q.find_index(id)).await {
             Some(index) => index,
             None => anyhow::bail!("трека {id} нет в очереди"),
@@ -546,6 +581,8 @@ impl App {
     /// Контекст из готового списка треков — обобщение `play_playlist`
     /// без чтения плейлиста: список приносит сам клиент.
     async fn play_context(&self, ids: Vec<TrackId>, start: usize) -> anyhow::Result<()> {
+        // Явная замена контекста хоронит радио-сессию.
+        self.cancel_radio().await;
         if ids.is_empty() {
             anyhow::bail!("пустой контекст воспроизведения");
         }
@@ -568,6 +605,8 @@ impl App {
     }
 
     async fn play_playlist(&self, id: &PlaylistId, requested: Option<&TrackId>) -> anyhow::Result<()> {
+        // Явная замена контекста хоронит радио-сессию.
+        self.cancel_radio().await;
         let mut tracks = self.playlist_tracks(id).await?;
         if tracks.is_empty() {
             anyhow::bail!("плейлист {id} пуст");

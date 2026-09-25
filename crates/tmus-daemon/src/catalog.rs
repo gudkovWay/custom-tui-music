@@ -1,8 +1,10 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tmus_core::model::{
-    CatalogShelf, Playlist, PlaylistId, ProviderId, Rating, SearchKind, SearchResult, Track, TrackId,
+    CatalogShelf, HomePage, Playlist, PlaylistId, ProviderId, Rating, SearchKind,
+    SearchResult, Track, TrackId,
 };
 use tmus_core::protocol::{CatalogSource, Event, ProviderView};
 
@@ -26,10 +28,73 @@ const HOME_TTL_SECS: u64 = 600;
 
 /// Снимок домашней ленты с ключом провайдера: повторный `Cmd::Home` с тем
 /// же разрезом в пределах TTL отвечает из кэша, а не из сети.
+///
+/// Курсоры продолжений здесь же: демон выдаёт клиенту собственный
+/// непрозрачный идентификатор (`h0`, `h1`, …) и помнит, какому
+/// провайдеру и какому сырому токену сервиса он соответствует. Сырые
+/// токены агрегата наружу не утекают — по ним нельзя понять, чья это
+/// страница, а клиенту и не нужно: токен провайдера без провайдера
+/// бессмыслен.
 pub(crate) struct HomeCache {
     key: String,
     at: Instant,
-    shelves: Vec<CatalogShelf>,
+    page: HomePage,
+    cursors: HashMap<String, (String, String)>,
+    next_cursor: u64,
+}
+
+/// Слияние страниц домашней ленты: полки с одинаковым заголовком и
+/// подзаголовком склеиваются, карточки-дубликаты (по каноническому id
+/// результата) выбрасываются. Порядок страниц на входе — порядок
+/// Registry, поэтому слияние детерминировано.
+fn merge_home_pages(pages: Vec<HomePage>) -> HomePage {
+    let mut shelves: Vec<CatalogShelf> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut next: Option<String> = None;
+    for page in pages {
+        if next.is_none() {
+            next = page.next;
+        }
+        for shelf in page.shelves {
+            let head = (shelf.title.clone(), shelf.subtitle.clone());
+            let items = shelf
+                .items
+                .into_iter()
+                .filter(|item| seen.insert(search_result_key(item)))
+                .collect::<Vec<_>>();
+            match shelves.iter_mut().find(|existing| {
+                (existing.title.clone(), existing.subtitle.clone()) == head
+            }) {
+                Some(existing) => existing.items.extend(items),
+                None => shelves.push(CatalogShelf { title: head.0, subtitle: head.1, items }),
+            }
+        }
+    }
+    HomePage { shelves, next }
+}
+
+/// Канонический ключ карточки полки: вид результата плюс составной id.
+fn search_result_key(result: &SearchResult) -> String {
+    match result {
+        SearchResult::Track(track) => format!("t:{}", track.id),
+        SearchResult::Playlist(playlist) => format!("p:{}", playlist.id),
+        SearchResult::Artist { provider, id, .. } => format!("a:{}:{id}", provider.as_str()),
+    }
+}
+
+/// Активная радио-сессия. Демон владеет ею целиком: провайдер сида,
+/// сам сид, курсор догрузки и два флага — «дочитано» (курсор кончился
+/// или провайдер отказал; повторов больше не будет) и «догрузка уже
+/// идёт» (вторая параллельная не стартует).
+pub(crate) struct RadioSession {
+    provider: String,
+    seed: TrackId,
+    /// Номер поколения сессии (счётчик `App::radio_generation`):
+    /// опоздавший сетевой ответ отличает свою сессию от сменившей её.
+    generation: u64,
+    continuation: Option<String>,
+    exhausted: bool,
+    refill_in_flight: bool,
 }
 
 /// Кулдаун попыток перечитать cookies браузера: одна на провайдера,
@@ -352,41 +417,61 @@ impl App {
         Ok(out)
     }
 
-    /// Домашняя лента рекомендаций с TTL-кэшем и single-flight.
+    /// Первая страница домашней ленты с TTL-кэшем и single-flight.
     ///
     /// Замок `tokio::sync::Mutex` держится через весь сетевой заход:
     /// параллельные `Cmd::Home` сливаются в один, а не дёргают
     /// InnerTube горсткой. Протухшие полки не отдаём — сервис хранит
     /// прошлую ленту у себя, честная ошибка лучше несвежих советов.
-    pub(crate) async fn home(&self, provider: Option<&str>) -> anyhow::Result<Vec<CatalogShelf>> {
+    ///
+    /// Курсоры продолжений агрегата — собственные идентификаторы
+    /// демона (см. [`HomeCache`]); свежая страница перевыпускает их,
+    /// и старые курсоры честно перестают существовать.
+    pub(crate) async fn home(&self, provider: Option<&str>) -> anyhow::Result<HomePage> {
         let key = provider.unwrap_or("all").to_owned();
         let mut guard = self.home_cache.lock().await;
         if let Some(cached) = guard.as_ref() {
             if cached.key == key && cached.at.elapsed().as_secs() < HOME_TTL_SECS {
-                return Ok(cached.shelves.clone());
+                return Ok(cached.page.clone());
             }
         }
         // Fan-out параллельно (причины те же, что у `search`), но
         // со строгим инвариантом home: полная ошибка любого провайдера
         // роняет весь ответ (кэш пишется только при полном успехе).
+        // Страница едет вместе с id своего провайдера: токен
+        // продолжения обязан остаться приписанным своему хозяину.
         let targets = self.targets(provider)?;
         let results = futures_util::future::join_all(
-            targets
-                .iter()
-                .map(|target| async move { (*target, target.catalog().home().await) }),
+            targets.iter().map(|target| async move {
+                let id = target.id().as_str().to_owned();
+                (id, target.catalog().home_page(None).await)
+            }),
         )
         .await;
-        let mut out = Vec::new();
-        for (target, result) in results {
+        let mut pages = Vec::new();
+        let mut continuation: Option<(String, String)> = None;
+        for (id, result) in results {
             match result {
-                Ok(shelves) => out.extend(shelves),
+                Ok(page) => {
+                    // Первый в порядке Registry токен и становится
+                    // продолжением агрегата: детерминированно и ровно
+                    // один — провайдеров с курсорами может быть несколько.
+                    let mut page = page;
+                    if continuation.is_none() {
+                        if let Some(raw) = page.next.take() {
+                            continuation = Some((id.clone(), raw));
+                        }
+                    }
+                    pages.push(page);
+                }
                 Err(tmus_provider::ProviderError::Unsupported { .. }) => {
                     // Не каждый провайдер умеет домашнюю ленту: это не
                     // сбой, просто полки у него нет.
-                    tracing::debug!(provider = %target.id(), "домашней ленты нет");
+                    tracing::debug!(provider = %id, "домашней ленты нет");
                 }
                 Err(err) => {
-                    tracing::warn!(provider = %target.id(), %err, "домашняя лента не прочиталась");
+                    tracing::warn!(provider = %id, %err, "домашняя лента не прочиталась");
+                    let target = self.targets(Some(&id))?.remove(0);
                     self.report_auth(target, &err);
                     if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
                         self.try_reauth(target).await;
@@ -396,10 +481,315 @@ impl App {
                 }
             }
         }
-        let results: Vec<SearchResult> = out.iter().flat_map(|s| s.items.iter().cloned()).collect();
-        self.remember(&results)?;
-        *guard = Some(HomeCache { key, at: Instant::now(), shelves: out.clone() });
+        let mut page = merge_home_pages(pages);
+        let cards: Vec<SearchResult> =
+            page.shelves.iter().flat_map(|s| s.items.iter().cloned()).collect();
+        self.remember(&cards)?;
+        // Курсоры продолжений перевыпускаются: нумерация продолжается
+        // поверх прошлой, чтобы курсор прошлой ленты не совпал с новым.
+        let mut cursors = HashMap::new();
+        let mut next_cursor = guard.as_ref().map_or(0, |c| c.next_cursor);
+        if let Some((owner, raw)) = continuation {
+            let id = format!("h{next_cursor}");
+            next_cursor += 1;
+            // Курсор указывает на реального провайдера страницы, а не на
+            // ключ разреза агрегата («all» провайдером не является).
+            cursors.insert(id.clone(), (owner, raw));
+            page.next = Some(id);
+        }
+        *guard = Some(HomeCache { key, at: Instant::now(), page: page.clone(), cursors, next_cursor });
+        Ok(page)
+    }
+
+    /// Страница продолжения домашней ленты. Курсор — собственный
+    /// идентификатор демона: он указывает и на провайдера, и на сырой
+    /// токен сервиса. Ответ — обновлённая лента целиком (слияние и
+    /// дедупликация на стороне демона), с курсором следующей страницы,
+    /// если она есть.
+    pub(crate) async fn home_more(
+        &self,
+        provider: Option<&str>,
+        cursor: &str,
+    ) -> anyhow::Result<HomePage> {
+        let mut guard = self.home_cache.lock().await;
+        let Some(cache) = guard.as_mut() else {
+            anyhow::bail!("курсор {cursor} протух — запросите домашнюю ленту заново");
+        };
+        let Some((owner, raw)) = cache.cursors.get(cursor) else {
+            anyhow::bail!("курсор {cursor} протух — запросите домашнюю ленту заново");
+        };
+        if let Some(asked) = provider {
+            if asked != owner {
+                anyhow::bail!("курсор {cursor} принадлежит провайдеру {owner}, а не {asked}");
+            }
+        }
+        let owner = owner.clone();
+        let raw = raw.clone();
+        let target = self.targets(Some(&owner))?.remove(0);
+        let page = match target.catalog().home_page(Some(&raw)).await {
+            Ok(page) => page,
+            Err(tmus_provider::ProviderError::Unsupported { .. }) => {
+                // Провайдер выдал токен сам — «нет продолжения» значит
+                // «дочитано», а не сбой.
+                tracing::debug!(provider = %target.id(), "у домашней ленты нет продолжения");
+                HomePage { shelves: Vec::new(), next: None }
+            }
+            Err(err) => {
+                // Сбой сети — не смерть курсора: отображение и страница
+                // остаются как были, повторный home_more с тем же hN
+                // валиден. Списывание — только на успехе, ниже.
+                tracing::warn!(provider = %target.id(), %err, "продолжение домашней ленты не прочиталось");
+                self.report_auth(target, &err);
+                if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
+                    self.try_reauth(target).await;
+                }
+                return Err(err.into());
+            }
+        };
+        // Страница приехала — старый курсор списан. Дальше в карту
+        // вернётся только свежевыпущенный курсор, старый станет протухшим.
+        cache.cursors.remove(cursor);
+        // В кэше лежит непрозрачный курсор демона (hN), а не сырой токен
+        // провайдера — в слияние он попасть не должен, иначе merge
+        // «продлил» бы его как настоящий. Сливаем ленту с обнулённым
+        // next: значимым токеном будет только свежий от провайдера.
+        let mut previous = cache.page.clone();
+        previous.next = None;
+        let merged = merge_home_pages(vec![previous, page]);
+        let cards: Vec<SearchResult> =
+            merged.shelves.iter().flat_map(|s| s.items.iter().cloned()).collect();
+        self.remember(&cards)?;
+        let mut cursors = std::mem::take(&mut cache.cursors);
+        let next_cursor = cache.next_cursor;
+        let mut out = merged;
+        if let Some(raw) = out.next.take() {
+            let id = format!("h{next_cursor}");
+            cursors.insert(id.clone(), (owner, raw));
+            out.next = Some(id);
+        }
+        cache.page = out.clone();
+        cache.next_cursor = next_cursor + if out.next.is_some() { 1 } else { 0 };
+        cache.cursors = cursors;
         Ok(out)
+    }
+
+    // ────────────────────────────────────────── радио (автодополнение)
+
+    /// На сколько позиций до хвоста очереди начинается догрузка радио:
+    /// к моменту, когда человек дойдёт до рекомендаций, они уже должны
+    /// стоять в очереди, но дёргать сеть за пять треков вперёд рано.
+    const RADIO_REFILL_AHEAD: usize = 2;
+
+    /// Запустить радио по сид-треку. Провайдер без радио (`Unsupported`)
+    /// — не сбой: фолбэк в конечное воспроизведение одного трека, как
+    /// раньше играл `Cmd::PlayTrack`.
+    pub(crate) async fn play_radio(&self, seed: &TrackId) -> anyhow::Result<()> {
+        let provider = self
+            .registry
+            .get(seed.provider)
+            .ok_or_else(|| anyhow::anyhow!("провайдер {} не подключён", seed.provider))?;
+        // Сид hydrate'ится до сессии: `?` здесь не должен оставлять
+        // сессию в подвешенном in-flight.
+        let seed_track = self.hydrate(std::slice::from_ref(seed))?.remove(0);
+        // Поколение берётся до сетевого захода: ответ, приехавший после
+        // явной замены контекста, узнаёт себя по номеру и уходит в
+        // никуда, не трогая новую очередь.
+        let generation = self.radio_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        // Сессия ставится до сетевого захода с in-flight флагом: параллельный
+        // `Cmd::PlayRadio` или преждевременная догрузка не стартуют вторые.
+        *self.radio.lock().await = Some(RadioSession {
+            provider: seed.provider.as_str().to_owned(),
+            seed: seed.clone(),
+            generation,
+            continuation: None,
+            exhausted: false,
+            refill_in_flight: true,
+        });
+        let first = match provider.catalog().radio(seed, None).await {
+            Ok(page) => page,
+            Err(tmus_provider::ProviderError::Unsupported { .. }) => {
+                // Опоздавший запрос (сессию сменили, пока мы ждали) уходит
+                // в никуда: ни сессию чужую не снимает, ни конечный фолбэк
+                // не играет поверх чужой очереди.
+                let mut radio = self.radio.lock().await;
+                if !matches!(radio.as_ref(), Some(session) if session.generation == generation) {
+                    return Ok(());
+                }
+                tracing::debug!(provider = %provider.id(), "радио не поддерживается — конечное воспроизведение");
+                *radio = None;
+                // Фолбэк под тем же замком: новый PlayRadio или явная
+                // замена подождут за ним; inner замок радио не берёт.
+                return self.play_track_inner(seed).await;
+            }
+            Err(err) => {
+                // Ошибка первой страницы: сессию снимаем, только если она
+                // всё ещё наша — чужую (более новую) не трогаем. Проверка
+                // и снятие под одним захватом замка: окно между ними
+                // позволило бы стереть вклинившуюся свежую сессию.
+                {
+                    let mut radio = self.radio.lock().await;
+                    if matches!(radio.as_ref(), Some(session) if session.generation == generation)
+                    {
+                        *radio = None;
+                    }
+                }
+                // Повторять курсор нечего: это была первая страница.
+                tracing::warn!(provider = %provider.id(), %err, "радио не запустилось");
+                self.report_auth(provider, &err);
+                if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
+                    self.try_reauth(provider).await;
+                }
+                return Err(err.into());
+            }
+        };
+        // Сессия могла быть отменена или заменена, пока ехала первая
+        // страница. Замок держим от проверки до конца финализации:
+        // явная замена контекста подождёт нас за этим же замком и
+        // только потом заменит очередь, а не наоборот.
+        let mut radio = self.radio.lock().await;
+        match radio.as_ref() {
+            Some(session) if session.generation == generation => {}
+            _ => return Ok(()),
+        }
+        // Очередь: сид первым, затем рекомендации без дубликатов сида
+        // и между собой.
+        let mut seen: Vec<TrackId> = vec![seed.clone()];
+        let mut tracks = vec![seed_track];
+        for track in first.tracks {
+            if seen.contains(&track.id) {
+                continue;
+            }
+            seen.push(track.id.clone());
+            tracks.push(track);
+        }
+        let len = self
+            .player
+            .with_queue(|q| {
+                q.clear();
+                for track in &tracks {
+                    q.append(track.clone());
+                }
+                q.goto(0);
+                q.len()
+            })
+            .await;
+        self.emit(Event::QueueChanged { len, index: Some(0) });
+        // Собственная замена очереди себя не хоронит: отмена живёт в
+        // явных заменах контекста, а не в мутации очереди.
+        if let Some(session) = radio.as_mut() {
+            session.continuation = first.next.clone();
+            session.exhausted = first.next.is_none();
+            session.refill_in_flight = false;
+        }
+        drop(radio);
+        self.play_known(seed).await
+    }
+
+    /// Точка догрузки из вахтёра: по transitions плеера смотрим, не
+    /// подошла ли очередь к хвосту, и в фоне дописываем рекомендации.
+    /// Дешёвая проверка под замком; сетевой заход уходит в задачу.
+    pub(crate) async fn maybe_refill_radio(self: &Arc<Self>, queue_len: usize, queue_index: Option<usize>) {
+        let Some(index) = queue_index else { return };
+        if index + Self::RADIO_REFILL_AHEAD < queue_len {
+            return;
+        }
+        let job = {
+            let mut radio = self.radio.lock().await;
+            let Some(session) = radio.as_mut() else { return };
+            // Нет сессии, всё дочитано, уже идёт догрузка или догружать
+            // нечем — все четыре случая означают «сейчас ничего не делать»;
+            // in-flight гасит и тугую петлю повторных вызовов вахтёра.
+            if session.exhausted
+                || session.refill_in_flight
+                || session.continuation.is_none()
+            {
+                return;
+            }
+            let cursor = session.continuation.clone().expect("проверено выше");
+            session.refill_in_flight = true;
+            (session.generation, session.provider.clone(), session.seed.clone(), cursor)
+        };
+        tokio::spawn(self.clone().radio_refill(job));
+    }
+
+    /// Фоновая догрузка одной страницы радио. Любой сбой — исчерпание
+    /// сессии: одна и та же страница не retried-ится, а успешная
+    /// догрузка дописывает в хвост без замены очереди.
+    async fn radio_refill(
+        self: Arc<Self>,
+        (generation, provider_name, seed, cursor): (u64, String, TrackId, String),
+    ) {
+        let Some(provider) = self.registry.get_by_str(&provider_name) else {
+            // Провайдер отключился за время сети: сессию снимаем, только
+            // если она всё ещё та, из которой мы ушли.
+            let mut radio = self.radio.lock().await;
+            if matches!(radio.as_ref(), Some(session) if session.generation == generation) {
+                *radio = None;
+            }
+            return;
+        };
+        let page = match provider.catalog().radio(&seed, Some(&cursor)).await {
+            Ok(page) => page,
+            Err(tmus_provider::ProviderError::Unsupported { .. }) => {
+                tracing::debug!(provider = %provider_name, "радио дочитано");
+                let mut radio = self.radio.lock().await;
+                if let Some(session) = radio.as_mut().filter(|s| s.generation == generation) {
+                    session.exhausted = true;
+                    session.refill_in_flight = false;
+                }
+                return;
+            }
+            Err(err) => {
+                // Ограниченный сбой: курсор не повторяем, автодополнение
+                // честно останавливается. Очередь продолжает играть.
+                tracing::warn!(provider = %provider_name, %err, "догрузка радио не удалась — автодополнение остановлено");
+                self.report_auth(provider, &err);
+                if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
+                    self.try_reauth(provider).await;
+                }
+                let mut radio = self.radio.lock().await;
+                if let Some(session) = radio.as_mut().filter(|s| s.generation == generation) {
+                    session.exhausted = true;
+                    session.refill_in_flight = false;
+                }
+                return;
+            }
+        };
+        // Дедупликация против текущей очереди — в момент записи, а не
+        // до сетевого захода: пока страница ехала, очередь могла
+        // измениться. Под тем же замком проверяем, что сессия — та же
+        // (курсор совпадает): за время сети человек мог запустить
+        // другой контекст, и чужой хвост в новую очередь писать нельзя.
+        let mut radio = self.radio.lock().await;
+        let Some(session) = radio.as_mut() else { return };
+        // Поколение — единственная защита от подмены сессии: два радио
+        // по одному сиду различаются номерами, курсор же может совпасть.
+        if session.generation != generation {
+            return;
+        }
+        let (len, index) = self
+            .player
+            .with_queue(|q| {
+                for track in page.tracks {
+                    if q.find_index(&track.id).is_some() {
+                        continue;
+                    }
+                    q.append(track);
+                }
+                (q.len(), q.current_index())
+            })
+            .await;
+        self.emit(Event::QueueChanged { len, index });
+        session.continuation = page.next.clone();
+        session.exhausted = page.next.is_none();
+        session.refill_in_flight = false;
+    }
+
+    /// Отмена радио-сессии: явная замена контекста (`PlayTrack`,
+    /// `PlayPlaylist`, `PlayContext`, `QueueClear`) хоронит сессию,
+    /// чтобы хвост старого радио не прирастал к новой очереди.
+    pub(crate) async fn cancel_radio(&self) {
+        *self.radio.lock().await = None;
     }
 
     /// Поставить оценку треку: локально сразу, у провайдера — зеркало.
