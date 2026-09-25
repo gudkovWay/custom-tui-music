@@ -875,9 +875,16 @@ impl App {
             self.with_cache(|c| c.forget_playlist_sync(&liked_playlist))?;
         }
         // Локальные треки зеркалить некуда: отметка только локальная.
-        let Some(provider) = self.registry.get(id.provider) else {
+        // Удалённому треку провайдер обязателен: без реестра зеркалить
+        // некому, и это видимая ошибка — локальная отметка выше уже
+        // сохранена и не откатывается.
+        if id.provider == ProviderId::LOCAL {
             return Ok(());
-        };
+        }
+        let provider = self
+            .registry
+            .get(id.provider)
+            .ok_or_else(|| anyhow::anyhow!("провайдер {} не подключён", id.provider))?;
         match provider.catalog().rate(id, rating).await {
             Ok(()) => Ok(()),
             Err(tmus_provider::ProviderError::Unsupported { .. }) => {
