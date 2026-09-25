@@ -355,13 +355,28 @@ pub(crate) fn suggestions(page: &Value) -> Vec<String> {
 
 /// Токен следующей страницы, если сервис её предложил.
 pub(crate) fn continuation_token(page: &Value) -> Option<String> {
-    renderers(page, "continuationItemRenderer")
-        .iter()
-        .find_map(|item| {
-            item.pointer("/continuationEndpoint/continuationCommand/token")
-                .and_then(Value::as_str)
-        })
+    nested_string(page, "continuationCommand", "token")
+        .or_else(|| nested_string(page, "nextContinuationData", "continuation"))
+        .or_else(|| nested_string(page, "reloadContinuationData", "continuation"))
         .map(str::to_owned)
+}
+
+/// Первая строка `field` внутри объекта с ключом `name` на любой глубине.
+///
+/// Формы continuation у InnerTube встречаются в разных обёртках, поэтому
+/// привязка к `continuationItemRenderer` теряет валидные токены.
+fn nested_string<'a>(value: &'a Value, name: &str, field: &str) -> Option<&'a str> {
+    match value {
+        Value::Object(map) => map
+            .get(name)
+            .and_then(|node| node.get(field))
+            .and_then(Value::as_str)
+            .or_else(|| map.values().find_map(|child| nested_string(child, name, field))),
+        Value::Array(items) => {
+            items.iter().find_map(|item| nested_string(item, name, field))
+        }
+        _ => None,
+    }
 }
 
 /// Все renderer'ы с этим именем ключа на любой глубине ответа.
