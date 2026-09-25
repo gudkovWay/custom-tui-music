@@ -37,14 +37,15 @@ height = 760
 # латиница приходит одним аккордом в верхнем регистре (сглаживает хост).
 # Tab/ctrl+l/h = переключение буферов 2↔3 (центральный список ↔
 # очередь); кириллические двойники — физические L/H = д/р на ЙЦУКЕН.
-# ctrl+BackSpace = удалить слово в поиске. «?» (question) — модал
+# ctrl+BackSpace = удалить слово в поиске. Home/End/Delete — курсор
+# поисковой строки (границы/удаление справа). «?» (question) — модал
 # подсказок; keysym один в обеих раскладках (ЙЦУКЕН — Shift+7).
 # Имена по канону xkb: голые «</» хост отвергает весь плагин — только
 # канонические кейсимы.
 capture_keys = [
   "Left", "Right", "Up", "Down", "Return", "Escape", "Space", "slash",
   "period", "comma", "minus", "apostrophe", "BackSpace", "less", "greater",
-  "question", "Shift+question",
+  "question", "Shift+question", "Home", "End", "Delete",
   "ctrl+j", "ctrl+k", "ctrl+Cyrillic_o", "ctrl+Cyrillic_el",
   "Tab", "ctrl+l", "ctrl+h", "ctrl+Cyrillic_de", "ctrl+Cyrillic_er",
   "ctrl+BackSpace",
