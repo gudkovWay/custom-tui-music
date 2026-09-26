@@ -601,7 +601,13 @@ impl App {
             })
             .await;
         self.emit(Event::QueueChanged { len, index: Some(start) });
-        self.play_known(&current).await
+        // Резолв и запуск — напрямую, а не через `play_known`: тот ищет
+        // трек в очереди по id (`find_index`) и переводит курсор на
+        // первое совпадение, из-за чего при дублях в контексте старт
+        // уезжал с выбранного вхождения на более раннее. Курсор уже
+        // выставлен `goto(start)` выше.
+        self.player.resolve_and_play(&current).await?;
+        Ok(())
     }
 
     async fn play_playlist(&self, id: &PlaylistId, requested: Option<&TrackId>) -> anyhow::Result<()> {
