@@ -963,14 +963,15 @@ local function trackRow(i, t, opts)
     onClick = function()
       cursor = i
       selected = o
-      if o.event then
-        -- Клик по треку поиска — тот же контекстный запуск, что и
-        -- Enter (activate), иначе клик и клавиша играют по-разному.
-        if view == "search" and o.kind == "track" then
-          activate(o)
-        else
-          poke(o.event, o.payload)
-        end
+      -- Клик по треку поиска — тот же контекстный запуск, что и Enter
+      -- (activate), иначе клик и клавиша играют по-разному. Решение и
+      -- данные берём из самой строки rows() (t): в opts нет ни kind,
+      -- ни id, поэтому прежняя проверка o.kind/o.id не срабатывала и
+      -- клик уходил одиночным радио мимо контекста.
+      if view == "search" and t ~= nil and t.kind == "track" then
+        activate(t, i)
+      elseif o.event then
+        poke(o.event, o.payload)
       end
       draw()
     end,
@@ -989,8 +990,8 @@ local function resultRow(r)
   }
   if kind == "track" then
     row.rating = ratingOf(snapshot, row.id)
-    -- Одиночная активация трека поиска — радио (`tmus radio`), не
-    -- play: контекст создаёт сам демон.
+    -- event/payload — одиночный фолбэк для activate: основной путь —
+    -- контекст всей видимой выдачи через play-context (contextPayload).
     row.event = "radio"
     row.payload = idOf(r)
   elseif kind == "playlist" then
@@ -1260,10 +1261,11 @@ local function homeMoveX(dx)
   return true
 end
 
--- Одиночная активация трека (поиск, home) — радио: демон сам строит
--- контекст (`tmus radio <prov:id>`). Контекстные жесты (плейлист,
+-- Активация карточки home: трек — радио (`tmus radio <prov:id>`): демон
+-- сам строит контекст рекомендациями. Контекстные жесты (плейлист,
 -- альбом) сохраняют прежнюю семантику: плейлист открывается/играется
--- целиком (PlayPlaylist), его треки — с --track.
+-- целиком (PlayPlaylist), его треки — с --track. Треки выдачи поиска
+-- контекстны и идут не сюда, а через activate (см. contextPayload).
 local function homeActivate()
   local shelf = homeShelves()[homeShelf]
   local c = shelf and shelf.cards[homeItem]
@@ -1279,7 +1281,31 @@ local function homeActivate()
   end
 end
 
-function activate(row)
+-- Payload контекстного запуска "<start>|<id1>,<id2>,...": треки из
+-- items (порядок отображения) без пустых id, start — 0-базный номер
+-- активной строки среди этих треков. Активная строка не трек, треков
+-- нет или строка вне items — nil, вызывающий падает назад на одиночный
+-- запуск строки.
+local function contextPayload(activePos, items)
+  local ids, start = {}, nil
+  for pos, it in ipairs(items) do
+    if it.kind == "track" and it.id ~= nil and it.id ~= "" then
+      if pos == activePos then
+        start = #ids
+      end
+      table.insert(ids, it.id)
+    end
+  end
+  if start == nil or #ids == 0 then
+    return nil
+  end
+  return tostring(start) .. "|" .. table.concat(ids, ",")
+end
+
+-- Активация строки списка клавишей или кликом. `pos` — номер строки в
+-- rows() (для Enter — cursor, для клика — индекс нажатой строки): по
+-- нему считается контекстный старт поиска.
+function activate(row, pos)
   if row == nil then
     return
   end
@@ -1297,6 +1323,19 @@ function activate(row)
   end
   if row.open then
     openPlaylist(row)
+  elseif row.event == "radio" then
+    -- Трек-строка поиска (event "radio" ставят только треки выдачи):
+    -- играем контекст всей видимой выдачи в порядке rows(), старт — с
+    -- активированной строки. Старт считается по номеру строки (pos), а
+    -- не по совпадению id: на дублях в выдаче поиск по id взял бы
+    -- первое вхождение и запустил бы не ту строку. Контекст не собрался
+    -- (нет позиции, строка вне rows()) — одиночное радио строки.
+    local payload = view == "search" and pos ~= nil and contextPayload(pos, rows()) or nil
+    if payload then
+      poke("play-context", payload)
+    else
+      poke(row.event, row.payload)
+    end
   elseif row.event then
     poke(row.event, row.payload)
   end
@@ -1576,7 +1615,7 @@ local function listChildren(slice, first)
         fill = (i == cursor or row.active) and COLORS.selected or COLORS.surface,
         onClick = function()
           cursor = i
-          activate(row)
+          activate(row, i)
           draw()
         end,
       }, {
@@ -2749,7 +2788,7 @@ function onKey(chord, pressed)
         if query ~= "" and query ~= lastSearched then
           doSearch()
         else
-          activate(rows()[cursor])
+          activate(rows()[cursor], cursor)
         end
         typing = false
         queryCursor = charCount(query)
@@ -2798,7 +2837,7 @@ function onKey(chord, pressed)
       end
     else
       if chord == "Return" then
-        activate(rows()[cursor])
+        activate(rows()[cursor], cursor)
         -- Активация выводит в normal (витрина не должна врать):
         -- возврат в insert — только i/slash/period ниже.
         typing = false
@@ -2903,11 +2942,11 @@ function onKey(chord, pressed)
     if view == "home" and focusBuf == 2 then
       homeActivate()
     else
-      activate(rows()[cursor])
+      activate(rows()[cursor], cursor)
     end
   elseif chord == "Space" then
     if view == "playlist" or view == "eq" then
-      activate(rows()[cursor])
+      activate(rows()[cursor], cursor)
     else
       poke("toggle")
     end
