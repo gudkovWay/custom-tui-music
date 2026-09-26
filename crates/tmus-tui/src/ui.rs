@@ -1046,13 +1046,35 @@ async fn play_selected(app: &mut App) {
             }
         }
         Panel::Search => {
-            let Some(sel) = app.nav.search_sel.selected() else { return };
-            let Some(&sel) = app.search_view.get(sel) else { return };
-            let Some(SearchResult::Track(track)) = app.search_results.get(sel) else { return };
-            // Один трек из поиска — радио по нему: провайдер с радио
-            // достроит очередь рекомендациями, без радио демон играет
-            // сам трек (конечный фолбэк), так что веток не нужно.
-            fire(app, Cmd::PlayRadio { track: track.id.clone() });
+            let Some(cursor) = app.nav.search_sel.selected() else { return };
+            let Some(&sel) = app.search_view.get(cursor) else { return };
+            // Выбранная строка не трек (плейлист/артист в выдаче) — цели
+            // запуска нет; для трека старт гарантированно найдётся ниже.
+            if !matches!(app.search_results.get(sel), Some(SearchResult::Track(_))) {
+                return;
+            }
+            // В очередь уходит вся видимая выдача: только треки-результаты
+            // в порядке показа (плейлисты и артисты отсеиваются).
+            let tracks: Vec<TrackId> = app
+                .search_view
+                .iter()
+                .filter_map(|&i| app.search_results.get(i))
+                .filter_map(|r| match r {
+                    SearchResult::Track(t) => Some(t.id.clone()),
+                    _ => None,
+                })
+                .collect();
+            // Старт — позиция выбранной строки среди этих треков, то есть
+            // число трек-строк выше курсора в видимой выдаче. Поиск по
+            // совпадению TrackId вернул бы первое вхождение и на дублях
+            // запустил бы не ту строку, на которой стоит курсор.
+            let mut start = 0;
+            for &i in &app.search_view[..cursor] {
+                if matches!(app.search_results.get(i), Some(SearchResult::Track(_))) {
+                    start += 1;
+                }
+            }
+            fire(app, Cmd::PlayContext { tracks, start });
         }
     }
 }

@@ -611,7 +611,21 @@ impl Player {
         let current = self.inner.current.lock().await;
         let pending = self.inner.pending.lock().await.clone();
         let shown = pending.as_ref().or(current.as_ref().map(|c| &c.track_id));
-        let index = shown.and_then(|id| queue.find_index(id));
+        // Дубликаты: `find_index` вернул бы ПЕРВОЕ вхождение и опубликовал бы
+        // не тот слот очереди. Если курсор очереди указывает на показываемый
+        // трек, берём именно его — так второе вхождение остаётся текущим.
+        // При переходном расхождении (pending ещё не совпал с current)
+        // сохраняем прежний ID-поиск.
+        let index = match shown {
+            None => None,
+            Some(id) => match queue
+                .current_index()
+                .filter(|&i| queue.track_at(i).map(|t| &t.id) == Some(id))
+            {
+                Some(i) => Some(i),
+                None => queue.find_index(id),
+            },
+        };
         let track = index.and_then(|i| queue.track_at(i)).cloned();
         let offline = current
             .as_ref()
