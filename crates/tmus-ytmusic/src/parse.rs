@@ -761,15 +761,20 @@ fn two_row(item: &Value) -> Option<TwoRow> {
             )
             .and_then(Value::as_str)
             .map(str::to_owned),
-        audio_playlist_id: item
-            .pointer(
-                "/thumbnailOverlay/musicItemThumbnailOverlayRenderer/content\
-                 /musicPlayButtonRenderer/playNavigationEndpoint\
-                 /watchPlaylistEndpoint/playlistId",
-            )
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        audio_playlist_id: audio_playlist_id(item),
     })
+}
+
+fn audio_playlist_id(item: &Value) -> Option<String> {
+    let endpoint = item.pointer(
+        "/thumbnailOverlay/musicItemThumbnailOverlayRenderer/content\
+         /musicPlayButtonRenderer/playNavigationEndpoint",
+    )?;
+    ["/watchPlaylistEndpoint/playlistId", "/watchEndpoint/playlistId"]
+        .iter()
+        .find_map(|path| endpoint.pointer(path).and_then(Value::as_str)
+            .filter(|id| !id.is_empty()))
+        .map(str::to_owned)
 }
 
 /// pageType browse-эндпоинта responsive-записи. Единственный надёжный
@@ -805,14 +810,7 @@ fn responsive_row(item: &Value) -> Option<TwoRow> {
             .unwrap_or_default()
             .to_owned(),
         page_type: responsive_page_type(item),
-        audio_playlist_id: item
-            .pointer(
-                "/thumbnailOverlay/musicItemThumbnailOverlayRenderer/content\
-                 /musicPlayButtonRenderer/playNavigationEndpoint\
-                 /watchPlaylistEndpoint/playlistId",
-            )
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        audio_playlist_id: audio_playlist_id(item),
     })
 }
 
@@ -1194,6 +1192,38 @@ mod tests {
                 "contents": items
             }
         })
+    }
+
+    #[test]
+    fn home_album_uses_current_play_endpoint() {
+        let mut album = two_row_album();
+        album["musicTwoRowItemRenderer"]["thumbnailOverlay"]
+            ["musicItemThumbnailOverlayRenderer"]["content"]["musicPlayButtonRenderer"]
+            ["playNavigationEndpoint"] = json!({ "watchEndpoint": {
+                "videoId": "album-song", "playlistId": "OLAK5uy_album"
+            } });
+        let page = json!({ "contents": [carousel("New releases", None, json!([album]))] });
+        let shelves = home(&page);
+        let SearchResult::Playlist(album) = &shelves[0].items[0] else {
+            panic!("expected playable album");
+        };
+        assert_eq!(album.id.id, "OLAK5uy_album");
+        assert_eq!(album.title, "Альбом");
+    }
+
+    #[test]
+    fn home_album_without_playable_id_keeps_valid_neighbors() {
+        let mut album = two_row_album();
+        album["musicTwoRowItemRenderer"]["thumbnailOverlay"] = Value::Null;
+        let page = json!({ "contents": [
+            carousel("Mixed", None, json!([album, two_row_playlist()]))
+        ] });
+        let shelves = home(&page);
+        let ids: Vec<_> = shelves[0].items.iter().map(|item| match item {
+            SearchResult::Playlist(playlist) => playlist.id.id.as_str(),
+            _ => panic!("expected playlist"),
+        }).collect();
+        assert_eq!(ids, ["PLhome1"]);
     }
 
     #[test]
