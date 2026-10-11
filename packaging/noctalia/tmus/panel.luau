@@ -3,6 +3,12 @@
 local KEY = "tmus"
 local SERVICE = "q/tmus:watch"
 
+-- Общий скин десктопа: модуль и skin-assets кладутся рядом с плагином
+-- при деплое (раскладку ведёт оркестратор). Свой модуль НЕ заводим —
+-- контракт один на все панели, иначе скины разъедутся. Локальный
+-- require требует plugin_api >= 22; у плагина 24.
+local skin = require('./desktop_skin.luau')
+
 -- Цвета — ИМЕНА РОЛЕЙ палитры хоста, а не hex: хост сам резолвит их в
 -- актуальный Material-цвет, поэтому смена темы/обоев перекрашивает
 -- панель без правок плагина. Роли проверены живой пробой 19.09;
@@ -35,11 +41,51 @@ local COLORS = {
   accent = "primary",
   -- Зарезервировано под будущие ошибки (срыв потока, отказ демона).
   error = "error",
+  -- Тёплый графит хрома (шапка, сайдбар): карточки контента остаются на
+  -- surface, чтобы рабочая область читалась как содержимое, а не как
+  -- ещё одна плашка. Роль с альфой — из проверенно рендерящихся.
+  chrome = "surface_variant/0.55",
 }
-local FONT = "Agave Nerd Font"
+-- UI-текст — sans скина (Noto Sans); MONO (Agave Nerd Font) остаётся
+-- глифам и числовым метаданным: тайминги, счётчики, индексы, полосы eq,
+-- индикатор окна. Кириллица есть и там, и там (Noto Sans CJK — фолбэк
+-- хоста), поэтому переносов и «тофу» не будет.
+local FONT = skin.FONT
 local RAIL = 64
 local GAP = 12
 local PAD = 16
+-- ── Геометрия панели и бюджет окон ──────────────────────────────────
+-- Панель 1180×760 (plugin.toml). Рамка скина резервирует skin.EDGE=12 px
+-- с КАЖДОЙ стороны прямо в потоке, т.е. забирает 2*EDGE=24 px по каждой
+-- оси; сверх этого идут собственный отступ (PAD), шапка (26), футер (16)
+-- и транспортная карточка (110). Бюджеты ниже ВЫВЕДЕНЫ из этой
+-- геометрии, а не назначены: окно рендерит ровно столько строк и
+-- карточек, сколько влезает в реальный вьюпорт. Раньше константы были
+-- «на глаз» — и, например, бюджет горизонтального окна home-полки не
+-- сходился с реальной шириной центрального столба, т.е. курсор мог
+-- уехать на невидимую карточку.
+-- Производные живут полями одной таблицы GEO: у главного чанка жёсткий
+-- лимит локальных имён, каждая новая константа занята до конца файла.
+local GEO = {
+  pad = PAD,
+  ring = skin.EDGE * 2,
+  header = 26,
+  footer = 16,
+  -- Транспорт (np-карточка): паддинг 12×2 + арт-строка 48 + спектр 18 +
+  -- прогресс 4 + два зазора по 8. Последний ребёнок workspace в каждом виде.
+  transport = 110,
+  panelW = 1180,
+  panelH = 760,
+}
+-- Тело: панель минус рамка, отступы, шапка, футер и два зазора.
+GEO.bodyH = GEO.panelH - GEO.ring - 2 * GEO.pad - GEO.header - GEO.footer - 2 * GAP
+-- Бюджет центрального вида: тело минус транспортная карточка и зазор.
+GEO.viewH = GEO.bodyH - (GEO.transport + GAP)
+GEO.bodyW = GEO.panelW - GEO.ring - 2 * GEO.pad
+-- Workspace:context = 7:3 (см. draw) — ширина центрального вида, от неё
+-- считается горизонтальное окно home-полки.
+GEO.workspaceW = math.floor((GEO.bodyW - (RAIL + GAP) - GAP) * 7 / 10)
+
 -- Геометрия строк: ОДИН источник на поверхность — высота строки,
 -- зазор и бюджет вьюпорта; видимое логическое окно ВЫВОДИТСЯ из них,
 -- а не назначается вручную. Фиксированная высота ряда не даёт
@@ -49,7 +95,10 @@ local PAD = 16
 -- (у клиентских строк padding=12 — 44 тоже безопасный минимум).
 local TRACK_ROW_HEIGHT = 44
 local TRACK_ROW_GAP = 6
-local TRACK_VIEWPORT_HEIGHT = 420
+-- Над списком в каждом виде стоит заголовок вида (24) и зазор; у поиска
+-- сверх этого — строка ввода (34) и ряд чипов (28) — его окно меньше,
+-- и считается прямо в windowSize().
+local TRACK_VIEWPORT_HEIGHT = GEO.viewH - (24 + GAP)
 local LIST_WINDOW = math.floor((TRACK_VIEWPORT_HEIGHT + TRACK_ROW_GAP)
   / (TRACK_ROW_HEIGHT + TRACK_ROW_GAP))
 -- Сетка Library: карточка = арт 120 + паддинг 24 + две подписи ≈ 200 px.
@@ -57,34 +106,34 @@ local LIST_WINDOW = math.floor((TRACK_VIEWPORT_HEIGHT + TRACK_ROW_GAP)
 local GRID_COLS = 4
 local CARD_ROW_HEIGHT = 200
 local CARD_ROW_GAP = GAP
-local CARD_VIEWPORT_HEIGHT = 420
+local CARD_VIEWPORT_HEIGHT = GEO.viewH - (24 + GAP)
 local CARD_WINDOW = GRID_COLS * math.floor((CARD_VIEWPORT_HEIGHT + CARD_ROW_GAP)
   / (CARD_ROW_HEIGHT + CARD_ROW_GAP))
 -- Окно очереди обязано ВЛЕЗАТЬ в бюджет context-колонки целиком:
 -- declarative UI не даёт scrollToIndex, «скролл» — это движущееся окно
 -- строк, и контент ниже вьюпорта недостижим с клавиатуры. Замер §17
 -- показал, что 15 строк со зазором 12 срезались снизу (панель
--- 1180×760, бюджет context ≈669 px, фидбек 21.09). Зазор ужат до
--- 4 px — выведенное окно 14 строк ≈560 px входит с запасом.
+-- 1180×760, фидбек 21.09). Зазор ужат до 4 px, и бюджет выведен: колонка
+-- = тело минус собственный паддинг (PAD×2), заголовок очереди (20) и
+-- зазор до скролла.
 local QUEUE_ROW_HEIGHT = 36
 local QUEUE_ROW_GAP = 4
-local QUEUE_VIEWPORT_HEIGHT = 560
+local QUEUE_VIEWPORT_HEIGHT = GEO.bodyH - 2 * GEO.pad - (20 + GAP)
 local QUEUE_WINDOW = math.floor((QUEUE_VIEWPORT_HEIGHT + QUEUE_ROW_GAP)
   / (QUEUE_ROW_HEIGHT + QUEUE_ROW_GAP))
 local NP_SPEC_BARS = 56
 -- Home-лента рекомендаций: видимых полок по Y и карточек в
 -- горизонтальном окне полки — окна выводятся из геометрии, как везде.
--- Полка ≈ заголовок 20 + арт 110 + паддинг 16 + подписи ≈64 → 210 px.
--- Центральный столб после rail, context и разделения 7:3 даёт около
--- 740 px, а не полную ширину панели: бюджет 720 px держит четыре
--- карточки по 150 px с зазорами. Модель хранит всю полку для
--- навигации, а рендер — только видимое окно HOME_CARD_WINDOW.
+-- Полка ≈ заголовок 20 + арт 110 + паддинг 16 + подписи ≈64 → 210 px;
+-- ряд карточек шириной 150 живёт в центральном столбе (GEO.workspaceW).
+-- Модель хранит всю полку для навигации; рендер — только видимое окно.
+-- Над полками — хиро (64 + GAP) и управление Refresh (28 + 8).
 local HOME_SHELF_HEIGHT = 210
-local HOME_SHELF_VIEWPORT_HEIGHT = 450
+local HOME_SHELF_VIEWPORT_HEIGHT = GEO.viewH - (64 + GAP) - (28 + 8)
 local SHELF_WINDOW = math.floor((HOME_SHELF_VIEWPORT_HEIGHT + GAP)
   / (HOME_SHELF_HEIGHT + GAP))
 local HOME_CARD_WIDTH = 150
-local HOME_CARDS_VIEWPORT_WIDTH = 720
+local HOME_CARDS_VIEWPORT_WIDTH = GEO.workspaceW
 local HOME_CARD_WINDOW = math.floor((HOME_CARDS_VIEWPORT_WIDTH + GAP)
   / (HOME_CARD_WIDTH + GAP))
 
@@ -674,7 +723,9 @@ local function lbl(text, props)
     text = text,
     color = p.color or COLORS.text,
     fontSize = p.size,
-    fontFamily = FONT,
+    -- p.mono — числовые метаданные и знаки (▶ ♥ ◄ ► ▌ ×1 ∞): эти
+    -- код-поинты гарантированно есть в Agave Nerd Font (skin.MONO).
+    fontFamily = p.mono and skin.MONO or FONT,
     flexGrow = p.grow,
     width = p.width,
     maxWidth = p.maxWidth,
@@ -852,6 +903,7 @@ local function npNode(s)
         key = "np-repeat-short",
         size = 11,
         color = COLORS.muted,
+        fontFamily = skin.MONO,
       }))
     end
     table.insert(controls, volumeNode(s))
@@ -873,6 +925,7 @@ local function npNode(s)
         key = "np-time",
         size = 12,
         color = COLORS.muted,
+        mono = true,
       }),
       ui.row({ key = "np-controls", gap = 6, align = "center" }, controls),
     }))
@@ -932,6 +985,7 @@ local function trackRow(i, t, opts)
       lbl(current and "▶" or (o.index or tostring(i)), {
         key = "idx" .. i,
         color = current and COLORS.accent or COLORS.muted,
+        mono = true,
       }),
     }),
     artNode(o.art, 32),
@@ -942,7 +996,7 @@ local function trackRow(i, t, opts)
       color = current and COLORS.accent or (active and COLORS.text or COLORS.muted),
     }),
     lbl(shorten(o.subtitle, 32), { key = "sub" .. i, color = COLORS.muted, maxWidth = 220 }),
-    lbl(o.time or "", { key = "time" .. i, color = COLORS.muted, width = 56 }),
+    lbl(o.time or "", { key = "time" .. i, color = COLORS.muted, width = 56, mono = true }),
   }
   return ui.row({
     key = "track" .. i,
@@ -1149,7 +1203,16 @@ function rows()
 end
 
 local function windowSize()
-  return view == "library" and CARD_WINDOW or LIST_WINDOW
+  if view == "library" then
+    return CARD_WINDOW
+  elseif view == "search" then
+    -- У поиска над списком ещё строка ввода (34) и ряд чипов (28) со
+    -- своими зазорами — окно меньше, чем у прочих списков. Считается
+    -- здесь же: отдельное имя на весь чанк не заводим (лимит локалов).
+    return math.floor((GEO.viewH - (34 + 28 + 2 * GAP) + TRACK_ROW_GAP)
+      / (TRACK_ROW_HEIGHT + TRACK_ROW_GAP))
+  end
+  return LIST_WINDOW
 end
 
 -- Общая арифметика окна списка: держит курсор в границах, окно —
@@ -1502,7 +1565,7 @@ local function railNode()
       gap = 2,
       align = "center",
       paddingV = 8,
-      radius = 6,
+      radius = 8,
       fill = active and COLORS.selected or COLORS.surface,
     }, {
         ui.glyph({ key = "rail-glyph-" .. v.id, name = v.glyph, size = 16, color = active and COLORS.accent or COLORS.muted }),
@@ -1514,10 +1577,72 @@ local function railNode()
     width = RAIL,
     gap = 8,
     paddingV = PAD,
-    fill = COLORS.surface,
-    radius = 10,
+    fill = COLORS.chrome,
+    radius = 12,
     align = "center",
   }, items)
+end
+
+-- Шапка панели: знак скина, имя плагина и активный вид слева; краткая
+-- сводка играющего и состояние связи справа. Сводка ТОЛЬКО читающая:
+-- кнопки, прогресс и спектр живут в транспортной карточке (npNode)
+-- внизу workspace — дублировать управление нельзя, разъедется состояние.
+local function headerNode(s)
+  local current = VIEWS[VIEW_IDS[view] or 0]
+  local title = (view == "playlist" and playlistTitle ~= "") and playlistTitle
+    or (current and current.title or tostring(view))
+  local hasTrack = s.linked and (s.title or "") ~= ""
+  local summary
+  if hasTrack then
+    local artists = tostring(s.artist or "")
+    summary = artists ~= "" and (artists .. " — " .. tostring(s.title or "")) or tostring(s.title or "")
+  elseif s.linked then
+    summary = "Nothing playing"
+  else
+    summary = "tmusd is not responding"
+  end
+  local stateText
+  if not s.linked then
+    stateText = "нет связи"
+  elseif hasTrack then
+    stateText = s.status == "playing" and "играет" or (s.status == "paused" and "пауза" or "стоп")
+  else
+    stateText = "простой"
+  end
+  return ui.row({
+    key = "header",
+    height = GEO.header,
+    gap = 10,
+    paddingH = PAD,
+    radius = GEO.header // 2,
+    align = "center",
+    fill = COLORS.chrome,
+  }, {
+    ui.image({
+      key = "brand-mark",
+      path = "skin-assets/emblem.png",
+      width = 18,
+      height = 18,
+      radius = 9,
+      fit = "cover",
+    }),
+    lbl("Музыка", { key = "brand-title", size = 13, color = COLORS.text }),
+    lbl(shorten(title, 24), { key = "header-view", size = 11, color = COLORS.muted, maxWidth = 240 }),
+    lbl("", { key = "header-spacer", grow = 1 }),
+    lbl(shorten(summary, 56), {
+      key = "header-np",
+      size = 11,
+      color = hasTrack and COLORS.accent or COLORS.muted,
+      maxWidth = 420,
+    }),
+    lbl(stateText, { key = "header-state", size = 10, color = COLORS.muted }),
+    lbl(#(s.queue or {}) .. " в очереди", {
+      key = "header-queue",
+      size = 10,
+      color = COLORS.muted,
+      mono = true,
+    }),
+  })
 end
 
 local function stateNode(s, items)
@@ -1752,6 +1877,7 @@ local function homeFeedNode()
         key = "hf-range-" .. i,
         size = 10,
         color = COLORS.muted,
+        mono = true,
       }),
     })
     local cards = {}
@@ -1854,7 +1980,13 @@ local function queueContextNode(s)
         size = 12,
         color = focusBuf == 3 and COLORS.accent or COLORS.muted,
       }),
-      lbl(queueCursor .. "/" .. #queue, { key = "q-count", size = 11, color = COLORS.muted, grow = 1 }),
+      lbl(queueCursor .. "/" .. #queue, {
+        key = "q-count",
+        size = 11,
+        color = COLORS.muted,
+        grow = 1,
+        mono = true,
+      }),
     }),
   }
   -- Заголовок фиксирован; строки и пустое состояние живут в скролле,
@@ -1902,6 +2034,7 @@ local function queueContextNode(s)
           lbl(isPlaying and "▶" or tostring(i), {
             key = "q-idx" .. i,
             color = isPlaying and COLORS.accent or COLORS.muted,
+            mono = true,
           }),
         }),
         -- Бейдж провайдера перед артом: из какого клиента трек.
@@ -1914,7 +2047,12 @@ local function queueContextNode(s)
           grow = 1,
           color = isPlaying and COLORS.accent or (isCursor and COLORS.text or COLORS.muted),
         }),
-        lbl(durationLabel(t.duration) or "", { key = "q-dur" .. i, width = 44, color = COLORS.muted }),
+        lbl(durationLabel(t.duration) or "", {
+          key = "q-dur" .. i,
+          width = 44,
+          color = COLORS.muted,
+          mono = true,
+        }),
       }))
     end
     body = ui.column({ key = "q-rows", gap = QUEUE_ROW_GAP }, rowsOut)
@@ -1948,7 +2086,12 @@ local function eqWorkspace(s)
       radius = 6,
       fill = active and COLORS.selected or COLORS.surface,
     }, {
-      lbl(text, { key = "eq-text-" .. i, grow = 1, color = active and COLORS.text or COLORS.muted }),
+      lbl(text, {
+        key = "eq-text-" .. i,
+        grow = 1,
+        color = active and COLORS.text or COLORS.muted,
+        mono = true,
+      }),
     }))
   end
   return ui.column({ key = "eq-lines", gap = 4 }, lines)
@@ -2145,7 +2288,13 @@ local function helpRow(id, keys, text)
     align = "center",
     height = HELP_ROW_HEIGHT,
   }, {
-    lbl(keys, { key = "help-k-" .. id, width = HELP_KEY_WIDTH, size = 11, color = COLORS.accent }),
+    lbl(keys, {
+      key = "help-k-" .. id,
+      width = HELP_KEY_WIDTH,
+      size = 11,
+      color = COLORS.accent,
+      mono = true,
+    }),
     lbl(shorten(text, HELP_TEXT_BUDGET), { key = "help-t-" .. id, grow = 1, size = 11, color = COLORS.muted }),
   })
 end
@@ -2244,7 +2393,7 @@ local function searchTextNode()
     or ""
   return ui.row({ key = "search-text", gap = 0, align = "center", flexGrow = 1 }, {
     lbl(before, { key = "search-before", color = COLORS.text }),
-    lbl(caretText, { key = "search-caret", color = caretColor }),
+    lbl(caretText, { key = "search-caret", color = caretColor, mono = true }),
     lbl(after, { key = "search-after", grow = 1, color = COLORS.text }),
   })
 end
@@ -2440,28 +2589,44 @@ function draw()
       gap = GAP,
       flexGrow = contextGrow,
       padding = PAD,
-      radius = 10,
+      radius = 12,
       fill = COLORS.surface,
     }, { context }),
   })
 
   -- Полная карта клавиш переехала в модал ? (приёмка 19.09: строка
-  -- на весь этаж читалась плохо); футер оставляет только два якоря.
-  local footer = lbl(
-    "? — подсказки · Tab · ctrl+h/l — буферы",
-    { key = "footer", size = 11, color = COLORS.muted }
-  )
+  -- на весь этаж читалась плохо); футер оставляет только якоря и
+  -- текущее состояние ввода.
+  local footer = ui.row({ key = "footer-row", gap = 8, align = "center" }, {
+    lbl("? — подсказки · Tab · ctrl+h/l — буферы", {
+      key = "footer",
+      size = 11,
+      color = COLORS.muted,
+    }),
+    lbl("", { key = "footer-spacer", grow = 1 }),
+    lbl(typing and "INSERT" or "NORMAL", {
+      key = "footer-mode",
+      size = 10,
+      color = typing and COLORS.accent or COLORS.muted,
+      mono = true,
+    }),
+  })
 
-  panel.render(ui.column({
+  -- Корень: шапка → тело (сайдбар · workspace · очередь) → футер, всё
+  -- внутри рамки скина. Рамка резервирует skin.EDGE=12 px с каждой
+  -- стороны В ПОТОКЕ (GEO.ring в бюджетах выше), поэтому собственный
+  -- отступ остаётся PAD.
+  panel.render(skin.frame(ui.column({
     key = "root",
     gap = GAP,
     padding = PAD,
     fill = COLORS.bg,
     flexGrow = 1,
   }, {
+    headerNode(s),
     ui.row({ key = "body", gap = GAP, flexGrow = 1 }, { railNode(), main }),
     footer,
-  }))
+  }), "tmus-root"))
 end
 
 -- Возвращает true, только когда реально изменилось состояние eq

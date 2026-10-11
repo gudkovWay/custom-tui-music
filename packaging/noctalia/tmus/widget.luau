@@ -1,11 +1,26 @@
 --!nonstrict
 
+-- Общий скин десктопа (модуль и skin-assets кладутся рядом с плагином
+-- при деплое): отсюда только шрифт — рамку/панель виджет не рисует.
+local skin = require('./desktop_skin.luau')
+
 local KEY = "tmus"
 local PANEL = "q/tmus:library"
 local SERVICE = "q/tmus:watch"
 
 local TITLE_WIDTH = math.max(0, tonumber(noctalia.getConfig("title_width")) or 28)
 local ART = 18
+-- Компактная капсула нативного бара: строка БЕЗ собственной заливки и
+-- рамки — фон, боковой отступ (padding = 8.0) и скругление даёт
+-- capsule_group хоста, в котором виджет стоит рядом с audio_visualizer
+-- (settings.toml, группа music). Своя капсула внутри хостовой читалась
+-- бы как вложенная плашка, а фиксированная высота больше бара растянула
+-- бы саму панель.
+-- Высота = толщине нативного бара в принятом конфиге (24 логических px,
+-- [bar.default].thickness); просившиеся в задаче 26 px относятся к
+-- капсуле целиком и задаются настройками хоста — это зона оркестратора,
+-- а не плагина. Контент (арт 18 + подпись 12 px) заведомо ниже строки.
+local BAR_H = 24
 
 local snapshot = {}
 
@@ -156,9 +171,22 @@ local function draw()
   local text = label(s)
   local children = { artNode(s) }
   if text ~= "" then
-    table.insert(children, ui.label({ key = "title", text = text, color = "on_surface" }))
+    -- Название — sans скина; числовая подпись (позиция/длительность)
+    -- живёт в tooltip, а не в баре.
+    table.insert(children, ui.label({
+      key = "title",
+      text = text,
+      color = "on_surface",
+      fontSize = 12,
+      fontFamily = skin.FONT,
+    }))
   end
-  barWidget.render(ui.row({ gap = 6, align = "center" }, children))
+  barWidget.render(ui.row({
+    key = "tmus",
+    gap = 6,
+    align = "center",
+    height = BAR_H,
+  }, children))
   barWidget.setTooltip(tooltip(s))
 end
 
