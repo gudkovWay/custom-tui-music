@@ -332,8 +332,8 @@ fn split_byline(byline: &str) -> (Vec<String>, Option<String>) {
 
 /// Лента Home: карусели `musicCarouselShelfRenderer` одной страницы.
 ///
-/// Выбрасываем — поверхность артиста в плеере нет, мёртвая карточка хуже
-/// отсутствующей. Полка без заголовка или без элементов не нужна вызывающему.
+/// Артисты без playable-адреса не показываются. Полка без заголовка или
+/// без поддержанных элементов не нужна вызывающему.
 pub(crate) fn home(page: &Value) -> Vec<CatalogShelf> {
     renderers(page, "musicCarouselShelfRenderer")
         .iter()
@@ -353,8 +353,9 @@ pub(crate) fn home(page: &Value) -> Vec<CatalogShelf> {
                     if let Some(entry) = item.get("musicResponsiveListItemRenderer") {
                         track_from_responsive(entry).map(SearchResult::Track)
                     } else if let Some(entry) = item.get("musicTwoRowItemRenderer") {
-                        // Оставляем только плейлисты (включая альбомы в их
-                        // представлении): остальное — мёртвые карточки.
+                        if entry.pointer("/navigationEndpoint/watchEndpoint").is_some() {
+                            return track_from_two_row(entry).map(SearchResult::Track);
+                        }
                         let row = two_row(entry)?;
                         match two_row_result(row) {
                             Some(result @ SearchResult::Playlist(_)) => Some(result),
@@ -374,6 +375,30 @@ pub(crate) fn home(page: &Value) -> Vec<CatalogShelf> {
             }
         })
         .collect()
+}
+
+fn track_from_two_row(item: &Value) -> Option<Track> {
+    let id = item.pointer("/navigationEndpoint/watchEndpoint/videoId")
+        .and_then(Value::as_str).filter(|id| !id.is_empty())?;
+    let title_text = item.get("title")?;
+    let title = runs_text(title_text);
+    if title.is_empty() {
+        return None;
+    }
+    let (artists, album) = match item.get("subtitle") {
+        Some(subtitle) => credit(&[title_text, subtitle]),
+        None => (Vec::new(), None),
+    };
+    Some(Track {
+        id: TrackId::new(PROVIDER, id),
+        title,
+        artists,
+        album,
+        duration: item.get("lengthText").map(runs_text)
+            .and_then(|text| parse_duration(&text)),
+        art_url: largest_thumbnail(item),
+        page_url: Some(format!("{WATCH_URL}{id}")),
+    })
 }
 
 /// Подсказки поиска. Пустой ответ сервиса — пустой вектор, а не ошибка.
@@ -1192,6 +1217,51 @@ mod tests {
                 "contents": items
             }
         })
+    }
+
+    fn two_row_track(id: &str, title: &str) -> Value {
+        json!({ "musicTwoRowItemRenderer": {
+            "title": { "runs": [{ "text": title }] },
+            "subtitle": { "runs": [{ "text": "Artist" }, { "text": " • " }, { "text": "90K views" }] },
+            "navigationEndpoint": { "watchEndpoint": { "videoId": id } },
+            "thumbnailRenderer": { "musicThumbnailRenderer": { "thumbnail": {
+                "thumbnails": [{ "url": "https://img.example/track.jpg", "width": 226 }]
+            } } }
+        } })
+    }
+
+    #[test]
+    fn home_two_row_tracks_are_playable_and_keep_metadata() {
+        let page = json!({ "contents": [carousel("Listen again", None, json!([
+            two_row_track("song-id", "Song"), two_row_track("video-id", "Video")
+        ]))] });
+        let shelves = home(&page);
+        let tracks: Vec<_> = shelves[0].items.iter().map(|item| match item {
+            SearchResult::Track(track) => track,
+            _ => panic!("expected playable track"),
+        }).collect();
+        assert_eq!(tracks.iter().map(|t| t.id.id.as_str()).collect::<Vec<_>>(),
+            ["song-id", "video-id"]);
+        assert_eq!(tracks[0].title, "Song");
+        assert_eq!(tracks[0].artists, ["Artist"]);
+        assert_eq!(tracks[0].album, None);
+        assert_eq!(tracks[0].art_url.as_deref(), Some("https://img.example/track.jpg"));
+        assert_eq!(tracks[0].page_url.as_deref(),
+            Some("https://music.youtube.com/watch?v=song-id"));
+    }
+
+    #[test]
+    fn home_two_row_malformed_tracks_do_not_remove_neighbors() {
+        let page = json!({ "contents": [carousel("Listen again", None, json!([
+            two_row_track("", "Broken"), two_row_track("blank-title", " "),
+            two_row_track("valid-id", "Valid")
+        ]))] });
+        let shelves = home(&page);
+        let ids: Vec<_> = shelves[0].items.iter().map(|item| match item {
+            SearchResult::Track(track) => track.id.id.as_str(),
+            _ => panic!("expected track"),
+        }).collect();
+        assert_eq!(ids, ["valid-id"]);
     }
 
     #[test]
