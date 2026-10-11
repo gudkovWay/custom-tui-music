@@ -1567,6 +1567,13 @@ local function railNode()
       paddingV = 8,
       radius = 8,
       fill = active and COLORS.selected or COLORS.surface,
+      -- Клик по пункту сайдбара — та же смена вида, что ctrl+j/k и
+      -- цифры: путь «клик по рейлу» упоминался в комментариях
+      -- setView, но обработчика у пункта не было.
+      onClick = function()
+        setView(v.id)
+        draw()
+      end,
     }, {
         ui.glyph({ key = "rail-glyph-" .. v.id, name = v.glyph, size = 16, color = active and COLORS.accent or COLORS.muted }),
       lbl(v.title, { key = "rail-label-" .. v.id, size = 10, color = active and COLORS.text or COLORS.muted }),
