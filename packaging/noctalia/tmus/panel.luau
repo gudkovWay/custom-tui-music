@@ -1036,7 +1036,9 @@ local function hintTarget(node, identity, badge)
 end
 
 local function renderPanel(tree)
-  panel.render(hints:render(tree, COLORS.accent))
+  local rendered = hints:render(tree, COLORS.accent)
+  panel.setCaptureCancel(hints:isActive() or hints:isStale())
+  panel.render(rendered)
 end
 
 local function card(children, props)
@@ -4506,6 +4508,7 @@ end
 -- действие»).
 local function clearTransient()
   hints:reset()
+  panel.setCaptureCancel(false)
   volumeKeys = false
   plPicker = nil
   plNaming = false
