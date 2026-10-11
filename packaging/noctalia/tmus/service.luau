@@ -97,6 +97,7 @@ local homeAt = 0
 local homeDirty = false
 local homeRequestGeneration = 0
 local homeSource = nil
+local sourceRequestGeneration = 0
 
 local function publishHome()
   noctalia.state.set(HOME_KEY, homeState)
@@ -619,11 +620,19 @@ local function pullRatings()
 end
 
 local function pullSource()
+  sourceRequestGeneration = sourceRequestGeneration + 1
+  local generation = sourceRequestGeneration
   call({ "source", "--json" }, function(got)
+    if generation ~= sourceRequestGeneration then
+      return
+    end
     local p = type(got) == "table" and got.provider or nil
     data.source = type(p) == "string" and p ~= "" and p or "all"
     sourceReady = true
     pullLibrary()
+    if homeSource ~= data.source then
+      pullHome()
+    end
   end)
 end
 
@@ -1003,7 +1012,10 @@ function onIpc(event, payload)
     if want ~= data.source then
       poke({ "source", want })
       data.source = want
+      sourceRequestGeneration = sourceRequestGeneration + 1
+      sourceReady = true
       pullLibrary()
+      pullHome()
     end
   elseif event == "repeat" and payload then
     poke({ "loop", tostring(payload) })
