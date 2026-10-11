@@ -426,11 +426,15 @@ impl App {
     /// Курсоры продолжений агрегата — собственные идентификаторы
     /// демона (см. [`HomeCache`]); свежая страница перевыпускает их,
     /// и старые курсоры честно перестают существовать.
-    pub(crate) async fn home(&self, provider: Option<&str>) -> anyhow::Result<HomePage> {
+    pub(crate) async fn home(
+        &self,
+        provider: Option<&str>,
+        refresh: bool,
+    ) -> anyhow::Result<HomePage> {
         let key = provider.unwrap_or("all").to_owned();
         let mut guard = self.home_cache.lock().await;
         if let Some(cached) = guard.as_ref() {
-            if cached.key == key && cached.at.elapsed().as_secs() < HOME_TTL_SECS {
+            if !refresh && cached.key == key && cached.at.elapsed().as_secs() < HOME_TTL_SECS {
                 return Ok(cached.page.clone());
             }
         }

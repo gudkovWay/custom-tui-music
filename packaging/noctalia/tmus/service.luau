@@ -95,6 +95,8 @@ local HOME_KEY = "tmus.home"
 local homeState = { status = "idle", shelves = {}, next = nil }
 local homeAt = 0
 local homeDirty = false
+local homeRequestGeneration = 0
+local homeSource = nil
 
 local function publishHome()
   noctalia.state.set(HOME_KEY, homeState)
@@ -517,14 +519,26 @@ local function pullTracks(id)
   end)
 end
 
-local function pullHome()
+local function pullHome(force)
+  local source = data.source
+  if not force and homeState.status == "loading" and homeSource == source then
+    return
+  end
+  homeRequestGeneration = homeRequestGeneration + 1
+  local generation = homeRequestGeneration
+  homeSource = source
   homeAt = noctalia.nowMs()
-  -- Новая лента обнуляет продолжение: застрявший guard догрузки не
-  -- должен переживать перезагрузку (путь reset/error).
   homeMoreInFlight = false
   homeState = { status = "loading", shelves = homeState.shelves, next = nil }
   publishHome()
-  call({ "home", "--provider", data.source, "--json" }, function(got)
+  local args = { "home", "--provider", source, "--json" }
+  if force then
+    table.insert(args, "--refresh")
+  end
+  call(args, function(got)
+    if generation ~= homeRequestGeneration or source ~= data.source then
+      return
+    end
     -- Home возвращается ОБЪЕКТОМ { shelves, next }: shelves — полки
     -- страницы, next — курсор продолжения (nil/"" — дочитано).
     local page = type(got) == "table" and got or {}
@@ -533,6 +547,9 @@ local function pullHome()
     local next = type(page.next) == "string" and page.next ~= "" and page.next or nil
     homeState = { status = "ok", shelves = shelves, next = next, at = os.time() }
   end, function()
+    if generation ~= homeRequestGeneration or source ~= data.source then
+      return
+    end
     -- onDone дёргается и после успешного onOk: ошибкой считаем
     -- только случай, когда статус остался "loading".
     if homeState.status == "loading" then
@@ -559,7 +576,12 @@ local function pullHomeMore(cursor)
   end
   homeMoreInFlight = true
   local want = homeState.next
+  local generation = homeRequestGeneration
+  local source = data.source
   call({ "home-more", want, "--json" }, function(got)
+    if generation ~= homeRequestGeneration or source ~= data.source then
+      return
+    end
     homeMoreInFlight = false
     -- Пока летел запрос, ленту перезагрузили (pullHome): страница
     -- чужая — вписывать её в новую ленту нельзя.
@@ -573,6 +595,9 @@ local function pullHomeMore(cursor)
     homeState.next = type(page.next) == "string" and page.next ~= "" and page.next or nil
     homeState.at = os.time()
   end, function()
+    if generation ~= homeRequestGeneration or source ~= data.source then
+      return
+    end
     homeMoreInFlight = false
     publishHome()
   end)
@@ -971,6 +996,8 @@ function onIpc(event, payload)
     end)
     -- publish() здесь не нужен: call() публикует сам в onDone (так же
     -- живёт ветка "tracks" выше).
+  elseif event == "home-refresh" then
+    pullHome(true)
   elseif event == "source" and payload then
     local want = tostring(payload)
     if want ~= data.source then

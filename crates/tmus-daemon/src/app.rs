@@ -423,8 +423,8 @@ impl App {
                 release_memory();
                 Ok(Payload::Tracks(out))
             }
-            Cmd::Home { provider } => {
-                let out = self.home(provider.as_deref()).await?;
+            Cmd::Home { provider, refresh } => {
+                let out = self.home(provider.as_deref(), refresh).await?;
                 release_memory(); // FEmusic_home — мегабайтный JSON, та же причина, что у каталожных arm'ов выше
                 Ok(Payload::Home(out))
             }
@@ -737,6 +737,8 @@ mod tests {
         playlist_calls: std::sync::Mutex<Vec<String>>,
         /// Постраничные данные состава: страница по индексу курсора.
         pages: std::sync::Mutex<Vec<Vec<Track>>>,
+        home_pages: std::sync::Mutex<Vec<tmus_core::model::HomePage>>,
+        fail_home: AtomicBool,
     }
 
     impl FakeProvider {
@@ -813,6 +815,18 @@ mod tests {
             let tracks = pages.get(idx).cloned().unwrap_or_default();
             let next = (idx + 1 < pages.len()).then(|| (idx + 1).to_string());
             Ok(tmus_provider::TrackPage { tracks, next })
+        }
+        async fn home_page(
+            &self,
+            cursor: Option<&str>,
+        ) -> Result<tmus_core::model::HomePage, ProviderError> {
+            if self.fail_home.load(Ordering::SeqCst) {
+                return Err(self.playlist_error());
+            }
+            let index = cursor.unwrap_or("0").parse::<usize>()
+                .map_err(|_| self.playlist_error())?;
+            self.home_pages.lock().expect("home pages").get(index)
+                .cloned().ok_or_else(|| self.playlist_error())
         }
         async fn liked(&self) -> Result<Vec<Track>, ProviderError> {
             Ok(Vec::new())
@@ -960,6 +974,8 @@ mod tests {
             fail_playlist: AtomicBool::new(fail_playlist),
             playlist_calls: std::sync::Mutex::new(Vec::new()),
             pages: std::sync::Mutex::new(Vec::new()),
+            home_pages: std::sync::Mutex::new(Vec::new()),
+            fail_home: AtomicBool::new(false),
         });
         registry.insert(Arc::clone(&provider) as Arc<dyn Provider>);
         let gate = Arc::new(tokio::sync::Semaphore::new(2));
@@ -977,6 +993,65 @@ mod tests {
         ));
         let app = App::new(player, registry, cache, Config::default(), paths, gate);
         (app, provider, dir)
+    }
+
+    fn home_fixture(id: &str, next: Option<&str>) -> tmus_core::model::HomePage {
+        tmus_core::model::HomePage {
+            shelves: vec![tmus_core::model::CatalogShelf {
+                title: "Recommendations".to_owned(),
+                subtitle: None,
+                items: vec![tmus_core::model::SearchResult::Track(
+                    sample_track(&TrackId::new(ProviderId::YTMUSIC, id)),
+                )],
+            }],
+            next: next.map(str::to_owned),
+        }
+    }
+
+    #[tokio::test]
+    async fn home_refresh_replaces_cached_cards_and_expires_old_cursor() {
+        let (app, provider, _dir) = app_full(false, false).await;
+        *provider.home_pages.lock().expect("home pages") =
+            vec![home_fixture("old", Some("1")), home_fixture("tail", None)];
+        let old = app.home(Some("ytmusic"), false).await.expect("home");
+        let cursor = old.next.expect("next cursor");
+        *provider.home_pages.lock().expect("home pages") =
+            vec![home_fixture("fresh", Some("1")), home_fixture("tail", None)];
+        let cached = app.home(Some("ytmusic"), false).await.expect("cached home");
+        assert_eq!(cached.shelves, home_fixture("old", None).shelves);
+        let fresh = app.home(Some("ytmusic"), true).await.expect("refresh");
+        assert_eq!(fresh.shelves, home_fixture("fresh", None).shelves);
+        assert!(app.home_more(Some("ytmusic"), &cursor).await.is_err());
+        let tail = app.home_more(Some("ytmusic"), fresh.next.as_deref().expect("new cursor"))
+            .await.expect("continue fresh feed");
+        let ids: Vec<_> = tail.shelves[0].items.iter().map(|item| match item {
+            tmus_core::model::SearchResult::Track(track) => track.id.id.as_str(),
+            _ => panic!("expected track"),
+        }).collect();
+        assert_eq!(ids, ["fresh", "tail"]);
+        assert_eq!(tail.next, None);
+        app.player.mpv().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn home_failed_refresh_preserves_cached_feed_and_cursor() {
+        let (app, provider, _dir) = app_full(false, false).await;
+        *provider.home_pages.lock().expect("home pages") =
+            vec![home_fixture("old", Some("1")), home_fixture("tail", None)];
+        let old = app.home(None, false).await.expect("home");
+        provider.fail_home.store(true, Ordering::SeqCst);
+        assert!(app.home(None, true).await.is_err());
+        assert_eq!(app.home(None, false).await.expect("cached"), old);
+        provider.fail_home.store(false, Ordering::SeqCst);
+        let tail = app.home_more(None, old.next.as_deref().expect("cursor"))
+            .await.expect("cursor survives failed refresh");
+        let ids: Vec<_> = tail.shelves[0].items.iter().map(|item| match item {
+            tmus_core::model::SearchResult::Track(track) => track.id.id.as_str(),
+            _ => panic!("expected track"),
+        }).collect();
+        assert_eq!(ids, ["old", "tail"]);
+        assert_eq!(tail.next, None);
+        app.player.mpv().shutdown().await;
     }
 
     /// Успешная оценка: пишется в кэш, вещается событие и видна в

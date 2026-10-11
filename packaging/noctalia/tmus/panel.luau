@@ -1767,6 +1767,25 @@ local function homeFeedNode()
   })
 end
 
+local function homeSectionNode()
+  return ui.column({ key = "hf-section", gap = 8, flexGrow = 1 }, {
+    ui.row({ key = "hf-controls", height = 28, gap = 8, align = "center" }, {
+      lbl("Recommendations", { key = "hf-label", size = 12, grow = 1 }),
+      lbl("Refresh", { key = "hf-refresh-label", size = 11, color = COLORS.muted }),
+      ui.button({
+        key = "hf-refresh",
+        glyph = "refresh",
+        controlSize = "sm",
+        variant = "ghost",
+        onClick = function()
+          poke("home-refresh")
+        end,
+      }),
+    }),
+    homeFeedNode(),
+  })
+end
+
 local function playlistCards(slice, first)
   local cards = {}
   for k, row in ipairs(slice) do
@@ -2251,7 +2270,7 @@ function draw()
       table.insert(wsChildren, hero)
     end
     -- Лента рекомендаций: состояния/полки, прокручиваемый скролл.
-    table.insert(wsChildren, homeFeedNode())
+    table.insert(wsChildren, homeSectionNode())
   elseif view == "search" then
     workspaceGrow = 63
     contextGrow = 37

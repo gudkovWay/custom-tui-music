@@ -110,6 +110,9 @@ enum CliCmd {
     Home {
         #[arg(long)]
         provider: Option<String>,
+        /// Перечитать рекомендации из сети, минуя TTL-кэш.
+        #[arg(long)]
+        refresh: bool,
         #[arg(long)]
         json: bool,
     },
@@ -325,9 +328,9 @@ async fn main() -> Result<()> {
             let provider = resolve_provider(&mut client, provider.as_deref()).await?;
             return print_payload(client.call(Cmd::Library { provider }).await?, json);
         }
-        CliCmd::Home { provider, json } => {
+        CliCmd::Home { provider, refresh, json } => {
             let provider = resolve_provider(&mut client, provider.as_deref()).await?;
-            return print_payload(client.call(Cmd::Home { provider }).await?, json);
+            return print_payload(client.call(Cmd::Home { provider, refresh }).await?, json);
         }
         CliCmd::HomeMore { cursor, provider, json } => {
             // Курсором владеет демон и он помнит своего провайдера:
@@ -947,19 +950,21 @@ mod tests {
     #[test]
     fn home_subcommand_parses_flags() {
         match Cli::try_parse_from(["tmus", "home"]).expect("valid").cmd {
-            Some(CliCmd::Home { provider, json }) => {
+            Some(CliCmd::Home { provider, refresh, json }) => {
                 assert_eq!(provider, None);
                 assert!(!json);
+                assert!(!refresh);
             }
             _ => panic!("ожидалась подкоманда home"),
         }
-        match Cli::try_parse_from(["tmus", "home", "--provider", "ytmusic", "--json"])
+        match Cli::try_parse_from(["tmus", "home", "--provider", "ytmusic", "--refresh", "--json"])
             .expect("valid")
             .cmd
         {
-            Some(CliCmd::Home { provider, json }) => {
+            Some(CliCmd::Home { provider, refresh, json }) => {
                 assert_eq!(provider.as_deref(), Some("ytmusic"));
                 assert!(json);
+                assert!(refresh);
             }
             _ => panic!("ожидалась подкоманда home с флагами"),
         }

@@ -113,8 +113,12 @@ pub enum Cmd {
     /// `next: None` значит «дочитано».
     LibraryTracksPage { playlist: PlaylistId },
     Liked { provider: Option<String> },
-    /// Домашняя лента рекомендаций; provider = None — из всех.
-    Home { provider: Option<String> },
+    /// Домашняя лента; refresh обходит TTL, provider = None — из всех.
+    Home {
+        provider: Option<String>,
+        #[serde(default)]
+        refresh: bool,
+    },
     /// Следующая страница домашней ленты по непрозрачному курсору
     /// демона. `provider` — подсказка-ограничитель; соответствие
     /// курсора провайдеру хранит демон, и чужой провайдер с чужим
@@ -581,11 +585,16 @@ mod tests {
     }
 
     #[test]
-    fn home_request_serializes() {
-        let got = line(&Request { id: 30, cmd: Cmd::Home { provider: None } });
-        assert_eq!(got, r#"{"id":30,"cmd":"home","provider":null}"#);
-        let back: Request = serde_json::from_str(&got).expect("parse");
-        assert_eq!(back.cmd, Cmd::Home { provider: None });
+    fn home_request_distinguishes_cached_read_from_explicit_refresh() {
+        let cached: Request = serde_json::from_str(
+            r#"{"id":30,"cmd":"home","provider":null}"#,
+        ).expect("ordinary home request");
+        assert_eq!(cached.cmd, Cmd::Home { provider: None, refresh: false });
+        let fresh: Request = serde_json::from_str(
+            r#"{"id":31,"cmd":"home","provider":"ytmusic","refresh":true}"#,
+        ).expect("explicit refresh");
+        assert_eq!(fresh.cmd,
+            Cmd::Home { provider: Some("ytmusic".to_owned()), refresh: true });
     }
 
     #[test]
