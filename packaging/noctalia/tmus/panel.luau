@@ -76,9 +76,8 @@ local NP_SPEC_BARS = 56
 -- горизонтальном окне полки — окна выводятся из геометрии, как везде.
 -- Полка ≈ заголовок 20 + арт 110 + паддинг 16 + подписи ≈64 → 210 px;
 -- ряд карточек шириной 150 в центральном столбе ≈960 px
--- (панель 1180×760, замер §17). Карточек в полке рендерим не больше
--- HOME_CARD_CAP — окно двигается, хвост не держим (счётчик честный:
--- shelf.count хранит число карточек до капа).
+-- (панель 1180×760, замер §17). Модель хранит всю полку для навигации,
+-- а рендер — только видимое окно HOME_CARD_WINDOW.
 local HOME_SHELF_HEIGHT = 210
 local HOME_SHELF_VIEWPORT_HEIGHT = 450
 local SHELF_WINDOW = math.floor((HOME_SHELF_VIEWPORT_HEIGHT + GAP)
@@ -87,7 +86,6 @@ local HOME_CARD_WIDTH = 150
 local HOME_CARDS_VIEWPORT_WIDTH = 960
 local HOME_CARD_WINDOW = math.floor((HOME_CARDS_VIEWPORT_WIDTH + GAP)
   / (HOME_CARD_WIDTH + GAP))
-local HOME_CARD_CAP = 20
 
 local VIEWS = {
   { id = "home", title = "Home", glyph = "home" },
@@ -539,10 +537,9 @@ local function playlistAddable(p, trackProv)
   return type(caps) == "table" and caps.playlist_add == true
 end
 
--- Рендер-модель home-ленты: массив полок {title, subtitle, count,
--- cards} из homeFeed. count — ЧЕСТНОЕ число элементов полки до капа
--- (счётчик окна показывает его), cards капятся HOME_CARD_CAP —
--- рендерим окно, хвост не держим. Пустые полки выбрасываются.
+-- Рендер-модель home-ленты: все поддержанные cards из homeFeed.
+-- Счётчик отражает доступные навигации карточки; рендер остаётся оконным.
+-- Пустые полки выбрасываются.
 -- Перевычисляется только в watch-колбэке (rebuildHomeShelves) — draw
 -- до 8 Гц не должен перебирать полки.
 local function rebuildHomeShelves()
@@ -552,9 +549,6 @@ local function rebuildHomeShelves()
       local items = shelf.items or {}
       local cards = {}
       for _, it in ipairs(items) do
-        if #cards >= HOME_CARD_CAP then
-          break
-        end
         local kind = tostring(it.kind or "")
         if kind == "track" then
           table.insert(cards, {
@@ -584,7 +578,7 @@ local function rebuildHomeShelves()
         table.insert(out, {
           title = tostring(shelf.title or ""),
           subtitle = tostring(shelf.subtitle or ""),
-          count = #items,
+          count = #cards,
           cards = cards,
         })
       end
@@ -1748,18 +1742,18 @@ local function homeFeedNode()
   for i = homeTop, last do
     local shelf = shelves[i]
     local left = homeLeft[i] or 1
+    local clast = math.min(left + HOME_CARD_WINDOW - 1, #shelf.cards)
     local header = ui.row({ key = "hf-head-" .. i, height = 20, gap = 8, align = "center" }, {
       lbl(shorten(shelf.title, 24), { key = "hf-shelf-title-" .. i, size = 13, height = 20, color = COLORS.text }),
       shelf.subtitle ~= "" and lbl(shorten(shelf.subtitle, 28), { key = "hf-shelf-sub-" .. i, size = 11, height = 20, color = COLORS.muted }) or nil,
       lbl("", { key = "hf-spacer-" .. i, grow = 1 }),
-      lbl("◄ " .. left .. "–" .. (left + HOME_CARD_WINDOW - 1) .. "/" .. shelf.count .. " ►", {
+      lbl("◄ " .. left .. "–" .. clast .. "/" .. shelf.count .. " ►", {
         key = "hf-range-" .. i,
         size = 10,
         color = COLORS.muted,
       }),
     })
     local cards = {}
-    local clast = math.min(left + HOME_CARD_WINDOW - 1, #shelf.cards)
     for j = left, clast do
       table.insert(cards, homeCardNode(i, j, shelf.cards[j]))
     end
