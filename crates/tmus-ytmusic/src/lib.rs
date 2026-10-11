@@ -17,7 +17,7 @@ mod auth;
 mod innertube;
 mod parse;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::{Arc, Mutex};
 
@@ -358,8 +358,37 @@ impl Catalog for YtMusic {
 
 
     async fn liked(&self) -> Result<Vec<Track>> {
-        self.playlist_tracks(&PlaylistId::new(self.id, LIKED_PLAYLIST))
-            .await
+        // Лайки YTM — это нативный плейлист `LM`: полный агрегат и
+        // постраничный пейджинг идут через один и тот же путь. Дочитываем
+        // до `next = None`; повтор токена — зацикливание сервиса, о нём
+        // предупреждаем и отдаём собранное.
+        let playlist = PlaylistId::new(self.id, LIKED_PLAYLIST);
+        let mut all = Vec::new();
+        let mut seen = HashSet::new();
+        let mut cursor = None;
+        loop {
+            let page = self
+                .playlist_tracks_page(&playlist, cursor.as_deref())
+                .await?;
+            all.extend(page.tracks);
+            match page.next {
+                Some(token) => {
+                    if !seen.insert(token.clone()) {
+                        tracing::warn!(
+                            provider = "ytmusic",
+                            "лайки не дочитаны: сервис зациклил токен продолжения"
+                        );
+                        return Ok(all);
+                    }
+                    cursor = Some(token);
+                }
+                None => return Ok(all),
+            }
+        }
+    }
+
+    async fn liked_page(&self, cursor: Option<&str>) -> Result<TrackPage> {
+        self.playlist_tracks_page(&PlaylistId::new(self.id, LIKED_PLAYLIST), cursor).await
     }
 
     async fn home_page(&self, cursor: Option<&str>) -> Result<HomePage> {

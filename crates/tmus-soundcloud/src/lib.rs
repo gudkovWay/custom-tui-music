@@ -19,6 +19,7 @@ mod api;
 mod auth;
 mod parse;
 
+use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
 
@@ -45,12 +46,6 @@ const DISPLAY_NAME: &str = "SoundCloud";
 /// Селектор формата для yt-dlp: прогрессивный HTTP-аудио, HLS — только
 /// фолбэком. См. поле `SoundCloud::format`.
 const SC_FORMAT: &str = "bestaudio[protocol*=http]/bestaudio";
-
-/// Страница лайков при полном дочитывании: SoundCloud отдаёт лайки
-/// страницами без понятия «всё сразу», и без предела цикл теоретически
-/// не кончается. Предел — тот же, что у YouTube Music: 10 страниц по
-/// 24 записи хватает подавляющему большинству аккаунтов.
-const MAX_PAGES: usize = 10;
 
 /// Провайдер SoundCloud.
 pub struct SoundCloud {
@@ -236,20 +231,33 @@ impl Catalog for SoundCloud {
     /// отдельный эндпоинт с пагинацией `next_href`. Страницы — по 200
     /// (лимит сервиса), продолжения приходят такими же like-объектами,
     /// поэтому разбор у всех страниц один — [`parse::liked_of`].
+    async fn liked_page(&self, cursor: Option<&str>) -> Result<TrackPage> {
+        // None — свежий запрос лимита; Some — готовый `next_href` из
+        // прошлого ответа, отдельного разбора не требует.
+        let page = match cursor {
+            None => self.api.likes(200).await?,
+            Some(url) => self.api.get_url(url).await?,
+        };
+        let (tracks, next) = parse::liked_of(&page);
+        Ok(TrackPage { tracks, next })
+    }
+
     async fn liked(&self) -> Result<Vec<Track>> {
+        // Дочитываем до `next_href = None`; повтор `next_href` —
+        // зацикливание сервиса, о нём предупреждаем и отдаём собранное.
         let mut all = Vec::new();
+        let mut seen = HashSet::new();
         let (mut page_items, mut next) = {
             let page = self.api.likes(200).await?;
             parse::liked_of(&page)
         };
         all.append(&mut page_items);
-        let mut pages = 1;
         while let Some(url) = next {
-            if pages >= MAX_PAGES {
+            if !seen.insert(url.clone()) {
                 tracing::warn!(
                     provider = "soundcloud",
-                    limit = MAX_PAGES,
-                    "лайки не дочитаны: достигнут предел страниц"
+                    href = %url,
+                    "лайки не дочитаны: сервис зациклил next_href"
                 );
                 break;
             }
@@ -257,7 +265,6 @@ impl Catalog for SoundCloud {
             let (page_items, next_href) = parse::liked_of(&page);
             all.extend(page_items);
             next = next_href;
-            pages += 1;
         }
         Ok(all)
     }

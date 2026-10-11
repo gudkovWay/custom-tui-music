@@ -59,6 +59,16 @@ fn source_label(app: &App) -> String {
         Some(id) => app.provider_names.get(id).cloned().unwrap_or_else(|| id.clone()),
     }
 }
+fn is_liked_playlist(id: &tmus_core::model::PlaylistId) -> bool {
+    id.provider == ProviderId::LOCAL && id.id == "liked"
+}
+
+fn is_refreshable_liked_playlist(id: &tmus_core::model::PlaylistId) -> bool {
+    (id.provider == ProviderId::LOCAL && id.id == "liked")
+        || (id.provider == ProviderId::YTMUSIC && id.id == "LM")
+}
+
+const PAGE_TAIL_THRESHOLD: usize = 5;
 
 /// Панели левой колонки. Tab переключает по кругу.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -184,6 +194,12 @@ impl PlaylistPicker {
     }
 }
 
+struct PlaylistCacheEntry {
+    tracks: Vec<Track>,
+    loaded_at: std::time::Instant,
+    has_more: bool,
+}
+
 struct App {
     client: Client,
     /// Для фоновых команд: play-команды не должны держать цикл ввода.
@@ -193,16 +209,12 @@ struct App {
     playlists: Vec<Playlist>,
     /// Треки выбранного плейлиста — правая колонка.
     playlist_tracks: Vec<Track>,
+    /// Кэш треков плейлистов и состояние продолжения.
+    playlist_cache: std::collections::HashMap<tmus_core::model::PlaylistId, PlaylistCacheEntry>,
     search_results: Vec<SearchResult>,
     search_input: String,
     search_mode: bool,
     nav: Nav,
-    /// Кэш треков плейлистов по id: (треки, момент загрузки). Без него
-    /// каждое движение j/k по колонке библиотеки уходило в InnerTube
-    /// (~1–2 с на запрос), и зажатая клавиша сериально гоняла сеть.
-    /// TTL 600 с: каталог меняется редко, инвалидация по событиям ради
-    /// этого не стоит.
-    playlist_cache: std::collections::HashMap<tmus_core::model::PlaylistId, (Vec<Track>, std::time::Instant)>,
     /// Отложенная загрузка: (плейлист, момент последнего шага курсора).
     /// Ставится при промахе кэша, исполняется в event_loop, когда курсор
     /// стоит 400 мс, — дебаунс сетевых запросов.
@@ -429,8 +441,6 @@ async fn apply_event(app: &mut App, event: Event) -> bool {
             true
         }
         Event::RatingChanged { track, rating } => {
-            // `None` удаляет запись: «нет оценки» и «none» — одно
-            // состояние, мёртвые ключи в карте не нужны.
             if rating == Rating::None {
                 app.ratings.remove(&track);
             } else {
@@ -439,14 +449,44 @@ async fn apply_event(app: &mut App, event: Event) -> bool {
             true
         }
         Event::PlaylistsChanged => {
-            // Событие не несёт дельту, а библиотека плейлистов невелика:
-            // перечитываем список целиком, как это делает CLI-путь
-            // library/list.
             if let Ok(Payload::Playlists(ps)) =
                 app.client.call(Cmd::Library { provider: app.source.provider.clone() }).await
             {
                 reconcile_open_playlist(app, &ps);
                 app.playlists = ps;
+            }
+            if let Some(id) = app
+                .nav
+                .open_playlist
+                .clone()
+                .filter(is_refreshable_liked_playlist)
+            {
+                let previous_selection = app
+                    .nav
+                    .playlist_sel
+                    .selected()
+                    .and_then(|index| app.playlist_tracks.get(index))
+                    .map(|track| track.id.clone());
+                if let Ok(Payload::Tracks(tracks)) =
+                    app.client.call(Cmd::LibraryTracks { playlist: id.clone() }).await
+                {
+                    let selected = previous_selection
+                        .as_ref()
+                        .and_then(|track_id| tracks.iter().position(|track| &track.id == track_id))
+                        .or_else(|| {
+                            app.nav
+                                .playlist_sel
+                                .selected()
+                                .map(|index| index.min(tracks.len().saturating_sub(1)))
+                        });
+                    app.playlist_tracks = tracks.clone();
+                    app.playlist_cache.insert(id, PlaylistCacheEntry {
+                        tracks,
+                        loaded_at: std::time::Instant::now(),
+                        has_more: true,
+                    });
+                    app.nav.playlist_sel.select(selected);
+                }
             }
             true
         }
@@ -506,7 +546,9 @@ async fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Re
                 app.track_view.len(),
             );
             app.nav.move_active(1, p, q, s, t);
-            if app.nav.focus == Focus::Panel && app.nav.panel == Panel::Library {
+            if app.nav.focus == Focus::Tracks {
+                request_next_page(app).await;
+            } else if app.nav.focus == Focus::Panel && app.nav.panel == Panel::Library {
                 load_selected_playlist(app).await;
             }
         }
@@ -713,8 +755,12 @@ async fn handle_picker_key(app: &mut App, code: KeyCode) -> Result<()> {
             let playlist =
                 picker_destinations(app).get(sel - 1).map(|p| p.id.clone());
             app.picker = None;
-            if let (Some(track), Some(playlist)) = (track, playlist) {
-                fire(app, Cmd::PlaylistAdd { playlist, track });
+            if let Some(track) = track {
+                if playlist.as_ref().is_some_and(is_liked_playlist) {
+                    fire(app, Cmd::Rate { track, rating: Rating::Liked });
+                } else if let Some(playlist) = playlist {
+                    fire(app, Cmd::PlaylistAdd { playlist, track });
+                }
             }
         }
         _ => {
@@ -790,6 +836,10 @@ async fn create_and_add(app: &mut App) {
 async fn playlist_remove_or_delete(app: &mut App) {
     if app.nav.focus == Focus::Tracks {
         let Some(id) = app.nav.open_playlist.clone() else { return };
+        if is_liked_playlist(&id) {
+            app.notice = Some("local:liked доступен только для чтения".to_owned());
+            return;
+        }
         if id.provider == ProviderId::LOCAL {
             // Абсолютная позиция из track_view — единственный адрес
             // записи: дубликаты одного трека независимы, по id их не
@@ -798,8 +848,8 @@ async fn playlist_remove_or_delete(app: &mut App) {
             let Some(sel) = app.nav.playlist_sel.selected() else { return };
             let Some(&position) = app.track_view.get(sel) else { return };
             app.playlist_tracks.remove(position);
-            if let Some((tracks, _)) = app.playlist_cache.get_mut(&id) {
-                tracks.remove(position);
+            if let Some(entry) = app.playlist_cache.get_mut(&id) {
+                entry.tracks.remove(position);
             }
             call_quiet(app, Cmd::PlaylistRemoveAt { playlist: id, position }).await;
         } else {
@@ -815,8 +865,8 @@ async fn playlist_remove_or_delete(app: &mut App) {
             match app.client.call(Cmd::PlaylistRemove { playlist: id.clone(), track: track.clone() }).await {
                 Ok(_) => {
                     app.playlist_tracks.retain(|t| t.id != track);
-                    if let Some((tracks, _)) = app.playlist_cache.get_mut(&id) {
-                        tracks.retain(|t| t.id != track);
+                    if let Some(entry) = app.playlist_cache.get_mut(&id) {
+                        entry.tracks.retain(|t| t.id != track);
                     }
                     app.notice = None;
                 }
@@ -827,6 +877,10 @@ async fn playlist_remove_or_delete(app: &mut App) {
         let Some(idx) = app.nav.library_sel.selected() else { return };
         let Some(playlist) = app.playlists.get(idx) else { return };
         let id = playlist.id.clone();
+        if is_liked_playlist(&id) {
+            app.notice = Some("local:liked доступен только для чтения".to_owned());
+            return;
+        }
         if id.provider != ProviderId::LOCAL
             && !app
                 .capabilities
@@ -870,9 +924,9 @@ async fn load_selected_playlist(app: &mut App) {
     let Some(idx) = app.nav.library_sel.selected() else { return };
     let Some(playlist) = app.playlists.get(idx) else { return };
     let id = playlist.id.clone();
-    if let Some((tracks, loaded_at)) = app.playlist_cache.get(&id) {
-        if loaded_at.elapsed() < PLAYLIST_CACHE_TTL {
-            app.playlist_tracks = tracks.clone();
+    if let Some(entry) = app.playlist_cache.get(&id) {
+        if entry.loaded_at.elapsed() < PLAYLIST_CACHE_TTL {
+            app.playlist_tracks = entry.tracks.clone();
             app.notice = None;
             return;
         }
@@ -894,7 +948,11 @@ async fn flush_pending_load(app: &mut App) -> bool {
     let Some(id) = due else { return false };
     match app.client.call(Cmd::LibraryTracks { playlist: id.clone() }).await {
         Ok(Payload::Tracks(tracks)) => {
-            app.playlist_cache.insert(id, (tracks.clone(), std::time::Instant::now()));
+            app.playlist_cache.insert(id, PlaylistCacheEntry {
+                tracks: tracks.clone(),
+                loaded_at: std::time::Instant::now(),
+                has_more: true,
+            });
             app.playlist_tracks = tracks;
             app.notice = None;
         }
@@ -902,6 +960,25 @@ async fn flush_pending_load(app: &mut App) -> bool {
         Err(e) => app.notice = Some(e.to_string()),
     }
     true
+}
+
+async fn request_next_page(app: &mut App) {
+    let Some(id) = app.nav.open_playlist.clone() else { return };
+    let Some(sel) = app.nav.playlist_sel.selected() else { return };
+    if sel + PAGE_TAIL_THRESHOLD < app.track_view.len() { return }
+    let Some(entry) = app.playlist_cache.get(&id) else { return };
+    if !entry.has_more { return }
+    match app.client.call(Cmd::LibraryTracksPage { playlist: id.clone() }).await {
+        Ok(Payload::TracksPage { tracks, next }) => {
+            app.playlist_tracks.extend(tracks.clone());
+            if let Some(entry) = app.playlist_cache.get_mut(&id) {
+                entry.tracks.extend(tracks);
+                entry.has_more = next.is_some();
+            }
+        }
+        Ok(_) => app.notice = Some("неожиданный ответ на LibraryTracksPage".to_owned()),
+        Err(e) => app.notice = Some(e.to_string()),
+    }
 }
 
 fn track_cmd(app: &App) -> Option<Cmd> {

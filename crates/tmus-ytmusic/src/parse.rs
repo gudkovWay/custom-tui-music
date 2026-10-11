@@ -444,10 +444,14 @@ fn continuation_in(value: &Value) -> Option<&str> {
                     }
                 }
             }
-            if let Some(token) = map.get("continuationItemRenderer")
-                .and_then(|item| item.pointer("/continuationEndpoint/continuationCommand/token"))
-                .and_then(Value::as_str)
-                .filter(|token| !token.is_empty())
+            if let Some(token) = [
+                ("continuationCommand", "token"),
+                ("nextContinuationData", "continuation"),
+                ("reloadContinuationData", "continuation"),
+            ].iter().find_map(|(name, field)| {
+                map.get(*name).and_then(|node| node.get(*field))
+                    .and_then(Value::as_str).filter(|token| !token.is_empty())
+            })
             {
                 return Some(token);
             }
@@ -1312,6 +1316,19 @@ mod tests {
             "continuations": [{ "nextContinuationData": { "continuation": "home-tail" } }]
         } } });
         assert_eq!(continuation_token(&tail).as_deref(), Some("home-tail"));
+    }
+
+    #[test]
+    fn playlist_continuation_supports_paged_and_reload_forms() {
+        for kind in ["nextContinuationData", "reloadContinuationData"] {
+            let page = json!({ "continuationContents": { "musicPlaylistShelfContinuation": {
+                "continuations": [{ (kind): { "continuation": "liked-tail" } }]
+            } } });
+            assert_eq!(continuation_token(&page).as_deref(), Some("liked-tail"));
+        }
+        assert_eq!(continuation_token(&json!({
+            "continuationCommand": { "token": "" }
+        })), None);
     }
 
     #[test]

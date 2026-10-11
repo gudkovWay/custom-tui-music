@@ -156,6 +156,14 @@ pub trait Catalog: Send + Sync {
     /// вызывающего это не касается.
     async fn liked(&self) -> Result<Vec<Track>>;
 
+    /// Одна страница лайкнутого: `cursor: None` — первый кусок,
+    /// `Some(token)` — продолжение. Дефолт для провайдеров без своей
+    /// пагинации лайков: весь [`Self::liked`] одной страницей
+    /// (`next = None`).
+    async fn liked_page(&self, _cursor: Option<&str>) -> Result<TrackPage> {
+        Ok(TrackPage { tracks: self.liked().await?, next: None })
+    }
+
     /// Страница домашней ленты рекомендаций. `cursor: None` — первый
     /// кусок, `Some(token)` — продолжение по токену от прошлого вызова.
     ///
