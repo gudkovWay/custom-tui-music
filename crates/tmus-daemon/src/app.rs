@@ -852,6 +852,12 @@ mod tests {
         async fn liked(&self) -> Result<Vec<Track>, ProviderError> {
             Ok(Vec::new())
         }
+        async fn liked_page(
+            &self,
+            cursor: Option<&str>,
+        ) -> Result<tmus_provider::TrackPage, ProviderError> {
+            self.playlist_tracks_page(&PlaylistId::new(self.id, "LM"), cursor).await
+        }
         async fn rate(&self, _id: &TrackId, _rating: Rating) -> Result<(), ProviderError> {
             if self.fail_rate.load(Ordering::SeqCst) {
                 Err(ProviderError::Format {
@@ -1027,6 +1033,45 @@ mod tests {
             }],
             next: next.map(str::to_owned),
         }
+    }
+
+    #[tokio::test]
+    async fn liked_virtual_paging_deduplicates_tail_and_keeps_accumulated_snapshot() {
+        let (app, provider, _dir) = app_full(false, false).await;
+        let track = |id| sample_track(&TrackId::new(ProviderId::YTMUSIC, id));
+        provider.set_pages(vec![vec![track("a"), track("b")], vec![track("b"), track("c")]]);
+        let playlist = PlaylistId::new(ProviderId::LOCAL, "liked");
+        let ids = |tracks: Vec<Track>| tracks.into_iter().map(|t| t.id.id).collect::<Vec<_>>();
+        assert_eq!(ids(app.playlist_tracks(&playlist).await.expect("first page")), ["a", "b"]);
+        let (tail, next) = app.playlist_tracks_page(&playlist).await.expect("next page");
+        assert_eq!(ids(tail), ["c"]);
+        assert_eq!(next, None);
+        assert_eq!(ids(app.playlist_tracks(&playlist).await.expect("cached snapshot")),
+            ["a", "b", "c"]);
+        let (tail, next) = app.playlist_tracks_page(&playlist).await.expect("exhausted page");
+        assert_eq!(tail, Vec::new());
+        assert_eq!(next, None);
+        app.player.mpv().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn liked_and_home_snapshots_expire_after_remote_rating() {
+        let (app, provider, _dir) = app_full(false, false).await;
+        let track = |id| sample_track(&TrackId::new(ProviderId::YTMUSIC, id));
+        provider.set_pages(vec![vec![track("old")]]);
+        *provider.home_pages.lock().expect("home pages") = vec![home_fixture("old", None)];
+        let playlist = PlaylistId::new(ProviderId::LOCAL, "liked");
+        assert_eq!(app.playlist_tracks(&playlist).await.expect("liked"), [track("old")]);
+        let old_home = app.home(Some("ytmusic"), false).await.expect("home");
+        assert_eq!(old_home.shelves, home_fixture("old", None).shelves);
+        provider.set_pages(vec![vec![track("fresh")]]);
+        *provider.home_pages.lock().expect("home pages") = vec![home_fixture("fresh", None)];
+        app.rate_track(&TrackId::new(ProviderId::YTMUSIC, "old"), Rating::None)
+            .await.expect("remote rating");
+        assert_eq!(app.playlist_tracks(&playlist).await.expect("refreshed liked"), [track("fresh")]);
+        let fresh_home = app.home(Some("ytmusic"), false).await.expect("refreshed home");
+        assert_eq!(fresh_home.shelves, home_fixture("fresh", None).shelves);
+        app.player.mpv().shutdown().await;
     }
 
     #[tokio::test]
