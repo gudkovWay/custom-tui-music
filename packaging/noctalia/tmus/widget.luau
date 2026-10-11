@@ -166,10 +166,30 @@ local function artNode(s)
   return ui.glyph({ key = "glyph", name = glyph or "music", color = color or "on_surface_variant" })
 end
 
+-- Индикатор паузы. artNode уже показывает plug-off, когда связи нет, и
+-- player-pause, когда пауза застала без арта; собственный значок нужен
+-- ровно в одном случае — пауза при живой картинке (арт там лишь
+-- приглушён, и состояние с одного взгляда не читается).
+local function stateBadge(s)
+  if s.linked and s.status == "paused" and tostring(s.artPath or "") ~= "" then
+    return "player-pause", "secondary"
+  end
+  return nil
+end
+
 local function draw()
   local s = snapshot
   local text = label(s)
   local children = { artNode(s) }
+  local badge, badgeColor = stateBadge(s)
+  if badge then
+    table.insert(children, ui.glyph({
+      key = "state",
+      name = badge,
+      size = 12,
+      color = badgeColor,
+    }))
+  end
   if text ~= "" then
     -- Название — sans скина; числовая подпись (позиция/длительность)
     -- живёт в tooltip, а не в баре.
