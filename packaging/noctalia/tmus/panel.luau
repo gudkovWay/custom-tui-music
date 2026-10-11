@@ -6,8 +6,22 @@ local SERVICE = "q/tmus:watch"
 -- Общий скин десктопа: модуль и skin-assets кладутся рядом с плагином
 -- при деплое (раскладку ведёт оркестратор). Свой модуль НЕ заводим —
 -- контракт один на все панели, иначе скины разъедутся. Локальный
--- require требует plugin_api >= 22; у плагина 24.
+-- require требует plugin_api >= 22; у плагина 32 (минимум модуля —
+-- 22, плюс getSetting 26 и getColor 31, см. комментарий манифеста).
 local skin = require('./desktop_skin.luau')
+
+-- Активна ли семья Stagecraft в текущем кадре и её рез шамфера (канон
+-- skin.tokens().chamfer). Считается ОДИН раз в начале draw(), а не в
+-- каждом узле: у панели десятки строк, а stagecraft()/tokens() читают
+-- настройки. Смена рецепта подхватывается на ближайшем рендере.
+local SC = false
+local CHAM = 14
+
+-- Семья Kumihimo текущего кадра и её токены (шесть цветов применённого
+-- рецепта). Взаимоисключающа со SC: у активного Kumihimo stagecraft()
+-- вернёт false. Тоже читается один раз на кадр.
+local KU = false
+local KT = nil
 
 -- Цвета — ИМЕНА РОЛЕЙ палитры хоста, а не hex: хост сам резолвит их в
 -- актуальный Material-цвет, поэтому смена темы/обоев перекрашивает
@@ -21,7 +35,7 @@ local skin = require('./desktop_skin.luau')
 -- заливки строк: фон=surface, курсор=primary/0.20, играет=
 -- secondary/0.28; курсор НА играющей — заливка playing плюс рамка
 -- border 1px, иначе было бы неразличимо, чей цвет сильнее.
-local COLORS = {
+local COLORS_ROLE = {
   bg = "surface",
   surface = "surface_variant",
   -- Курсорная строка обязана читаться с одного взгляда: проба 18.09
@@ -46,6 +60,101 @@ local COLORS = {
   -- ещё одна плашка. Роль с альфой — из проверенно рендерящихся.
   chrome = "surface_variant/0.55",
 }
+
+-- Активная палитра кадра. Роли хоста (Stagecraft/дефолт) ЛИБО hex-цвета
+-- применённого рецепта Kumihimo: у Kumihimo материал задают обои, а не
+-- базовая палитра, поэтому роли тут не участвуют. Значения читаются на
+-- каждом использовании, поэтому подмена полей в начале draw() перекрашивает
+-- весь кадр без правок десятков узлов.
+local COLORS = {}
+-- Новые рендер-хелперы Kumihimo живут полями одной таблицы: у главного
+-- чанка жёсткий лимит локальных имён, и каждая отдельная `local function`
+-- занимает слот до конца файла.
+local KUF = {}
+function KUF.rolePalette()
+  for k, v in pairs(COLORS_ROLE) do
+    COLORS[k] = v
+  end
+end
+
+-- Палитра Kumihimo из шести настроек применённого рецепта. Полупрозрачные
+-- заливки — hex с альфой "#rrggbbaa" (парсер цвета хоста её принимает).
+-- selected(курсор) и playing(играет) — производные акцента и muted, НЕ
+-- декоративный шнур: бордо остаётся материалом, а не идентичностью
+-- фокуса/воспроизведения.
+function KUF.kumihimoPalette(t)
+  local c = t.colors
+  COLORS.bg = c.surface
+  COLORS.surface = c.surfaceVariant
+  COLORS.selected = c.accent .. "47"
+  COLORS.playing = c.muted .. "33"
+  COLORS.npbg = c.surfaceVariant .. "8c"
+  COLORS.text = c.text
+  COLORS.muted = c.muted
+  COLORS.border = c.outline
+  COLORS.accent = c.accent
+  COLORS.error = "#c2504a"
+  COLORS.chrome = c.surfaceVariant .. "8c"
+end
+KUF.rolePalette()
+
+-- Тёплая локальная палитра кнопки Kumihimo: явные normal/hover/pressed
+-- цвета держат состояния кнопки в материале рецепта и не дают хост-синему
+-- (variant primary/ghost) просвечивать. p.hot — акцентная кнопка
+-- (toggle/включённый режим): заливка accent, текст/глиф — surface. В
+-- неактивной семье props возвращаются нетронутыми: кнопка остаётся
+-- ровно на прежней variant-палитре, дефолт не меняется.
+function KUF.warmButton(p, hot)
+  if not KU then
+    return p
+  end
+  local c = KT.colors
+  if hot then
+    p.fill = c.accent
+    p.hoverFill = c.accent
+    p.pressedFill = c.accent
+    p.color = c.surface
+    p.hoverColor = c.surface
+    p.pressedColor = c.surface
+  else
+    p.fill = c.surfaceVariant
+    -- Полупрозрачный accent поверх тёплой поверхности: hover/press
+    -- только меняют локальный цвет, геометрия не двигается.
+    p.hoverFill = c.accent .. "40"
+    p.pressedFill = c.accent .. "66"
+    p.color = c.text
+    p.hoverColor = c.text
+    p.pressedColor = c.text
+  end
+  p.border = c.outline
+  p.borderWidth = 1
+  p.radius = 6
+  return p
+end
+
+-- Kumihimo-toggle: тёплый ОЧЕРЧЕННЫЙ круг 32×32 (radius 16) с акцентной
+-- рамкой и акцентным глифом — главная кнопка транспорта читается, но не
+-- становится сплошной золотой плашкой. Кнопка-глиф и так меряется 32×32
+-- (глиф 16 + паддинг 8×2), поэтому явные width/height лишь фиксируют
+-- круг, а contentAlign центрирует глиф в нём. Вне Kumihimo props
+-- возвращаются нетронутыми: non-KU вид не меняется.
+function KUF.warmToggleProps(p)
+  if not KU then
+    return p
+  end
+  local c = KT.colors
+  KUF.warmButton(p, false)
+  p.border = c.accent
+  p.color = c.accent
+  p.hoverColor = c.accent
+  p.pressedColor = c.accent
+  p.radius = 16
+  p.width = 32
+  p.height = 32
+  p.contentAlign = "center"
+  return p
+end
+
 -- UI-текст — sans скина (Noto Sans); MONO (Agave Nerd Font) остаётся
 -- глифам и числовым метаданным: тайминги, счётчики, индексы, полосы eq,
 -- индикатор окна. Кириллица есть и там, и там (Noto Sans CJK — фолбэк
@@ -54,88 +163,215 @@ local FONT = skin.FONT
 local RAIL = 64
 local GAP = 12
 local PAD = 16
+-- Хост режет манифестную площадь панели ДО plugin.layout: native
+-- panel_manager вычитает 2*Style::panelPadding (14) с каждой оси, поэтому
+-- 1180×760 из манифеста — внешний размер, а рисовать панель может в
+-- 1152×732. Без этой поправки бюджеты разъезжаются с фактом на 28 px по
+-- обеим осям (окно считалось по 468, а вьюпорт был 440).
+local HOST_PANEL_PAD = 14
+-- ScrollView при переполнении контента резервирует под полосу прокрутки
+-- scrollbarWidth(6)+scrollbarGap(8). Ширину карточек home считаем с этим
+-- резервом ЗАРАНЕЕ, чтобы третья обложка не лезла под полосу.
+local SCROLL_GUTTER = 14
 -- ── Геометрия панели и бюджет окон ──────────────────────────────────
--- Панель 1180×760 (plugin.toml). Рамка скина резервирует skin.EDGE=12 px
--- с КАЖДОЙ стороны прямо в потоке, т.е. забирает 2*EDGE=24 px по каждой
--- оси; сверх этого идут собственный отступ (PAD), шапка (26), футер (16)
--- и транспортная карточка (110). Бюджеты ниже ВЫВЕДЕНЫ из этой
--- геометрии, а не назначены: окно рендерит ровно столько строк и
--- карточек, сколько влезает в реальный вьюпорт. Раньше константы были
--- «на глаз» — и, например, бюджет горизонтального окна home-полки не
--- сходился с реальной шириной центрального столба, т.е. курсор мог
--- уехать на невидимую карточку.
--- Производные живут полями одной таблицы GEO: у главного чанка жёсткий
--- лимит локальных имён, каждая новая константа занята до конца файла.
+-- Панель 1180×760 (plugin.toml). Рамка скина резервирует EDGE=12 px
+-- с КАЖДОЙ стороны прямо в потоке (2*EDGE по оси); у активного Kumihimo
+-- периметр тонкий, но сверху ещё шнур-акцент, поэтому ringX/ringY
+-- считаются раздельно. Сверх рамки идут собственный отступ (PAD),
+-- шапка/вкладки, футер и транспортная карточка. Бюджеты ниже ВЫВЕДЕНЫ
+-- из этой геометрии, а не назначены: окно рендерит ровно столько строк
+-- и карточек, сколько влезает в реальный вьюпорт — иначе курсор мог бы
+-- уехать на невидимую строку.
 local GEO = {
   pad = PAD,
-  ring = skin.EDGE * 2,
+  ringX = skin.EDGE * 2,
+  ringY = skin.EDGE * 2,
   header = 26,
   footer = 16,
   -- Транспорт (np-карточка): паддинг 12×2 + арт-строка 48 + спектр 18 +
-  -- прогресс 4 + два зазора по 8. Последний ребёнок workspace в каждом виде.
+  -- прогресс 4 + два зазора по 8. В дефолте — последний ребёнок
+  -- workspace; у Kumihimo вынесен под main во всю ширину.
   transport = 110,
   panelW = 1180,
   panelH = 760,
 }
--- Тело: панель минус рамка, отступы, шапка, футер и два зазора.
-GEO.bodyH = GEO.panelH - GEO.ring - 2 * GEO.pad - GEO.header - GEO.footer - 2 * GAP
--- Бюджет центрального вида: тело минус транспортная карточка и зазор.
-GEO.viewH = GEO.bodyH - (GEO.transport + GAP)
-GEO.bodyW = GEO.panelW - GEO.ring - 2 * GEO.pad
--- Workspace:context = 7:3 (см. draw) — ширина центрального вида, от неё
--- считается горизонтальное окно home-полки.
-GEO.workspaceW = math.floor((GEO.bodyW - (RAIL + GAP) - GAP) * 7 / 10)
 
--- Геометрия строк: ОДИН источник на поверхность — высота строки,
--- зазор и бюджет вьюпорта; видимое логическое окно ВЫВОДИТСЯ из них,
--- а не назначается вручную. Фиксированная высота ряда не даёт
--- длинному тексту раздуть строку и рассинхронизировать скролл с
--- отрисовкой (clampScroll получает только выведенный счётчик).
--- Трек-строка (поиск, плейлист, клиенты): арт 32 + паддинг 6×2 = 44 px
--- (у клиентских строк padding=12 — 44 тоже безопасный минимум).
-local TRACK_ROW_HEIGHT = 44
-local TRACK_ROW_GAP = 6
--- Над списком в каждом виде стоит заголовок вида (24) и зазор; у поиска
--- сверх этого — строка ввода (34) и ряд чипов (28) — его окно меньше,
--- и считается прямо в windowSize().
-local TRACK_VIEWPORT_HEIGHT = GEO.viewH - (24 + GAP)
-local LIST_WINDOW = math.floor((TRACK_VIEWPORT_HEIGHT + TRACK_ROW_GAP)
-  / (TRACK_ROW_HEIGHT + TRACK_ROW_GAP))
--- Сетка Library: карточка = арт 120 + паддинг 24 + две подписи ≈ 200 px.
--- Карточек в ряду сетки (см. playlistCards): шаг moveY.
+-- Верхняя строка транспорта Kumihimo — ОДНА раскладка на оба состояния
+-- (с треком и без): левая зона left шириной leftW, правая right шириной
+-- rightW, между ними (если передан) центр prev/toggle/next. Ширины зон
+-- приходят из GEO — они посчитаны в recomputeLayout от фактической
+-- ширины карточки, поэтому длинный заголовок/статус не распирает строку
+-- и не выдавливает контролы за правый край. Хелпер только собирает уже
+-- созданные узлы: обработчики, ключи и состояние — вызывающего.
+-- Определение стоит ПОСЛЕ инициализатора local GEO: оба обращения
+-- (npCenterW, npTopH) читают лексически связанную локальную таблицу.
+function KUF.npTopRow(zones)
+  local row = {
+    ui.row({ key = "np-left", gap = 12, align = "center", justify = "start", width = zones.leftW }, zones.left),
+    ui.row({ key = "np-right", gap = 12, align = "center", justify = "end", width = zones.rightW }, zones.right),
+  }
+  if zones.center then
+    table.insert(
+      row,
+      2,
+      ui.row({ key = "np-controls", gap = 6, align = "center", width = GEO.npCenterW }, zones.center)
+    )
+  end
+  return ui.row({ key = "np-top", gap = 12, align = "center", height = GEO.npTopH }, row)
+end
 local GRID_COLS = 4
-local CARD_ROW_HEIGHT = 200
-local CARD_ROW_GAP = GAP
-local CARD_VIEWPORT_HEIGHT = GEO.viewH - (24 + GAP)
-local CARD_WINDOW = GRID_COLS * math.floor((CARD_VIEWPORT_HEIGHT + CARD_ROW_GAP)
-  / (CARD_ROW_HEIGHT + CARD_ROW_GAP))
--- Окно очереди обязано ВЛЕЗАТЬ в бюджет context-колонки целиком:
--- declarative UI не даёт scrollToIndex, «скролл» — это движущееся окно
--- строк, и контент ниже вьюпорта недостижим с клавиатуры. Замер §17
--- показал, что 15 строк со зазором 12 срезались снизу (панель
--- 1180×760, фидбек 21.09). Зазор ужат до 4 px, и бюджет выведен: колонка
--- = тело минус собственный паддинг (PAD×2), заголовок очереди (20) и
--- зазор до скролла.
-local QUEUE_ROW_HEIGHT = 36
-local QUEUE_ROW_GAP = 4
-local QUEUE_VIEWPORT_HEIGHT = GEO.bodyH - 2 * GEO.pad - (20 + GAP)
-local QUEUE_WINDOW = math.floor((QUEUE_VIEWPORT_HEIGHT + QUEUE_ROW_GAP)
-  / (QUEUE_ROW_HEIGHT + QUEUE_ROW_GAP))
 local NP_SPEC_BARS = 56
--- Home-лента рекомендаций: видимых полок по Y и карточек в
--- горизонтальном окне полки — окна выводятся из геометрии, как везде.
--- Полка ≈ заголовок 20 + арт 110 + паддинг 16 + подписи ≈64 → 210 px;
--- ряд карточек шириной 150 живёт в центральном столбе (GEO.workspaceW).
--- Модель хранит всю полку для навигации; рендер — только видимое окно.
--- Над полками — хиро (64 + GAP) и управление Refresh (28 + 8).
+-- Бюджеты, зависящие от семьи: высоты рядов/полок и выведенные окна.
+-- Пересчитываются каждый кадр в recomputeLayout (смена семьи/рецепта
+-- подхватывается на ближайшем draw).
+local TRACK_ROW_HEIGHT, TRACK_ROW_GAP = 44, 6
+local CARD_ROW_HEIGHT, CARD_ROW_GAP = 200, GAP
+local QUEUE_ROW_HEIGHT, QUEUE_ROW_GAP = 36, 4
 local HOME_SHELF_HEIGHT = 210
-local HOME_SHELF_VIEWPORT_HEIGHT = GEO.viewH - (64 + GAP) - (28 + 8)
-local SHELF_WINDOW = math.floor((HOME_SHELF_VIEWPORT_HEIGHT + GAP)
-  / (HOME_SHELF_HEIGHT + GAP))
 local HOME_CARD_WIDTH = 150
-local HOME_CARDS_VIEWPORT_WIDTH = GEO.workspaceW
-local HOME_CARD_WINDOW = math.floor((HOME_CARDS_VIEWPORT_WIDTH + GAP)
-  / (HOME_CARD_WIDTH + GAP))
+local LIST_WINDOW, CARD_WINDOW, QUEUE_WINDOW, SHELF_WINDOW, HOME_CARD_WINDOW = 0, 0, 0, 0, 0
+
+-- Единственный источник бюджетов. non-Kumihimo ветка В ТОЧНОСТИ
+-- повторяет прежние числа; Kumihimo меняет шапку на горизонтальные
+-- вкладки-подвесы, выносит транспорт во всю ширину, убирает левый рейл
+-- и делает ряды очереди/полки выше — поэтому вьюпорты другие.
+-- kuView — ТЕКУЩИЙ вид: функция объявлена до `local view`, поэтому вид
+-- приходит параметром, а не захватом позже объявленной локальной
+-- переменной (та молча стала бы глобалом/nil).
+function KUF.recomputeLayout(ku, kuPad, kuView)
+  if ku then
+    local pad = kuPad or 12
+    -- Шнур/зазор рамки — из shared-модуля, а не дрейфующая копия:
+    -- бюджет не должен разъезжаться с фактическим узлом frame().
+    local cord = skin.KUMIHIMO_CORD
+    local frameGap = skin.KUMIHIMO_FRAME_GAP
+    -- Плагин рисует уже ОБРЕЗАННУЮ хостом площадь: 1180×760 из манифеста
+    -- минус 2*HOST_PANEL_PAD по каждой оси.
+    local panelW = GEO.panelW - 2 * HOST_PANEL_PAD
+    local panelH = GEO.panelH - 2 * HOST_PANEL_PAD
+    -- Корень Kumihimo паддится неодинаково: 16 по горизонтали, 8 по
+    -- вертикали. Оба числа участвуют в бюджете тела.
+    local padH, padV = 16, 8
+    -- Вкладки-подвесы: подвес 14 + тело 34 (паддинг 7×2 + строка 20).
+    -- Паддинг тела обязан быть >= 7: у срезанного угла chamfer катет равен
+    -- KUMIHIMO_FOLD (14), и контент с паддингом < 7 выступал бы за срез
+    -- (Flex не режет детей по силуэту). 48 = HANGER + 2*7 + строка глифа.
+    GEO.header = 48
+    -- np-карточка: паддинг 12×2 + арт-строка 48 + два зазора 8 + прогресс
+    -- 4 + спектр 18 = 110 ровно. Высота карточки задаётся ЯВНО (npNode),
+    -- поэтому бюджет и факт совпадают и карточка не прыгает.
+    GEO.npcH = 110
+    GEO.npTopH = 48
+    -- Fixed-height шнур-ряд cord + зазор 6 + np-карточка.
+    GEO.transport = cord + 6 + GEO.npcH
+    GEO.ringX = 2 * pad
+    -- Периметр pad×2 + верхний шнур cord + зазор рамки frameGap.
+    GEO.ringY = 2 * pad + cord + frameGap
+    -- Три зазора корня: вкладки·тело, тело·транспорт, транспорт·футер;
+    -- сам транспорт — отдельный сиблинг main во всю ширину, поэтому его
+    -- высота тоже вычитается из бюджета тела. По вертикали корень
+    -- паддится padV (8), по горизонтали — padH (16).
+    GEO.bodyH = panelH - GEO.ringY - 2 * padV - GEO.header - GEO.footer
+      - 3 * GAP - GEO.transport
+    GEO.bodyW = panelW - GEO.ringX - 2 * padH
+    -- Транспорт вынесен под main: тело целиком идёт центральному виду.
+    GEO.viewH = GEO.bodyH
+    -- Левого рейла нет: ширину делят только workspace:context — 7:3, а в
+    -- поиске 63:37 (ровно как flexGrow в main), поэтому доля приходит
+    -- параметром вида, а не выводится из фиксированной константы.
+    local wsNum, wsDen = 7, 10
+    if kuView == "search" then
+      wsNum, wsDen = 63, 100
+    end
+    GEO.workspaceW = math.floor((GEO.bodyW - GAP) * wsNum / wsDen)
+    -- ── Бюджет строки транспорта ────────────────────────────────────
+    -- Карточка занимает всю ширину тела; её контент — минус паддинг 12.
+    -- Ширины трёх зон ВЫВЕДЕНЫ из этой ширины, а не набраны flexGrow с
+    -- натуральной длиной текста: иначе 48-символьный заголовок или
+    -- длинный статус распирали бы строку и выдавливали контролы,
+    -- громкость и время за правый край.
+    local npW = GEO.bodyW - 2 * 12
+    -- Центр: prev/toggle/next — три круга 32 и два зазора 6.
+    local npCenterW = 3 * 32 + 2 * 6
+    -- Справа: строка громкости (глиф 14 + зазор 6 + слайдер 96 — та же
+    -- ширина, что задаёт volumeNode, поэтому она в GEO) + зазор 12 +
+    -- колонка времени/статуса (моно 12: «88:88 / 88:88» ≈ 94; 150 — с
+    -- запасом на строку статуса, который при переполнении эллипсится).
+    local npTimeW = 150
+    local npVolW = 14 + 6 + 96
+    -- Равные боковые зоны удерживают prev/toggle/next точно в центре.
+    -- Справа содержимое прижато к краю; слева текст получает остаток
+    -- после арта и двух режимов, не вытесняя центр.
+    local npLeftW = (npW - npCenterW - 2 * 12) / 2
+    local npRightW = npLeftW
+    GEO.npW = npW
+    GEO.npCenterW, GEO.npRightW, GEO.npTimeW = npCenterW, npRightW, npTimeW
+    GEO.npVolW = npVolW
+    GEO.npLeftW = npLeftW
+    GEO.npTextW = npLeftW - (48 + 12 + 12 + 2 * 32 + 2 * 6 + 20)
+    -- Без трека центра нет: правая зона вбирает и его ширину.
+    GEO.npStateW = npRightW + npCenterW + 12
+    TRACK_ROW_HEIGHT, TRACK_ROW_GAP = 44, 6
+    CARD_ROW_HEIGHT, CARD_ROW_GAP = 200, GAP
+    -- Подвесной ряд очереди: подвес HANGER 14 + тело 44 при паддинге 7 —
+    -- контент (арт 28) получает 58−14−14 = 30, запас 2. Паддинг >=7
+    -- обязателен: иначе контент выступает за chamfer-срез угла.
+    QUEUE_ROW_HEIGHT, QUEUE_ROW_GAP = 58, 6
+    -- Подвесная карточка обложки (coverFold=true): подвес HANGER 14 +
+    -- стабильный слот угла FOLD 14 + тело 152 = 180. Слот угла ВЫРЕЗАЕТСЯ
+    -- из высоты, детям тела (padding 7) остаётся 180 − 14 − 14 − 2×7 = 138.
+    -- slot: квадратный арт 96 + caption-обёртки 18/16 + два зазора 3 = 136
+    -- (нативные Label.height не применяются — фиксированные слоты держат
+    -- flex-обёртки, а не сам label). padding 7 — минимум против chamfer.
+    GEO.cardH = 180
+    GEO.cardArt = 96
+    -- Полка: заголовок 20 + зазор 6 + шнур 8 + зазор 0 + карточка 180 =
+    -- 214. Две полки (2×214 + GAP 12 = 440) влезают в вьюпорт 456.
+    HOME_SHELF_HEIGHT = 20 + 6 + cord + 0 + GEO.cardH
+    -- Обложка: ширина ВЫВЕДЕНА из фактической ширины рабочей области.
+    -- Из неё заранее вычтен SCROLL_GUTTER (полоса прокрутки), поэтому три
+    -- обложки и два зазора (3×W + 2×GAP) гарантированно влезают даже
+    -- когда полоса прокрутки появится.
+    HOME_CARD_WIDTH = math.floor((GEO.workspaceW - SCROLL_GUTTER - 2 * GAP) / 3)
+  else
+    GEO.header = 26
+    GEO.transport = 110
+    GEO.ringX = skin.EDGE * 2
+    GEO.ringY = skin.EDGE * 2
+    GEO.bodyH = GEO.panelH - GEO.ringY - 2 * GEO.pad - GEO.header - GEO.footer - 2 * GAP
+    GEO.bodyW = GEO.panelW - GEO.ringX - 2 * GEO.pad
+    GEO.viewH = GEO.bodyH - (GEO.transport + GAP)
+    GEO.workspaceW = math.floor((GEO.bodyW - (RAIL + GAP) - GAP) * 7 / 10)
+    TRACK_ROW_HEIGHT, TRACK_ROW_GAP = 44, 6
+    CARD_ROW_HEIGHT, CARD_ROW_GAP = 200, GAP
+    QUEUE_ROW_HEIGHT, QUEUE_ROW_GAP = 36, 4
+    HOME_SHELF_HEIGHT = 210
+    HOME_CARD_WIDTH = 150
+  end
+  -- Над списком стоит заголовок вида (24) и зазор; вьюпорт — от него.
+  local trackVp = GEO.viewH - (24 + GAP)
+  LIST_WINDOW = math.floor((trackVp + TRACK_ROW_GAP) / (TRACK_ROW_HEIGHT + TRACK_ROW_GAP))
+  CARD_WINDOW = GRID_COLS * math.floor((trackVp + CARD_ROW_GAP) / (CARD_ROW_HEIGHT + CARD_ROW_GAP))
+  -- Колонка очереди: тело минус собственный паддинг, заголовок (20), зазор.
+  local queueVp = GEO.bodyH - 2 * GEO.pad - (20 + GAP)
+  QUEUE_WINDOW = math.floor((queueVp + QUEUE_ROW_GAP) / (QUEUE_ROW_HEIGHT + QUEUE_ROW_GAP))
+  -- Полки home: у Kumihimo дублирующего трек-хиро нет — лента начинается
+  -- сразу, поэтому вьюпорт полок равен полной высоте вида; у дефолта над
+  -- полками висит хиро (64 + зазор). Окно Kumihimo дополнительно капнуто
+  -- самой композицией: не больше двух полок и трёх обложек в ряду, даже
+  -- если выведенное по ширине/высоте окно шире.
+  local shelfVp = GEO.viewH - (ku and 0 or (64 + GAP))
+  SHELF_WINDOW = math.floor((shelfVp + GAP) / (HOME_SHELF_HEIGHT + GAP))
+  HOME_CARD_WINDOW = math.floor((GEO.workspaceW + GAP) / (HOME_CARD_WIDTH + GAP))
+  if ku then
+    SHELF_WINDOW = math.min(2, SHELF_WINDOW)
+    HOME_CARD_WINDOW = math.min(3, HOME_CARD_WINDOW)
+    -- Clients: реальный провайдерский ряд 64 при зазоре 6; бюджет окна
+    -- выводится из этих чисел, а не из общей строки списка.
+    GEO.clientRow, GEO.clientGap = 64, 6
+  end
+end
+KUF.recomputeLayout(false)
 
 local VIEWS = {
   { id = "home", title = "Home", glyph = "home" },
@@ -439,6 +675,34 @@ local function spectrumBars(count, maxHeight, barWidth, gap, fillColor)
   return ui.row({ key = "spec-bars", gap = gap or 2, align = "center" }, bars)
 end
 
+-- Kumihimo-спектр: ровно 24 реальные полосы хоста (публикует виджет в
+-- лёгкий ключ). Каждая полоса — grow-ребёнок ПОЛНОШИРИННОГО ряда, поэтому
+-- никакой короткой левой ленты: полосы делят всю ширину транспорта.
+-- Значения парсятся тем же CSV и клампятся в 0..1; нулевая полоса (тишина)
+-- оставляет базовую линию 1 px. Ряд выравнивается по нижнему краю кадра.
+function KUF.kuSpectrum(csv)
+  local values = {}
+  local at = 1
+  for num in string.gmatch(tostring(csv or ""), "([^,]+)") do
+    if at > 24 then
+      break
+    end
+    values[at] = math.max(0, math.min(1, tonumber(num) or 0))
+    at = at + 1
+  end
+  local bars = {}
+  for i = 1, 24 do
+    bars[i] = ui.box({
+      key = "spec-bar" .. i,
+      flexGrow = 1,
+      height = math.max(1, math.floor((values[i] or 0) * 18 + 0.5)),
+      radius = 1,
+      fill = COLORS.accent,
+    })
+  end
+  return ui.row({ key = "spec-bars", gap = 2, align = "end", flexGrow = 1 }, bars)
+end
+
 local function clock(seconds)
   local total = math.floor(tonumber(seconds) or 0)
   if total < 0 then
@@ -587,9 +851,9 @@ local function playlistAddable(p, trackProv)
   return type(caps) == "table" and caps.playlist_add == true
 end
 
--- Рендер-модель home-ленты: все поддержанные cards из homeFeed.
--- Счётчик отражает доступные навигации карточки; рендер остаётся оконным.
--- Пустые полки выбрасываются.
+-- Рендер-модель home-ленты: массив полок {title, subtitle, count,
+-- cards} из homeFeed. Держим все карточки для навигации; draw
+-- рендерит только видимое окно. Пустые полки выбрасываются.
 -- Перевычисляется только в watch-колбэке (rebuildHomeShelves) — draw
 -- до 8 Гц не должен перебирать полки.
 local function rebuildHomeShelves()
@@ -718,6 +982,10 @@ end
 
 local function lbl(text, props)
   local p = props or {}
+  -- height/maxLines доходят до хоста как есть: label своей высоты не
+  -- имеет (её задаёт строка/колонка родителя), а maxLines=1 запрещает
+  -- перенос там, где бюджет строки посчитан на одну строку. nil — ключ
+  -- не выставляется, поэтому не-Kumihimo вызовы не меняются.
   return ui.label({
     key = p.key,
     text = text,
@@ -728,25 +996,72 @@ local function lbl(text, props)
     fontFamily = p.mono and skin.MONO or FONT,
     flexGrow = p.grow,
     width = p.width,
+    height = p.height,
     maxWidth = p.maxWidth,
+    maxLines = p.maxLines,
     opacity = p.opacity,
   })
 end
 
 local function card(children, props)
   local p = props or {}
+  -- Kumihimo: тёмная тёплая поверхность рецепта, тонкая рамка outline;
+  -- НЕ Stagecraft-материал и не blossom. Явные p.fill/p.border сильнее.
+  if KU then
+    return ui.column({
+      key = p.key,
+      gap = p.gap or 10,
+      padding = p.padding or PAD,
+      radius = p.radius or 8,
+      -- p.shape — opt-in (state-карточки KU): срезанный угол 8 совпадает
+      -- с языком ярлыков; по умолчанию остаётся прежняя скруглённая форма.
+      shape = p.shape,
+      fill = p.fill or KT.colors.surfaceVariant,
+      border = p.border or KT.colors.outline,
+      borderWidth = p.borderWidth or 1,
+      flexGrow = p.grow,
+      width = p.width,
+      -- Явная высота карточки Kumihimo: транспорт держит свой бюджет
+      -- (GEO.npcH), а не натуральную сумму детей, иначе строка могла бы
+      -- разойтись с посчитанным вьюпортом.
+      height = p.height,
+      maxWidth = p.maxWidth,
+    }, children)
+  end
+  -- Материал Стейджикрафта: шамферная гравировка и серебряный волосок
+  -- включаются ТОЛЬКО для активной семьи; для остальных (и для дефолта
+  -- без скина) остаются прежняя скруглённая геометрия и отсутствие
+  -- рамки. Явные p.radius/p.border вызывающего всегда сильнее.
+  local sc = SC
   return ui.column({
     key = p.key,
     gap = p.gap or 10,
     padding = p.padding or PAD,
-    radius = p.radius or 10,
+    radius = p.radius or (sc and CHAM or 10),
+    shape = sc and "chamfer" or nil,
     fill = p.fill or COLORS.surface,
-    border = p.border,
-    borderWidth = p.borderWidth,
+    border = p.border or (sc and COLORS.border or nil),
+    borderWidth = p.borderWidth or (sc and 1 or nil),
     flexGrow = p.grow,
     width = p.width,
     maxWidth = p.maxWidth,
   }, children)
+end
+
+-- Дети декларативного узла обязаны быть плотной последовательностью.
+-- compact(...) собирает варахарги без дыр: nil/false пропускаются, порядок
+-- и все реальные узлы сохраняются. Счёт по select('#', ...), поэтому
+-- результат не зависит от длины массива-источника.
+local function compact(...)
+  local out = {}
+  local count = select("#", ...)
+  for i = 1, count do
+    local node = select(i, ...)
+    if node ~= nil and node ~= false then
+      out[#out + 1] = node
+    end
+  end
+  return out
 end
 
 local function artNode(path, size, glyph)
@@ -799,10 +1114,44 @@ local volDraft = nil
 -- контрола и модала подсказок (?).
 local function volumeNode(s)
   local current = volDraft or math.max(0, math.min(100, math.floor(tonumber(s.volume) or 0)))
+  local sliderProps = {
+    key = "np-volume-slider",
+    min = 0,
+    max = 100,
+    step = 5,
+    value = current,
+    width = 96,
+    -- Kumihimo: точную ширину слайдер получает как grow-ребёнок строки
+    -- громкости (см. volumeNode ниже) — проп width хост игнорирует.
+    flexGrow = KU and 1 or nil,
+    onChange = function(v)
+      volDraft = math.max(0, math.min(100, math.floor(tonumber(v) or 0)))
+    end,
+    onDragEnd = function()
+      local final = volDraft or current
+      volDraft = nil
+      poke("vol-set", tostring(math.max(0, math.min(100, math.floor(tonumber(final) or 0)))))
+    end,
+  }
+  -- Kumihimo: тёплая палитра слайдера из поддерживаемых реконсилютором
+  -- свойств (fill/track/thumb/focusColor) — иначе хост-синий ползунок.
+  if KU then
+    local c = KT.colors
+    sliderProps.fill = c.accent
+    sliderProps.track = c.outline
+    sliderProps.thumb = c.text
+    sliderProps.focusColor = c.accent
+  end
   return ui.row({
     key = "np-volume",
     gap = 6,
     align = "center",
+    -- Kumihimo: строка громкости ФИКСИРОВАННОЙ ширины (глиф 14 + зазор 6
+    -- + слайдер 96), а слайдер внутри растёт. Хост НЕ применяет width к
+    -- ui.slider — реконсилятор его не читает, и слайдер мерится дефолтными
+    -- 180, ломая бюджет правой зоны транспорта; точную ширину получает
+    -- только grow-ребёнок. Вне Kumihimo строка остаётся натуральной.
+    width = KU and GEO.npVolW or nil,
   }, {
     ui.glyph({
       key = "np-volume-glyph",
@@ -810,22 +1159,7 @@ local function volumeNode(s)
       size = 14,
       color = COLORS.muted,
     }),
-    ui.slider({
-      key = "np-volume-slider",
-      min = 0,
-      max = 100,
-      step = 5,
-      value = current,
-      width = 96,
-      onChange = function(v)
-        volDraft = math.max(0, math.min(100, math.floor(tonumber(v) or 0)))
-      end,
-      onDragEnd = function()
-        local final = volDraft or current
-        volDraft = nil
-        poke("vol-set", tostring(math.max(0, math.min(100, math.floor(tonumber(final) or 0)))))
-      end,
-    }),
+    ui.slider(sliderProps),
   })
 end
 
@@ -848,130 +1182,278 @@ local function npNode(s)
     if (s.loop or "none") ~= "none" then
       table.insert(marks, REPEAT_LABEL[tostring(s.loop)] or tostring(s.loop))
     end
-    local controls = {
-      ui.button({
-        key = "prev",
-        glyph = "player-skip-back",
-        controlSize = "sm",
-        variant = "ghost",
-        onClick = function()
-          poke("prev")
-        end,
-      }),
-      ui.button({
-        key = "toggle",
-        glyph = s.status == "playing" and "player-pause" or "player-play",
-        controlSize = "sm",
-        variant = "primary",
-        onClick = function()
-          poke("toggle")
-        end,
-      }),
-      ui.button({
-        key = "next",
-        glyph = "player-skip-forward",
-        controlSize = "sm",
-        variant = "ghost",
-        onClick = function()
-          poke("next")
-        end,
-      }),
-      ui.button({
-        key = "shuffle",
-        glyph = "arrows-shuffle",
-        controlSize = "sm",
-        variant = s.shuffle and "primary" or "ghost",
-        onClick = function()
-          poke("shuffle", "toggle")
-        end,
-      }),
-      ui.button({
-        key = "repeat",
-        -- Три различимых состояния: track — «repeat-once», queue —
-        -- «repeat», оба primary; none — тусклый ghost.
-        glyph = (tostring(s.loop or "none")) == "track" and "repeat-once" or "repeat",
-        controlSize = "sm",
-        variant = (tostring(s.loop or "none")) ~= "none" and "primary" or "ghost",
-        onClick = function()
-          poke("repeat", REPEAT_CYCLE[tostring(s.loop or "none")] or "none")
-        end,
-      }),
-    }
     local loopMode = tostring(s.loop or "none")
-    if loopMode ~= "none" then
-      table.insert(controls, ui.label(REPEAT_SHORT[loopMode] or loopMode, {
-        key = "np-repeat-short",
-        size = 11,
-        color = COLORS.muted,
-        fontFamily = skin.MONO,
-      }))
-    end
-    table.insert(controls, volumeNode(s))
-    table.insert(children, ui.row({ key = "np-top", gap = 12, align = "center" }, {
-      artNode(s.artPath, 48),
-      ui.column({ key = "np-text", gap = 2, flexGrow = 1 }, {
-        lbl(providerGlyph(s.provider) .. shorten(tostring(s.title or ""), 48), { key = "np-title", size = 15, color = COLORS.text }),
-        lbl(shorten(tostring(s.artist or ""), 48), { key = "np-artist", size = 12, color = COLORS.muted }),
-        -- Причина отказа видна и без играющего трека — иначе она
-        -- нужна именно тогда, когда трека нет.
-        (tostring(s.lastError or "") ~= "") and lbl(shorten("! " .. tostring(s.lastError), 56), { key = "np-error", size = 11, color = COLORS.error }) or nil,
-        lbl(#marks > 0 and table.concat(marks, " · ") or "", {
-          key = "np-marks",
-          size = 11,
-          color = COLORS.muted,
-        }),
+    -- Кнопки транспорта создаются ОДИН раз: обработчики, глифы и режимы у
+    -- обеих семейств одни и те же — различаются только раскладка
+    -- (Kumihimo собирает из них три зоны, см. ниже) и палитра
+    -- (KUF.warmButton / KUF.warmToggleProps вне Kumihimo возвращают props
+    -- нетронутыми, поэтому вид non-KU не меняется).
+    local btnPrev = ui.button(KUF.warmButton({
+      key = "prev",
+      glyph = "player-skip-back",
+      controlSize = "sm",
+      variant = "ghost",
+      onClick = function()
+        poke("prev")
+      end,
+    }))
+    -- Toggle — тёплый очерченный круг 32/radius16 (не сплошная плашка);
+    -- вне Kumihimo props не тронуты и работает прежний variant=primary.
+    local btnToggle = ui.button(KUF.warmToggleProps({
+      key = "toggle",
+      glyph = s.status == "playing" and "player-pause" or "player-play",
+      controlSize = "sm",
+      variant = "primary",
+      onClick = function()
+        poke("toggle")
+      end,
+    }))
+    local btnNext = ui.button(KUF.warmButton({
+      key = "next",
+      glyph = "player-skip-forward",
+      controlSize = "sm",
+      variant = "ghost",
+      onClick = function()
+        poke("next")
+      end,
+    }))
+    local btnShuffle = ui.button(KUF.warmButton({
+      key = "shuffle",
+      glyph = "arrows-shuffle",
+      controlSize = "sm",
+      variant = s.shuffle and "primary" or "ghost",
+      onClick = function()
+        poke("shuffle", "toggle")
+      end,
+    }, s.shuffle == true))
+    -- Три различимых состояния повтора: track — «repeat-once», queue —
+    -- «repeat», оба primary; none — тусклый ghost.
+    local btnRepeat = ui.button(KUF.warmButton({
+      key = "repeat",
+      glyph = loopMode == "track" and "repeat-once" or "repeat",
+      controlSize = "sm",
+      variant = loopMode ~= "none" and "primary" or "ghost",
+      onClick = function()
+        poke("repeat", REPEAT_CYCLE[loopMode] or "none")
+      end,
+    }, loopMode ~= "none"))
+    local volume = volumeNode(s)
+    -- Подпись режима повтора для Kumihimo — ОБЫЧНЫЙ lbl: ui.label берёт
+    -- ОДНУ таблицу props, поэтому прежний вызов ui.label(text, props)
+    -- оставлял подпись пустой. Бюджет строки транспорта посчитан на одну
+    -- строку, отсюда maxLines=1. В non-KU ветке (ниже) тот прежний вызов
+    -- сохранён как есть — её рендер менять запрещено.
+    local repeatShort = (loopMode ~= "none") and lbl(REPEAT_SHORT[loopMode] or loopMode, {
+      key = "np-repeat-short",
+      size = 11,
+      color = COLORS.muted,
+      mono = true,
+      maxLines = 1,
+    }) or nil
+    -- Ошибка важнее меток (она объясняет срыв), метки — фолбэк.
+    local err = tostring(s.lastError or "")
+    -- Kumihimo: колонка текста получает РЕАЛЬНУЮ ширину из GEO, а подписи —
+    -- maxLines=1: иначе натуральная длина 48-символьного заголовка
+    -- распирала бы строку транспорта. Вне KU ширина по-прежнему от
+    -- раскладки, а maxLines не выставляется.
+    local textColumn = ui.column({ key = "np-text", gap = 2, flexGrow = 1, width = KU and GEO.npTextW or nil }, compact(
+      lbl(providerGlyph(s.provider) .. shorten(tostring(s.title or ""), 48), {
+        key = "np-title",
+        size = 15,
+        color = COLORS.text,
+        maxLines = KU and 1 or nil,
+        maxWidth = KU and GEO.npTextW or nil,
       }),
-      lbl(clock(pos) .. (dur > 0 and (" / " .. clock(dur)) or ""), {
-        key = "np-time",
+      lbl(shorten(tostring(s.artist or ""), 48), {
+        key = "np-artist",
         size = 12,
         color = COLORS.muted,
-        mono = true,
+        maxLines = KU and 1 or nil,
+        maxWidth = KU and GEO.npTextW or nil,
       }),
-      ui.row({ key = "np-controls", gap = 6, align = "center" }, controls),
-    }))
+      -- Только дефолт держит причину отдельной строкой текста: у
+      -- Kumihimo она переезжает в правую колонку под время (ниже),
+      -- чтобы высота арт-строки осталась 48 и бюджет транспорта — 110.
+      (not KU) and err ~= "" and lbl(shorten("! " .. err, 56), { key = "np-error", size = 11, color = COLORS.error }) or nil,
+      (not KU) and lbl(#marks > 0 and table.concat(marks, " · ") or "", {
+        key = "np-marks",
+        size = 11,
+        color = COLORS.muted,
+      }) or nil
+    ))
+    local timeLabel = lbl(clock(pos) .. (dur > 0 and (" / " .. clock(dur)) or ""), {
+      key = "np-time",
+      size = 12,
+      color = COLORS.muted,
+      mono = true,
+      -- Kumihimo: время живёт в правой колонке своего бюджета (GEO.npTimeW).
+      maxLines = KU and 1 or nil,
+      maxWidth = KU and GEO.npTimeW or nil,
+    })
+    if KU then
+      -- Транспорт Kumihimo — три зоны по факту, без «оба края grow»:
+      -- слева режимы (shuffle/repeat) и now-playing, в центре
+      -- prev/toggle/next, справа громкость и время со статусом. Ширины зон
+      -- посчитаны в recomputeLayout от реальной ширины карточки (GEO.np*),
+      -- поэтому длинный заголовок или статус не вытесняет контролы за
+      -- край. Все прежние действия, глифы и метки сохранены 1:1.
+      local statusText = err ~= "" and ("! " .. shorten(err, 48))
+        or (#marks > 0 and table.concat(marks, " · ") or "")
+      table.insert(children, KUF.npTopRow({
+        leftW = GEO.npLeftW,
+        rightW = GEO.npRightW,
+        left = compact(
+          artNode(s.artPath, 48),
+          textColumn,
+          ui.row({ key = "np-modes", gap = 6, align = "center" }, compact(btnShuffle, btnRepeat, repeatShort))
+        ),
+        center = compact(btnPrev, btnToggle, btnNext),
+        right = compact(
+          volume,
+          ui.column({ key = "np-time-col", gap = 2, align = "end", width = GEO.npTimeW }, compact(
+            timeLabel,
+            statusText ~= "" and lbl(statusText, {
+              key = "np-status",
+              size = 11,
+              color = err ~= "" and COLORS.error or COLORS.muted,
+              maxLines = 1,
+              maxWidth = GEO.npTimeW,
+            }) or nil
+          ))
+        ),
+      }))
+    else
+      -- Non-KU транспорт — ровно прежний состав и порядок: арт, текст,
+      -- время и ряд контролов (prev/toggle/next/shuffle/repeat + подпись
+      -- режима + громкость). Прежний вызов ui.label(text, props) для
+      -- подписи режима оставлен как есть: рендер non-KU не меняем.
+      local controls = { btnPrev, btnToggle, btnNext, btnShuffle, btnRepeat }
+      if loopMode ~= "none" then
+        table.insert(controls, ui.label(REPEAT_SHORT[loopMode] or loopMode, {
+          key = "np-repeat-short",
+          size = 11,
+          color = COLORS.muted,
+          fontFamily = skin.MONO,
+        }))
+      end
+      table.insert(controls, volume)
+      table.insert(children, ui.row({ key = "np-top", gap = 12, align = "center" }, {
+        artNode(s.artPath, 48),
+        textColumn,
+        timeLabel,
+        ui.row({ key = "np-controls", gap = 6, align = "center" }, controls),
+      }))
+    end
     if dur > 0 then
-      table.insert(children, ui.progress({
+      local progressProps = {
         key = "np-progress",
         progress = math.max(0, math.min(1, pos / dur)),
-        flexGrow = 1,
         height = 4,
         radius = 2,
-      }))
+      }
+      -- Kumihimo: полоса НЕ растёт по оси колонки (той же оси, что и
+      -- карточка) — только фиксированная высота 4, ширину даёт stretch
+      -- карточки. Вне Kumihimo — прежний flexGrow=1.
+      if not KU then
+        progressProps.flexGrow = 1
+      end
+      -- Тёплая полоса прогресса из поддерживаемых свойств (fill/track):
+      -- иначе дефолтная хост-синяя заливка.
+      if KU then
+        progressProps.fill = KT.colors.accent
+        progressProps.track = KT.colors.outline
+      end
+      table.insert(children, ui.progress(progressProps))
     end
   else
     -- Без трека геометрия та же: карточка с текстом вместо кнопок —
     -- соседние вью не прыгают при старте/остановке демона.
-    table.insert(children, ui.row({ key = "np-top", gap = 12, align = "center" }, {
-      ui.glyph({
-        key = "np-state-glyph",
-        name = s.linked and "music" or "plug-off",
-        color = COLORS.muted,
-      }),
-      ui.column({ key = "np-text", gap = 2, flexGrow = 1 }, {
-        lbl(s.linked and "Nothing playing" or "tmusd is not responding", {
-          key = "np-state-title",
-          size = 15,
-          color = COLORS.text,
-        }),
-        s.linked and nil or lbl("start it with: systemctl --user start tmusd", {
-          key = "np-state-hint",
-          size = 12,
+    local stateTitle = lbl(s.linked and "Nothing playing" or "tmusd is not responding", {
+      key = "np-state-title",
+      size = 15,
+      color = COLORS.text,
+      maxLines = KU and 1 or nil,
+      maxWidth = KU and GEO.npTextW or nil,
+    })
+    -- Подсказка — только без связи; ошибка видна и без трека. Бюджет
+    -- правой зоны Kumihimo (GEO.npStateW) держит обе подписи одной
+    -- строкой: длинная ошибка эллипсится, а не вылезает за карточку.
+    local hintLabel = (not s.linked) and lbl("start it with: systemctl --user start tmusd", {
+      key = "np-state-hint",
+      size = 12,
+      color = COLORS.muted,
+      maxLines = KU and 1 or nil,
+      maxWidth = KU and GEO.npStateW or nil,
+    }) or nil
+    local errLabel = (tostring(s.lastError or "") ~= "") and lbl(shorten("! " .. tostring(s.lastError), 56), {
+      key = "np-error",
+      size = 11,
+      color = COLORS.error,
+      maxLines = KU and 1 or nil,
+      maxWidth = KU and GEO.npStateW or nil,
+    }) or nil
+    if KU then
+      -- Kumihimo: подсказка/ошибка — в правой колонке (как метки
+      -- транспорта), левая строка остаётся высотой 48; иначе три строки
+      -- (54 px) раздули бы явно ограниченную карточку. Обе зоны имеют
+      -- реальную ширину из GEO (центр отсутствует — правая вбирает его).
+      table.insert(children, KUF.npTopRow({
+        leftW = GEO.npLeftW,
+        rightW = GEO.npStateW,
+        left = {
+          ui.glyph({
+            key = "np-state-glyph",
+            name = s.linked and "music" or "plug-off",
+            color = COLORS.muted,
+          }),
+          ui.column({ key = "np-text", gap = 2, flexGrow = 1 }, { stateTitle }),
+        },
+        right = {
+          ui.column({ key = "np-time-col", gap = 2, align = "end", width = GEO.npStateW }, compact(hintLabel, errLabel)),
+        },
+      }))
+    else
+      table.insert(children, ui.row({ key = "np-top", gap = 12, align = "center" }, {
+        ui.glyph({
+          key = "np-state-glyph",
+          name = s.linked and "music" or "plug-off",
           color = COLORS.muted,
         }),
-        -- Ошибка воспроизведения чаще всего остаётся при пустом треке —
-        -- без этой строки панель молчит там, где она нужнее всего.
-        (tostring(s.lastError or "") ~= "") and lbl(shorten("! " .. tostring(s.lastError), 56), { key = "np-error", size = 11, color = COLORS.error }) or nil,
-      }),
+        ui.column({ key = "np-text", gap = 2, flexGrow = 1 }, compact(
+          stateTitle,
+          hintLabel,
+          errLabel
+        )),
+      }))
+    end
+  end
+  if KU then
+    -- Kumihimo: ровно реальные 24 полосы хоста (публикует виджет),
+    -- каждая grow1 в полноширинном ряду — никакой короткой левой ленты.
+    -- Нет CSV или пауза — пустой СТАБИЛЬНЫЙ слот 18 px (высота карточки не
+    -- прыгает), а не 56 выдуманных баров.
+    local live = spectrum ~= nil and s.status == "playing"
+    table.insert(children, ui.row({ key = "np-spec", height = 18, align = "end" },
+      compact(live and KUF.kuSpectrum(spectrum) or nil)))
+  else
+    -- Полоса спектра ВСЕГДА присутствует: без живого спектра или на
+    -- паузе — «спящая» базовая линия 1 px цветом border, чтобы высота
+    -- карточки не прыгала на каждом кадре.
+    local specColor = (spectrum and s.status == "playing") and COLORS.accent or COLORS.border
+    table.insert(children, ui.row({ key = "np-spec", height = 18, align = "center" }, {
+      spectrumBars(NP_SPEC_BARS, 14, 5, 2, specColor),
     }))
   end
-  -- Полоса спектра ВСЕГДА присутствует: без живого спектра или на
-  -- паузе — «спящая» базовая линия 1 px цветом border, чтобы высота
-  -- карточки не прыгала на каждом кадре.
-  local specColor = (spectrum and s.status == "playing") and COLORS.accent or COLORS.border
-  table.insert(children, ui.row({ key = "np-spec", height = 18, align = "center" }, {
-    spectrumBars(NP_SPEC_BARS, 14, 5, 2, specColor),
-  }))
-  return card(children, { key = "np-block", fill = COLORS.npbg, gap = 8, padding = 12 })
+  -- Высота карточки Kumihimo фиксирована бюджетом: 48 (np-top) + 8 + 4
+  -- (прогресс) + 8 + 18 (спектр) + 2×12 паддинга = 110 = GEO.npcH. Явная
+  -- высота держит карточку ровно в бюджете даже без прогресса.
+  return card(children, {
+    key = "np-block",
+    fill = COLORS.npbg,
+    gap = 8,
+    padding = 12,
+    height = KU and GEO.npcH or nil,
+  })
 end
 
 local function trackRow(i, t, opts)
@@ -980,6 +1462,82 @@ local function trackRow(i, t, opts)
   local current = o.current
   -- Маркер рейтинга перед названием: ♥ лайк, × дизлайк; нет — ничего.
   local marker = o.rating == "liked" and "♥ " or (o.rating == "disliked" and "× " or "")
+  local onClick = function()
+    cursor = i
+    selected = o
+    -- Клик по треку поиска — тот же контекстный запуск, что и Enter
+    -- (activate), иначе клик и клавиша играют по-разному. Решение и
+    -- данные берём из самой строки rows() (t): в opts нет ни kind,
+    -- ни id, поэтому прежняя проверка o.kind/o.id не срабатывала и
+    -- клик уходил одиночным радио мимо контекста.
+    if view == "search" and t ~= nil and t.kind == "track" then
+      activate(t, i)
+    elseif o.event then
+      poke(o.event, o.payload)
+    end
+    draw()
+  end
+  -- Kumihimo: компактная ОФОРМЛЕННАЯ строка выдачи (44): индекс 22, арт 28,
+  -- вертикальная колонка заголовок-подзаголовок (grow1, maxLines=1) и —
+  -- когда длительность есть — ограниченный слот 44. Тот же хелпер стилизует
+  -- и строки плейлиста, не меняя их логику. Курсор (рамка accent + заливка
+  -- selected) живёт ТОЛЬКО при фокусе буфера 2; реально играющий трек
+  -- независимо получает маркер ▶ и акцент — выдуманного playing нет.
+  if KU then
+    local playing = t ~= nil and t.id ~= nil and t.id ~= ""
+      and t.id == tostring(snapshot.trackId or "")
+    local focused = (i == cursor) and focusBuf == 2
+    local time = o.time
+    return ui.row({
+      key = "track" .. i,
+      gap = 10,
+      paddingH = 10,
+      paddingV = 6,
+      height = TRACK_ROW_HEIGHT,
+      radius = 6,
+      shape = "chamfer",
+      border = focused and COLORS.accent or KT.colors.outline,
+      borderWidth = 1,
+      fill = focused and COLORS.selected or KT.colors.surfaceVariant,
+      align = "center",
+      onClick = onClick,
+    }, compact(
+      ui.row({ key = "kmark" .. i, width = 22, align = "center" }, {
+        lbl(playing and "▶" or tostring(i), {
+          key = "kidx" .. i,
+          size = 12,
+          color = playing and COLORS.accent or COLORS.muted,
+          mono = true,
+          maxLines = 1,
+        }),
+      }),
+      artNode(o.art, 28),
+      -- Бейдж провайдера и рейтинг-маркер остаются в тексте заголовка;
+      -- обрезка по реальной ширине колонки, без счётчика символов.
+      ui.column({ key = "ktext" .. i, gap = 2, flexGrow = 1 }, {
+        lbl(providerGlyph(providerByTrack(t)) .. marker .. tostring(o.title or ""), {
+          key = "ktitle" .. i,
+          size = 13,
+          color = playing and COLORS.accent or COLORS.text,
+          maxLines = 1,
+        }),
+        lbl(tostring(o.subtitle or ""), {
+          key = "ksub" .. i,
+          size = 11,
+          color = COLORS.muted,
+          maxLines = 1,
+        }),
+      }),
+      (time ~= nil and time ~= "") and ui.row({
+        key = "ktime-w" .. i,
+        width = 44,
+        justify = "end",
+        align = "center",
+      }, {
+        lbl(time, { key = "ktime" .. i, size = 11, color = COLORS.muted, mono = true, maxLines = 1 }),
+      }) or nil
+    ))
+  end
   local children = {
     ui.row({ key = "mark" .. i, width = 28, align = "center" }, {
       lbl(current and "▶" or (o.index or tostring(i)), {
@@ -1005,25 +1563,12 @@ local function trackRow(i, t, opts)
     paddingV = 6,
     height = TRACK_ROW_HEIGHT,
     radius = 6,
+    shape = SC and "chamfer" or nil,
     align = "center",
     -- Играющий трек важнее курсора: у них разные заливки, иначе
     -- «что сейчас играет» не отличить от «где курсор» при скролле.
     fill = current and COLORS.playing or (active and COLORS.selected or COLORS.bg),
-    onClick = function()
-      cursor = i
-      selected = o
-      -- Клик по треку поиска — тот же контекстный запуск, что и Enter
-      -- (activate), иначе клик и клавиша играют по-разному. Решение и
-      -- данные берём из самой строки rows() (t): в opts нет ни kind,
-      -- ни id, поэтому прежняя проверка o.kind/o.id не срабатывала и
-      -- клик уходил одиночным радио мимо контекста.
-      if view == "search" and t ~= nil and t.kind == "track" then
-        activate(t, i)
-      elseif o.event then
-        poke(o.event, o.payload)
-      end
-      draw()
-    end,
+    onClick = onClick,
   }, children)
 end
 
@@ -1209,8 +1754,15 @@ local function windowSize()
     -- У поиска над списком ещё строка ввода (34) и ряд чипов (28) со
     -- своими зазорами — окно меньше, чем у прочих списков. Считается
     -- здесь же: отдельное имя на весь чанк не заводим (лимит локалов).
+    -- У Kumihimo эта оценка недостижима: clampCursor для KU Search
+    -- возвращается раньше, а draw зовёт авторитетный KUF.searchSlice.
     return math.floor((GEO.viewH - (34 + 28 + 2 * GAP) + TRACK_ROW_GAP)
       / (TRACK_ROW_HEIGHT + TRACK_ROW_GAP))
+  elseif view == "clients" and KU then
+    -- Реальный ряд Kumihimo (64) и зазор 6; над списком заголовок ~24 и
+    -- зазор GAP. Минимум одна строка — окно никогда не ноль.
+    return math.max(1, math.floor((GEO.viewH - (24 + GAP) + GEO.clientGap)
+      / (GEO.clientRow + GEO.clientGap)))
   end
   return LIST_WINDOW
 end
@@ -1245,6 +1797,11 @@ local function clampScroll(cur, top, count, window)
 end
 
 local function clampCursor(items)
+  -- Kumihimo Search: окно считает KUF.searchSlice по реальным заголовкам
+  -- групп — count-базовая арифметика тут не годится.
+  if KU and view == "search" then
+    return
+  end
   cursor, windowTop = clampScroll(cursor, windowTop, #items, windowSize())
 end
 
@@ -1259,6 +1816,78 @@ local function visibleWindow(items)
     table.insert(out, items[i])
   end
   return out, windowTop
+end
+
+-- Kumihimo Search: ОДНА ограниченная арифметика видимого окна. Каждый
+-- отрисованный результат стоит TRACK_ROW_HEIGHT (44), каждый заголовок
+-- группы — 18, а между ЛЮБЫМИ соседними узлами списка лежит зазор 6.
+-- Курсор всегда остаётся в подогнанном срезе; окно сдвигается ровно
+-- настолько, насколько нужно (курсор у нижнего края — вверх добираем
+-- бюджетом), как clampScroll. Обход ограничен бюджетом вьюпорта, поэтому
+-- 8-Гц перерисовка спектра не сканирует всю выдачу: ходим только рядом с
+-- текущим окном/курсором. Возвращает (first, slice) — как visibleWindow.
+function KUF.searchSlice(items, budget)
+  local n = #items
+  if n == 0 then
+    cursor, windowTop = 1, 1
+    return 1, {}
+  end
+  local c = cursor
+  if c < 1 then
+    c = 1
+  elseif c > n then
+    c = n
+  end
+  cursor = c
+  local rowH, headH, nodeGap = TRACK_ROW_HEIGHT, 18, 6
+  -- Высота среза [top..last] с заголовком у первого узла и на каждой
+  -- смене вида. Возвращает последний влезающий индекс (не меньше top).
+  local function sliceEnd(top)
+    local r, h, last = 0, 0, top - 1
+    for i = top, n do
+      local hdr = (i == top or items[i].kind ~= items[i - 1].kind) and 1 or 0
+      local nr, nh = r + 1, h + hdr
+      if rowH * nr + headH * nh + nodeGap * (nr + nh - 1) > budget then
+        break
+      end
+      r, h, last = nr, nh, i
+    end
+    if last < top then
+      last = top
+    end
+    return last
+  end
+  local top = windowTop
+  if top < 1 then
+    top = 1
+  elseif top > n then
+    top = n
+  end
+  if top > c then
+    top = c
+  end
+  local last = sliceEnd(top)
+  if last < c then
+    -- Курсор ушёл ниже окна: сдвигаем верх минимально — заполняем
+    -- бюджет ВВЕРХ от курсора (курсор становится последним видимым).
+    local i, r, h = c, 1, 1
+    while i > 1 do
+      local hdr = (items[i - 1].kind ~= items[i].kind) and 1 or 0
+      local nr, nh = r + 1, h + hdr
+      if rowH * nr + headH * nh + nodeGap * (nr + nh - 1) > budget then
+        break
+      end
+      r, h, i = nr, nh, i - 1
+    end
+    top = i
+    last = sliceEnd(top)
+  end
+  windowTop = top
+  local out = {}
+  for i = top, last do
+    out[#out + 1] = items[i]
+  end
+  return top, out
 end
 
 local function openPlaylist(row)
@@ -1557,6 +2186,7 @@ end
 
 local function railNode()
   local items = {}
+  local sc = SC
   for i, v in ipairs(VIEWS) do
     local active = view == v.id or (view == "playlist" and v.id == "library")
     table.insert(items, ui.column({
@@ -1566,6 +2196,7 @@ local function railNode()
       align = "center",
       paddingV = 8,
       radius = 8,
+      shape = sc and "chamfer" or nil,
       fill = active and COLORS.selected or COLORS.surface,
       -- Клик по пункту сайдбара — та же смена вида, что ctrl+j/k и
       -- цифры: путь «клик по рейлу» упоминался в комментариях
@@ -1585,9 +2216,60 @@ local function railNode()
     gap = 8,
     paddingV = PAD,
     fill = COLORS.chrome,
-    radius = 12,
+    radius = sc and CHAM or 12,
+    shape = sc and "chamfer" or nil,
+    border = sc and COLORS.border or nil,
+    borderWidth = sc and 1 or nil,
     align = "center",
   }, items)
+end
+
+-- Кумихимо: пять горизонтальных подвесных вкладок вместо левого рейла.
+-- Источник — тот же VIEWS; активная вкладка — плюс Library для вложенного
+-- playlist (как в рейле). Каждая вкладка — shared-ярлык skin.kumihimoTag:
+-- подвес декоративен, цель нажатия — тело. Подпись и глиф — как в рейле.
+function KUF.tabWidth()
+  return math.max(72, math.floor((GEO.bodyW - (#VIEWS - 1) * GAP) / #VIEWS))
+end
+
+function KUF.tabs()
+  local tabs = {}
+  local w = KUF.tabWidth()
+  for _, v in ipairs(VIEWS) do
+    local active = view == v.id or (view == "playlist" and v.id == "library")
+    table.insert(tabs, skin.kumihimoTag({
+      key = "ku-tab-" .. v.id,
+      width = w,
+      height = GEO.header,
+      gap = 4,
+      -- Паддинг 7 — минимум против выступа контента за chamfer-срез.
+      padding = 7,
+      active = active,
+      onClick = function()
+        setView(v.id)
+        draw()
+      end,
+    }, {
+      ui.row({ key = "ku-tab-in-" .. v.id, gap = 8, align = "center" }, {
+        ui.glyph({
+          key = "ku-tab-glyph-" .. v.id,
+          name = v.glyph,
+          size = 15,
+          color = active and KT.colors.accent or KT.colors.muted,
+        }),
+        lbl(v.title, {
+          key = "ku-tab-label-" .. v.id,
+          size = 12,
+          color = active and KT.colors.text or KT.colors.muted,
+          -- Тело вкладки — слот 20 px на одну строку: без maxLines=1
+          -- длинное имя вида («Equalizer») переносилось бы и выступало
+          -- за chamfer-срез.
+          maxLines = 1,
+        }),
+      }),
+    }))
+  end
+  return ui.row({ key = "ku-tabs", gap = GAP, align = "start" }, tabs)
 end
 
 -- Шапка панели: знак скина, имя плагина и активный вид слева; краткая
@@ -1616,23 +2298,33 @@ local function headerNode(s)
   else
     stateText = "простой"
   end
-  return ui.row({
-    key = "header",
-    height = GEO.header,
-    gap = 10,
-    paddingH = PAD,
-    radius = GEO.header // 2,
-    align = "center",
-    fill = COLORS.chrome,
-  }, {
-    ui.image({
+  local sc = SC
+  -- Активная Стейджикрафт-семья не показывает blossom-эмблему: знак
+  -- рисуется родным глифом в акценте. В остальных случаях — прежняя
+  -- картинка эмблемы.
+  local brand = sc
+    and ui.glyph({ key = "brand-glyph", name = "music", size = 16, color = COLORS.accent })
+    or ui.image({
       key = "brand-mark",
       path = "skin-assets/emblem.png",
       width = 18,
       height = 18,
       radius = 9,
       fit = "cover",
-    }),
+    })
+  return ui.row({
+    key = "header",
+    height = GEO.header,
+    gap = 10,
+    paddingH = PAD,
+    radius = sc and CHAM or (GEO.header // 2),
+    shape = sc and "chamfer" or nil,
+    align = "center",
+    fill = COLORS.chrome,
+    border = sc and COLORS.border or nil,
+    borderWidth = sc and 1 or nil,
+  }, {
+    brand,
     lbl("Музыка", { key = "brand-title", size = 13, color = COLORS.text }),
     lbl(shorten(title, 24), { key = "header-view", size = 11, color = COLORS.muted, maxWidth = 240 }),
     lbl("", { key = "header-spacer", grow = 1 }),
@@ -1654,11 +2346,21 @@ end
 
 local function stateNode(s, items)
   if not s.linked then
-    return card({
-      ui.glyph({ key = "st-glyph", name = "plug-off", color = COLORS.muted }),
-      lbl("tmusd is not responding", { key = "st-title", color = COLORS.text }),
-      lbl("start it with: systemctl --user start tmusd", { key = "st-hint", color = COLORS.muted }),
-    }, { key = "state-card", fill = COLORS.surface })
+    return card(compact(
+      ui.glyph({ key = "st-glyph", name = "plug-off", size = KU and 16 or nil, color = COLORS.muted }),
+      lbl("tmusd is not responding", {
+        key = "st-title",
+        size = KU and 13 or nil,
+        color = COLORS.text,
+        maxLines = KU and 1 or nil,
+      }),
+      lbl("start it with: systemctl --user start tmusd", {
+        key = "st-hint",
+        size = KU and 11 or nil,
+        color = COLORS.muted,
+        maxLines = KU and 1 or nil,
+      })
+    ), { key = "state-card", fill = COLORS.surface, shape = KU and "chamfer" or nil })
   end
   if #items > 0 then
     return nil
@@ -1681,14 +2383,20 @@ local function stateNode(s, items)
   else
     text = "Nothing found"
   end
-  return card({
+  return card(compact(
     ui.glyph({
       key = "st-glyph",
       name = (searching or (view == "playlist" and tostring(s.tracksId or "") ~= playlistId)) and "loader" or "music",
+      size = KU and 16 or nil,
       color = COLORS.muted,
     }),
-    lbl(text, { key = "st-title", color = COLORS.muted }),
-  }, { key = "state-card" })
+    lbl(text, {
+      key = "st-title",
+      size = KU and 13 or nil,
+      color = COLORS.muted,
+      maxLines = KU and 1 or nil,
+    })
+  ), { key = "state-card", shape = KU and "chamfer" or nil })
 end
 
 local function contextTitle(text)
@@ -1698,18 +2406,43 @@ end
 local function listChildren(slice, first)
   local children = {}
   local lastKind = nil
-  if view == "search" and first > 1 then
+  -- Kumihimo всегда рисует заголовок у первого узла среза (в бюджет окна
+  -- это заложено); при не-KU сохраняется прежняя логика «нет заголовка,
+  -- если вид не сменился».
+  if view == "search" and not KU and first > 1 then
     local prior = rows()[first - 1]
     lastKind = prior and prior.kind or nil
   end
   for k, row in ipairs(slice) do
     local i = first + k - 1
     if view == "search" and row.kind ~= lastKind then
-      table.insert(children, lbl(GROUP_TITLES[row.kind] or row.kind, {
-        key = "group-" .. row.kind,
-        size = 12,
-        color = COLORS.muted,
-      }))
+      if KU then
+        -- Тихий акцентный штрих + заголовок группы (11, one-line).
+        -- Орнаментов на каждый трек нет — только на границе вида.
+        -- Ключи включают абсолютный индекс строки i: если упорядоченная
+        -- выдача возвращается к уже встречавшемуся виду, kind-ключ дал бы
+        -- дубликат-сиблинг. Не-KU конвенцию ключей не трогаем.
+        table.insert(children, ui.row({
+          key = "group-" .. i,
+          height = 18,
+          gap = 8,
+          align = "center",
+        }, {
+          ui.box({ key = "group-tick-" .. i, width = 2, height = 12, radius = 1, fill = COLORS.accent }),
+          lbl(GROUP_TITLES[row.kind] or row.kind, {
+            key = "group-l-" .. i,
+            size = 11,
+            color = COLORS.muted,
+            maxLines = 1,
+          }),
+        }))
+      else
+        table.insert(children, lbl(GROUP_TITLES[row.kind] or row.kind, {
+          key = "group-" .. row.kind,
+          size = 12,
+          color = COLORS.muted,
+        }))
+      end
       lastKind = row.kind
     end
     if view == "clients" then
@@ -1732,36 +2465,95 @@ local function listChildren(slice, first)
       else
         stateText, stateColor = "Sign in", COLORS.muted
       end
-      table.insert(children, ui.row({
-        key = "client" .. i,
-        gap = 10,
-        padding = 12,
-        height = TRACK_ROW_HEIGHT,
-        radius = 6,
-        align = "center",
-        fill = (i == cursor or row.active) and COLORS.selected or COLORS.surface,
-        onClick = function()
-          cursor = i
-          activate(row, i)
-          draw()
-        end,
-      }, {
-        ui.glyph({
-          key = "client-glyph" .. i,
-          name = row.active and "circle-check" or "server",
-          color = row.active and COLORS.accent or COLORS.muted,
-        }),
-        lbl(glyph ~= "" and (glyph .. row.title) or row.title, {
-          key = "client-title" .. i,
-          grow = 1,
-          color = COLORS.text,
-        }),
-        lbl(hint ~= "" and shorten(hint, 40) or row.subtitle, { key = "client-sub" .. i, color = COLORS.muted }),
-        lbl(stateText, {
-          key = "client-state" .. i,
-          color = stateColor,
-        }),
-      }))
+      if KU then
+        -- Курсор и выбранный источник независимы: источник помечается
+        -- ТОЛЬКО глифом circle-check/accent, курсор (фокус буфера 2) —
+        -- рамкой accent + заливкой selected. Выбранный источник не
+        -- «разогревается» под клавиатурный фокус. Restart — нейтральное
+        -- действие с отдельным глифом refresh.
+        local focused = (i == cursor) and focusBuf == 2
+        table.insert(children, ui.row({
+          key = "client" .. i,
+          gap = 10,
+          paddingH = 12,
+          paddingV = 8,
+          height = GEO.clientRow,
+          radius = 8,
+          shape = "chamfer",
+          border = focused and COLORS.accent or KT.colors.outline,
+          borderWidth = 1,
+          fill = focused and COLORS.selected or KT.colors.surfaceVariant,
+          align = "center",
+          onClick = function()
+            cursor = i
+            activate(row, i)
+            draw()
+          end,
+        }, {
+          ui.glyph({
+            key = "client-glyph" .. i,
+            name = row.active and "circle-check" or (row.restart and "refresh" or "server"),
+            size = 16,
+            color = row.active and COLORS.accent or COLORS.muted,
+          }),
+          -- Центральная колонка растёт и несёт title/subtitle одной
+          -- строкой: длинная подсказка не выдавливает статус за край.
+          ui.column({ key = "client-text" .. i, gap = 2, flexGrow = 1 }, {
+            lbl(glyph ~= "" and (glyph .. row.title) or row.title, {
+              key = "client-title" .. i,
+              size = 13,
+              color = COLORS.text,
+              maxLines = 1,
+            }),
+            lbl(hint ~= "" and hint or row.subtitle, {
+              key = "client-sub" .. i,
+              size = 11,
+              color = COLORS.muted,
+              maxLines = 1,
+            }),
+          }),
+          ui.row({ key = "client-status-w" .. i, width = 104, justify = "end", align = "center" }, {
+            lbl(stateText, {
+              key = "client-state" .. i,
+              size = 11,
+              color = stateColor,
+              maxLines = 1,
+            }),
+          }),
+        }))
+      else
+        table.insert(children, ui.row({
+          key = "client" .. i,
+          gap = 10,
+          padding = 12,
+          height = TRACK_ROW_HEIGHT,
+          radius = 6,
+          shape = SC and "chamfer" or nil,
+          align = "center",
+          fill = (i == cursor or row.active) and COLORS.selected or COLORS.surface,
+          onClick = function()
+            cursor = i
+            activate(row, i)
+            draw()
+          end,
+        }, {
+          ui.glyph({
+            key = "client-glyph" .. i,
+            name = row.active and "circle-check" or "server",
+            color = row.active and COLORS.accent or COLORS.muted,
+          }),
+          lbl(glyph ~= "" and (glyph .. row.title) or row.title, {
+            key = "client-title" .. i,
+            grow = 1,
+            color = COLORS.text,
+          }),
+          lbl(hint ~= "" and shorten(hint, 40) or row.subtitle, { key = "client-sub" .. i, color = COLORS.muted }),
+          lbl(stateText, {
+            key = "client-state" .. i,
+            color = stateColor,
+          }),
+        }))
+      end
     elseif row.kind == "more" then
       -- Приглашение догрузки: приглушённая, без onClick и event —
       -- курсор на неё может встать, активация ничего не делает.
@@ -1833,13 +2625,80 @@ end
 
 local function homeCardNode(shelfIndex, cardIndex, c)
   local active = shelfIndex == homeShelf and cardIndex == homeItem
+  -- Kumihimo: карточка подвешена на шнуре полки общим ярлыком. active в
+  -- shared API — состояние навигации секции, а не тон курсора home,
+  -- поэтому здесь он не передаётся: выделение курсора выражено явной
+  -- заливкой selected и живёт ТОЛЬКО когда центральный буфер держит фокус
+  -- (focusBuf==2). Отогнутый угол (focused) — тот же конъюнкт. При фокусе
+  -- очереди (focusBuf==3) ни заливки, ни угла нет.
+  -- Высота и арт — из GEO (cardH 180 = подвес 14 + слот угла 14 + тело
+  -- 152; cardArt 96): числа считаются один раз в recomputeLayout и здесь
+  -- только читаются, второй копии нет.
+  if KU then
+    return skin.kumihimoTag({
+      key = "hf-card-" .. shelfIndex .. "-" .. cardIndex,
+      width = HOME_CARD_WIDTH,
+      height = GEO.cardH,
+      gap = 3,
+      padding = 7,
+      -- Стабильный слот угла вырезается из height и существует всегда —
+      -- фокус лишь проявляет клапан, геометрия не двигается. Курсор
+      -- (заливка selected + угол) живёт ТОЛЬКО когда центральный буфер
+      -- держит фокус (focusBuf==2); при фокусе очереди (3) ни того, ни
+      -- другого нет.
+      coverFold = true,
+      fill = (active and focusBuf == 2) and COLORS.selected or KT.colors.surfaceVariant,
+      focused = active and focusBuf == 2,
+      onClick = function()
+        homeShelf = shelfIndex
+        homeItem = cardIndex
+        focusBuf = 2
+        draw()
+      end
+    }, {
+      -- Явный квадратный слот: строка РОВНО 96 px, арт центрируется в ней
+      -- и остаётся квадратом 96×96. Прямой ребёнок колонки растянулся бы
+      -- по её ширине (Flex мерит поперечную ось точно) и превратился бы в
+      -- широкий кроп обложки.
+      ui.row({
+        key = "hf-art-" .. shelfIndex .. "-" .. cardIndex,
+        height = GEO.cardArt,
+        align = "center",
+        justify = "center",
+      }, {
+        artNode(c.art, GEO.cardArt),
+      }),
+      -- Подписи живут в ФИКСИРОВАННЫХ flex-слотах 18/16 (нативный
+      -- Label.height игнорируется), текст центрируется по вертикали,
+      -- one-line без счётчика символов — границей служит maxWidth.
+      ui.row({ key = "t-w", height = 18, align = "center" }, {
+        lbl(c.title, {
+          key = "t",
+          size = 12,
+          color = COLORS.text,
+          maxLines = 1,
+          maxWidth = HOME_CARD_WIDTH - 14,
+        }),
+      }),
+      ui.row({ key = "s-w", height = 16, align = "center" }, {
+        lbl(c.subtitle, {
+          key = "s",
+          size = 11,
+          color = COLORS.muted,
+          maxLines = 1,
+          maxWidth = HOME_CARD_WIDTH - 14,
+        }),
+      }),
+    })
+  end
   return ui.column({
     key = "hf-card-" .. shelfIndex .. "-" .. cardIndex,
-    width = 150,
+    width = HOME_CARD_WIDTH,
     height = 174,
     gap = 6,
     padding = 8,
     radius = 6,
+    shape = SC and "chamfer" or nil,
     fill = active and COLORS.selected or COLORS.surface,
     onClick = function()
       homeShelf = shelfIndex
@@ -1875,26 +2734,56 @@ local function homeFeedNode()
   for i = homeTop, last do
     local shelf = shelves[i]
     local left = homeLeft[i] or 1
-    local clast = math.min(left + HOME_CARD_WINDOW - 1, #shelf.cards)
-    local header = ui.row({ key = "hf-head-" .. i, height = 20, gap = 8, align = "center" }, {
-      lbl(shorten(shelf.title, 24), { key = "hf-shelf-title-" .. i, size = 13, height = 20, color = COLORS.text }),
-      shelf.subtitle ~= "" and lbl(shorten(shelf.subtitle, 28), { key = "hf-shelf-sub-" .. i, size = 11, height = 20, color = COLORS.muted }) or nil,
+    -- Один и тот же конец среза для подписи и цикла: pager не может
+    -- показать диапазон шире реально отрисованных карточек (1–3/1 при
+    -- одной карточке исключён).
+    local cend = math.min(left + HOME_CARD_WINDOW - 1, #shelf.cards)
+    local header = ui.row({ key = "hf-head-" .. i, height = 20, gap = 8, align = "center" }, compact(
+      lbl(shorten(shelf.title, 24), {
+        key = "hf-shelf-title-" .. i,
+        size = 13,
+        height = 20,
+        color = COLORS.text,
+        maxLines = KU and 1 or nil,
+      }),
+      shelf.subtitle ~= "" and lbl(shorten(shelf.subtitle, 28), {
+        key = "hf-shelf-sub-" .. i,
+        size = 11,
+        height = 20,
+        color = COLORS.muted,
+        maxLines = KU and 1 or nil,
+      }) or nil,
       lbl("", { key = "hf-spacer-" .. i, grow = 1 }),
-      lbl("◄ " .. left .. "–" .. clast .. "/" .. shelf.count .. " ►", {
+      lbl("◄ " .. left .. "–" .. cend .. "/" .. shelf.count .. " ►", {
         key = "hf-range-" .. i,
         size = 10,
         color = COLORS.muted,
         mono = true,
-      }),
-    })
+        maxLines = KU and 1 or nil,
+      })
+    ))
     local cards = {}
-    for j = left, clast do
+    for j = left, cend do
       table.insert(cards, homeCardNode(i, j, shelf.cards[j]))
     end
-    table.insert(shelfNodes, ui.column({ key = "hf-shelf-" .. i, height = HOME_SHELF_HEIGHT, gap = 8 }, {
-      header,
-      ui.row({ key = "hf-cards-" .. i, gap = GAP }, cards),
-    }))
+    if KU then
+      -- Полка: заголовок 20, зазор 6 до шнура, шнур 8, зазор 0 до ряда
+      -- карточек. Неравные зазоры выражены обёрткой: внешняя колонка даёт
+      -- 6 (gap=6), её внутренний напарник с gap=0 склеивает шнур с рядом.
+      -- Итого 20+6+8+0+180 = 214.
+      table.insert(shelfNodes, ui.column({ key = "hf-shelf-" .. i, height = HOME_SHELF_HEIGHT, gap = 6 }, {
+        header,
+        ui.column({ key = "hf-shelf-b-" .. i, gap = 0 }, {
+          skin.kumihimoCord({ key = "hf-shelf-cord-" .. i }),
+          ui.row({ key = "hf-cards-" .. i, gap = GAP }, cards),
+        }),
+      }))
+    else
+      table.insert(shelfNodes, ui.column({ key = "hf-shelf-" .. i, height = HOME_SHELF_HEIGHT, gap = 8 }, {
+        header,
+        ui.row({ key = "hf-cards-" .. i, gap = GAP }, cards),
+      }))
+    end
   end
   return ui.scroll({ key = "hf-scroll", flexGrow = 1 }, {
     ui.column({ key = "hf-body", gap = GAP }, shelfNodes),
@@ -1911,9 +2800,7 @@ local function homeSectionNode()
         glyph = "refresh",
         controlSize = "sm",
         variant = "ghost",
-        onClick = function()
-          poke("home-refresh")
-        end,
+        onClick = function() poke("home-refresh") end,
       }),
     }),
     homeFeedNode(),
@@ -1931,6 +2818,7 @@ local function playlistCards(slice, first)
       gap = 8,
       padding = 12,
       radius = 6,
+      shape = SC and "chamfer" or nil,
       fill = i == cursor and COLORS.selected or COLORS.surface,
       onClick = function()
         cursor = i
@@ -1981,7 +2869,7 @@ local function queueContextNode(s)
   local index = tonumber(s.queueIndex)
   local playingIdx = index ~= nil and index + 1 or nil
   local children = {
-    ui.row({ key = "q-head", gap = 8, align = "center" }, {
+    ui.row({ key = "q-head", gap = 8, align = "center", height = KU and 20 or nil }, {
       lbl("Queue", {
         key = "q-title",
         size = 12,
@@ -2017,26 +2905,7 @@ local function queueContextNode(s)
       local rating = ratingOf(s, idOf(t))
       -- Маркер рейтинга перед названием: ♥ лайк, × дизлайк; нет — ничего.
       local marker = rating == "liked" and "♥ " or (rating == "disliked" and "× " or "")
-      table.insert(rowsOut, ui.row({
-        key = "q" .. i,
-        gap = 8,
-        paddingH = 8,
-        paddingV = 4,
-        height = QUEUE_ROW_HEIGHT,
-        radius = 6,
-        align = "center",
-        fill = isPlaying and COLORS.playing or (isCursor and COLORS.selected or COLORS.bg),
-        border = (isCursor and isPlaying) and COLORS.border or nil,
-        borderWidth = (isCursor and isPlaying) and 1 or nil,
-        -- Клик мышью по строке очереди = намерение работать с ней:
-        -- курсор и фокус буфера 3, иначе ввод уйдёт в центральный вид.
-        onClick = function()
-          queueCursor = i
-          followPlaying = false
-          focusBuf = 3
-          draw()
-        end,
-      }, {
+      local rowChildren = {
         ui.row({ key = "q-mark" .. i, width = 24, align = "center" }, {
           lbl(isPlaying and "▶" or tostring(i), {
             key = "q-idx" .. i,
@@ -2049,18 +2918,79 @@ local function queueContextNode(s)
           lbl(providerGlyph(providerByTrack(t)), { key = "q-badge-t" .. i, color = COLORS.muted }),
         }),
         artNode(t.art_path, 28),
-        lbl(shorten(marker .. tostring(t.title or ""), 26), {
+        -- Kumihimo: заголовок растёт в реальной ширине колонки (maxLines=1),
+        -- без счётчика символов; вне KU — прежняя обрезка.
+        KU and lbl(marker .. tostring(t.title or ""), {
+          key = "q-title" .. i,
+          grow = 1,
+          size = 12,
+          color = isPlaying and COLORS.accent or (isCursor and COLORS.text or COLORS.muted),
+          maxLines = 1,
+        }) or lbl(shorten(marker .. tostring(t.title or ""), 26), {
           key = "q-title" .. i,
           grow = 1,
           color = isPlaying and COLORS.accent or (isCursor and COLORS.text or COLORS.muted),
         }),
-        lbl(durationLabel(t.duration) or "", {
+        -- Длительность Kumihimo — ограниченный слот 44 (label.width хост
+        -- игнорирует, поэтому ширину держит flex-обёртка).
+        KU and ui.row({ key = "q-dur-w" .. i, width = 44, justify = "end", align = "center" }, {
+          lbl(durationLabel(t.duration) or "", {
+            key = "q-dur" .. i,
+            size = 11,
+            color = COLORS.muted,
+            mono = true,
+            maxLines = 1,
+          }),
+        }) or lbl(durationLabel(t.duration) or "", {
           key = "q-dur" .. i,
           width = 44,
           color = COLORS.muted,
           mono = true,
         }),
-      }))
+      }
+      -- Клик мышью по строке очереди = намерение работать с ней:
+      -- курсор и фокус буфера 3, иначе ввод уйдёт в центральный вид.
+      local onClick = function()
+        queueCursor = i
+        followPlaying = false
+        focusBuf = 3
+        draw()
+      end
+      if KU then
+        -- Подвесной ряд: подвес декоративен, тело ярлыка — цель клика.
+        -- Играющий маркер (фонарь + ▶/акцент) независим от курсора.
+        -- Курсор очереди — навигационный акцент active (тёплая рамка
+        -- тела) плюс заливка selected, а НЕ отогнутый угол: угол-обложка
+        -- ставится только центральному буферу (focusBuf==2), очередь —
+        -- отдельная компактная колонка, а не шестой таб.
+        table.insert(rowsOut, skin.kumihimoTag({
+          key = "q" .. i,
+          height = QUEUE_ROW_HEIGHT,
+          gap = 0,
+          padding = 7,
+          playing = isPlaying,
+          active = isCursor,
+          fill = isCursor and COLORS.selected or nil,
+          onClick = onClick,
+        }, {
+          ui.row({ key = "q-in" .. i, gap = 8, align = "center", flexGrow = 1 }, rowChildren),
+        }))
+      else
+        table.insert(rowsOut, ui.row({
+          key = "q" .. i,
+          gap = 8,
+          paddingH = 8,
+          paddingV = 4,
+          height = QUEUE_ROW_HEIGHT,
+          radius = 6,
+          shape = SC and "chamfer" or nil,
+          align = "center",
+          fill = isPlaying and COLORS.playing or (isCursor and COLORS.selected or COLORS.bg),
+          border = (isCursor and isPlaying) and COLORS.border or nil,
+          borderWidth = (isCursor and isPlaying) and 1 or nil,
+          onClick = onClick,
+        }, rowChildren))
+      end
     end
     body = ui.column({ key = "q-rows", gap = QUEUE_ROW_GAP }, rowsOut)
   end
@@ -2091,6 +3021,7 @@ local function eqWorkspace(s)
       paddingH = 10,
       paddingV = 4,
       radius = 6,
+      shape = SC and "chamfer" or nil,
       fill = active and COLORS.selected or COLORS.surface,
     }, {
       lbl(text, {
@@ -2106,7 +3037,7 @@ end
 
 local function chipNode(kind, title)
   local active = searchKind == kind
-  return ui.button({
+  local props = KUF.warmButton({
     key = "chip-" .. kind,
     text = title,
     controlSize = "sm",
@@ -2120,14 +3051,22 @@ local function chipNode(kind, title)
       end
       draw()
     end,
-  })
+  }, active)
+  -- Kumihimo-фильтр: фиксированная высота 28, малый радиус 4 и рамка 1;
+  -- активный — акцентный (hot), неактивный — тихий outline-материал.
+  if KU then
+    props.height = 28
+    props.radius = 4
+    props.borderWidth = 1
+  end
+  return ui.button(props)
 end
 
 -- Чип фильтра по клиенту: тот же вид, что у чипов вида, но переключение
 -- чисто локальное — перевыдача не нужна, выдача уже в snapshot.
 local function providerChipNode(pid, title)
   local active = searchProvider == pid
-  return ui.button({
+  local props = KUF.warmButton({
     key = "chip-prov-" .. pid,
     text = title,
     controlSize = "sm",
@@ -2137,7 +3076,13 @@ local function providerChipNode(pid, title)
       cursor = 1
       draw()
     end,
-  })
+  }, active)
+  if KU then
+    props.height = 28
+    props.radius = 4
+    props.borderWidth = 1
+  end
+  return ui.button(props)
 end
 
 -- c в normal (поиск): цикл All → клиенты по порядку демона → All.
@@ -2231,9 +3176,6 @@ local function pickerItems(s)
   for _, p in ipairs(s.playlists or {}) do
     if playlistAddable(p, trackProv) then
       local ref = plRef(p)
-      -- Лайк-адресат — ТОЛЬКО точный агрегатный id "local:liked" из
-      -- демона. Ни native "ytmusic:LM", ни плейлисты с похожими
-      -- названиями/суффиксами сюда не попадают.
       table.insert(out, { ref = ref, title = tostring(p.title or ""), liked = ref == "local:liked" })
     end
   end
@@ -2262,6 +3204,7 @@ local function playlistPickerNode(s)
       paddingH = 10,
       paddingV = 6,
       radius = 6,
+      shape = SC and "chamfer" or nil,
       align = "center",
       fill = active and COLORS.selected or COLORS.surface,
       onClick = function()
@@ -2269,8 +3212,7 @@ local function playlistPickerNode(s)
         draw()
       end,
     }, {
-      -- local:liked управляется лайками (pl add туда не пишет) —
-      -- помечаем пункт, чтобы выбор читался как лайк, а не добавление.
+      -- Общий Liked Music управляется оценками, а не pl add.
       lbl(item.liked and (shorten(item.title, 26) .. " · ♥ лайк") or shorten(item.title, 34), {
         key = "plpick-t" .. i,
         grow = 1,
@@ -2406,13 +3348,48 @@ local function searchTextNode()
 end
 
 function draw()
+  -- Одно чтение рецепта на кадр. Семьи взаимоисключающи: Kumihimo
+  -- проверяем первым, иначе stagecraft(). Токены — тоже на кадр, чтобы
+  -- смена рецепта подхватывалась на ближайшем рендере. Бюджеты окон
+  -- пересчитываются под активную семью (смена/очистка — тоже здесь).
+  KU = skin.kumihimo()
+  if KU then
+    SC = false
+    KT = skin.kumihimoTokens()
+    KUF.kumihimoPalette(KT)
+    -- view приходит параметром: функция объявлена до объявления `view`.
+    KUF.recomputeLayout(true, KT.pad, view)
+  else
+    KT = nil
+    SC = skin.stagecraft()
+    if SC then
+      CHAM = skin.tokens().chamfer
+    end
+    KUF.rolePalette()
+    KUF.recomputeLayout(false, nil, view)
+  end
   local s = snapshot
   local items = rows()
-  clampCursor(items)
   -- Окно правой колонки-очереди клампится вместе с центральным
   -- списком, чтобы followPlaying/ручной курсор не вылезали за границы.
   clampQueue(s.queue or {})
-  local slice, first = visibleWindow(items)
+  local slice, first
+  if KU and view == "search" then
+    -- Kumihimo Search: окно считает KUF.searchSlice по РЕАЛЬНЫМ узлам —
+    -- результат 44, заголовок группы 18, зазор 6; сверху ввод 36, ряд
+    -- фильтров 32 и (при наличии) ряд клиентов 32 со своими зазорами GAP.
+    local budget = GEO.viewH - (36 + 32 + 2 * GAP)
+    for _, p in ipairs(s.providers or {}) do
+      if tostring(p.id or "") ~= "" then
+        budget = budget - (32 + GAP)
+        break
+      end
+    end
+    first, slice = KUF.searchSlice(items, budget)
+  else
+    clampCursor(items)
+    slice, first = visibleWindow(items)
+  end
 
   local wsChildren = nil
   -- Единая правая колонка очереди для всех видов; отдельные context
@@ -2424,9 +3401,14 @@ function draw()
   if view == "home" then
     -- Хиро исчезает без трека; npNode внизу остаётся всегда.
     wsChildren = {}
-    local hero = homeWorkspace(s)
-    if hero then
-      table.insert(wsChildren, hero)
+    -- Kumihimo: трек-хиро дублировал бы нижний транспорт на том же
+    -- экране (один now-playing на вид) — под Kumihimo лента полок идёт
+    -- сразу, без второго блока. Дефолт сохраняет хиро как раньше.
+    if not KU then
+      local hero = homeWorkspace(s)
+      if hero then
+        table.insert(wsChildren, hero)
+      end
     end
     -- Лента рекомендаций: состояния/полки, прокручиваемый скролл.
     table.insert(wsChildren, homeSectionNode())
@@ -2465,9 +3447,16 @@ function draw()
         key = "search-line",
         gap = 8,
         align = "center",
-        paddingH = 12,
-        paddingV = 8,
+        -- Kumihimo: фиксированная строка 36 (6+24+6), chamfer 8, паддинг
+        -- 10/6 и outline-рамка, которая теплеет до accent только когда
+        -- ввод реально идёт (typing). Вне KU — прежние паддинги без рамки.
+        paddingH = KU and 10 or 12,
+        paddingV = KU and 6 or 8,
+        height = KU and 36 or nil,
         radius = 8,
+        shape = (KU or SC) and "chamfer" or nil,
+        border = KU and (typing and COLORS.accent or KT.colors.outline) or nil,
+        borderWidth = KU and 1 or nil,
         fill = COLORS.surface,
         onClick = function()
           cursor = 1
@@ -2495,13 +3484,13 @@ function draw()
           color = typing and COLORS.accent or COLORS.muted,
         }),
       }),
-      ui.row({ key = "chips", gap = 8 }, chips),
+      ui.row({ key = "chips", gap = 8, align = "center", height = KU and 32 or nil }, chips),
       ui.column({ key = "ws-body", gap = GAP, flexGrow = 1 }, body),
     }
     -- Строка чипов клиентов (§19) — между чипами видов и телом выдачи,
     -- только когда есть из чего выбирать (>1 чипа = All + клиенты).
     if #provChips > 1 then
-      table.insert(wsChildren, 3, ui.row({ key = "chips-prov", gap = 8 }, provChips))
+      table.insert(wsChildren, 3, ui.row({ key = "chips-prov", gap = 8, align = "center", height = KU and 32 or nil }, provChips))
     end
   elseif view == "library" then
     local state = stateNode(s, items)
@@ -2577,7 +3566,11 @@ function draw()
 
   -- Нижний now-playing — последний ребёнок workspace-колонки в КАЖДОМ
   -- виде: управление и спектр всегда в одном и том же месте экрана.
-  table.insert(wsChildren, npNode(s))
+  -- У Kumihimo транспорт вынесен под main во всю ширину (см. корень),
+  -- поэтому в workspace его не дублируем.
+  if not KU then
+    table.insert(wsChildren, npNode(s))
+  end
   local workspace = ui.column({ key = "ws", gap = GAP, flexGrow = workspaceGrow }, wsChildren)
 
   -- Поповер выбора плейлиста перекрывает обычный context в любом виде.
@@ -2585,6 +3578,8 @@ function draw()
     context = playlistPickerNode(s)
   end
 
+  -- Материал рабочей области: активная Стейджикрафт-семья рисует
+  -- контекстную колонку тем же шамфером и серебряным волоском.
   local main = ui.row({
     key = "main",
     gap = GAP,
@@ -2596,19 +3591,31 @@ function draw()
       gap = GAP,
       flexGrow = contextGrow,
       padding = PAD,
-      radius = 12,
+      radius = SC and CHAM or 12,
+      shape = SC and "chamfer" or nil,
       fill = COLORS.surface,
+      border = (SC or KU) and COLORS.border or nil,
+      borderWidth = (SC or KU) and 1 or nil,
     }, { context }),
   })
 
   -- Полная карта клавиш переехала в модал ? (приёмка 19.09: строка
   -- на весь этаж читалась плохо); футер оставляет только якоря и
   -- текущее состояние ввода.
-  local footer = ui.row({ key = "footer-row", gap = 8, align = "center" }, {
+  -- Бюджет футера (GEO.footer = 16) держится явной высотой строки и
+  -- однострочными подписями — только у Kumihimo: у прочих семейств
+  -- футер остаётся натуральной высоты.
+  local footer = ui.row({
+    key = "footer-row",
+    gap = 8,
+    align = "center",
+    height = KU and GEO.footer or nil,
+  }, {
     lbl("? — подсказки · Tab · ctrl+h/l — буферы", {
       key = "footer",
       size = 11,
       color = COLORS.muted,
+      maxLines = KU and 1 or nil,
     }),
     lbl("", { key = "footer-spacer", grow = 1 }),
     lbl(typing and "INSERT" or "NORMAL", {
@@ -2616,13 +3623,40 @@ function draw()
       size = 10,
       color = typing and COLORS.accent or COLORS.muted,
       mono = true,
+      maxLines = KU and 1 or nil,
     }),
   })
 
-  -- Корень: шапка → тело (сайдбар · workspace · очередь) → футер, всё
-  -- внутри рамки скина. Рамка резервирует skin.EDGE=12 px с каждой
-  -- стороны В ПОТОКЕ (GEO.ring в бюджетах выше), поэтому собственный
-  -- отступ остаётся PAD.
+  -- Корень. Kumihimo: горизонтальные вкладки вместо рейла, транспорт
+  -- (шнур-акцент + real now-playing) во всю ширину под main. Остальные
+  -- семьи: шапка → тело (сайдбар · workspace · очередь) → футер. Всё
+  -- внутри рамки скина; бюджет рамки учтён в GEO.ringX/ringY.
+  if KU then
+    -- Явно ограниченный нижний транспорт: высота бюджета GEO.transport
+    -- (fixed-height шнур-ряд + зазор 6 + np-карточка 110), поэтому он не
+    -- растягивает корень и не выдавливает виды. Шнур в колонке НЕ растёт:
+    -- flexGrow не задаём — ширину даёт stretch ряда, высоту — сам ряд.
+    local transport = ui.column({ key = "np-full", gap = 6, height = GEO.transport }, {
+      skin.kumihimoCord({ key = "np-cord" }),
+      npNode(s),
+    })
+    panel.render(skin.frame(ui.column({
+      key = "root",
+      gap = GAP,
+      -- Корень Kumihimo паддится неодинаково: 16 по горизонтали, 8 по
+      -- вертикали — ровно как вычитает GEO.bodyW/bodyH.
+      paddingH = 16,
+      paddingV = 8,
+      fill = COLORS.bg,
+      flexGrow = 1,
+    }, {
+      KUF.tabs(),
+      main,
+      transport,
+      footer,
+    }), "tmus-root"))
+    return
+  end
   panel.render(skin.frame(ui.column({
     key = "root",
     gap = GAP,
@@ -2881,9 +3915,7 @@ function onKey(chord, pressed)
         local item = items[plPicker.cursor]
         if item and item.ref then
           if item.ref == "local:liked" then
-            -- Агрегатный Liked нельзя править через pl add — он целиком
-            -- выводится из лайков; подтверждение на local:liked = лайк
-            -- трека, ради которого и открыт пикер.
+            -- Виртуальный плейлист меняется через оценку трека.
             poke("rate", "like:" .. plPicker.track)
           else
             poke("pl", "add:" .. item.ref .. ":" .. plPicker.track)
@@ -3057,12 +4089,6 @@ function onKey(chord, pressed)
         local count = #rows()
         cursor = cursor == 1 and count or 1
         maybeLoadMore()
-      elseif key == "f" then
-        -- Оценка строки курсора — то же, что глобальная карта ниже;
-        -- normal-ветка поиска иначе съедает клавишу draw/return'ом.
-        rateSelected("liked")
-      elseif key == "d" then
-        rateSelected("disliked")
       elseif chord == "BackSpace" or chord == "Backspace" then
         -- Назад на home — зеркало Esc; захват остаётся, чтобы
         -- клавиша не утекала под панель.
@@ -3263,8 +4289,6 @@ function onKey(chord, pressed)
       -- иначе по id трека (pl rm).
       if row and row.kind == "track" and row.id and row.pos ~= nil
         and playlistId ~= "local:liked" then
-        -- local:liked — агрегат только для чтения: убрать из него трек
-        -- нельзя (снимите лайк), ни по позиции, ни по id.
         local prov = trackProvider(playlistId)
         if isLocalProvider(prov) then
           poke("pl", "rmat:" .. playlistId .. ":" .. tostring(row.pos))
@@ -3288,8 +4312,7 @@ function onKey(chord, pressed)
       local row = rows()[cursor]
       if row and row.kind == "playlist" and (row.plid or "") ~= ""
         and row.plid ~= "local:liked" then
-        -- Удаление самого плейлиста: локальный — всегда; нативный —
-        -- только при caps.playlist_delete. local:liked нельзя удалить.
+        -- Обычные локальные плейлисты редактируемы; виртуальный — нет.
         local caps = capsOfProvider(row.provider)
         if isLocalProvider(row.provider)
           or (type(caps) == "table" and caps.playlist_delete == true) then
