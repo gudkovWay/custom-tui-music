@@ -395,17 +395,44 @@ pub(crate) fn suggestions(page: &Value) -> Vec<String> {
     found
 }
 
-/// Токен следующей страницы, если сервис её предложил: общий
-/// `continuationItemRenderer`, которым пользуются `browse` и `search`.
-/// Очередь радио курсор так не отдаёт — у неё [`radio_continuation`].
+/// Курсор browse/search. Home отдаёт продолжение списка секций, а не
+/// карусели: её локальный курсор нельзя использовать для всей ленты.
+/// Очередь радио имеет отдельный [`radio_continuation`].
 pub(crate) fn continuation_token(page: &Value) -> Option<String> {
-    renderers(page, "continuationItemRenderer")
-        .iter()
-        .find_map(|item| {
-            item.pointer("/continuationEndpoint/continuationCommand/token")
+    continuation_in(page).map(str::to_owned)
+}
+
+fn continuation_in(value: &Value) -> Option<&str> {
+    match value {
+        Value::Object(map) => {
+            for name in ["sectionListRenderer", "sectionListContinuation"] {
+                if let Some(entries) = map.get(name)
+                    .and_then(|section| section.get("continuations"))
+                    .and_then(Value::as_array)
+                {
+                    if let Some(token) = entries.iter().find_map(|entry| {
+                        entry.pointer("/nextContinuationData/continuation")
+                            .and_then(Value::as_str)
+                            .filter(|token| !token.is_empty())
+                    }) {
+                        return Some(token);
+                    }
+                }
+            }
+            if let Some(token) = map.get("continuationItemRenderer")
+                .and_then(|item| item.pointer("/continuationEndpoint/continuationCommand/token"))
                 .and_then(Value::as_str)
-        })
-        .map(str::to_owned)
+                .filter(|token| !token.is_empty())
+            {
+                return Some(token);
+            }
+            map.iter()
+                .filter(|(key, _)| key.as_str() != "musicCarouselShelfRenderer")
+                .find_map(|(_, child)| continuation_in(child))
+        }
+        Value::Array(items) => items.iter().find_map(continuation_in),
+        _ => None,
+    }
 }
 
 /// Все renderer'ы с этим именем ключа на любой глубине ответа.
@@ -1167,6 +1194,46 @@ mod tests {
                 "contents": items
             }
         })
+    }
+
+    #[test]
+    fn home_continuation_uses_section_cursor_not_carousel_cursor() {
+        let page = json!({ "contents": { "singleColumnBrowseResultsRenderer": {
+            "tabs": [{ "tabRenderer": { "content": { "sectionListRenderer": {
+                "contents": [{ "musicCarouselShelfRenderer": {
+                    "continuations": [{ "nextContinuationData": { "continuation": "shelf-next" } }]
+                } }],
+                "continuations": [{ "nextContinuationData": { "continuation": "home-next" } }]
+            } } } }]
+        } } });
+        assert_eq!(continuation_token(&page).as_deref(), Some("home-next"));
+        let tail = json!({ "continuationContents": { "sectionListContinuation": {
+            "contents": [],
+            "continuations": [{ "nextContinuationData": { "continuation": "home-tail" } }]
+        } } });
+        assert_eq!(continuation_token(&tail).as_deref(), Some("home-tail"));
+    }
+
+    #[test]
+    fn home_continuation_does_not_follow_an_exhausted_shelfs_cursor() {
+        let page = json!({ "contents": { "sectionListRenderer": {
+            "contents": [{ "musicCarouselShelfRenderer": { "contents": [
+                { "continuationItemRenderer": { "continuationEndpoint": {
+                    "continuationCommand": { "token": "shelf-next" }
+                } } }
+            ] } }],
+            "continuations": [{ "nextContinuationData": { "continuation": "" } }]
+        } } });
+        assert_eq!(continuation_token(&page), None);
+    }
+
+    #[test]
+    fn home_continuation_accepts_legacy_commands() {
+        let page = json!({ "continuationItemRenderer": { "continuationEndpoint": {
+            "continuationCommand": { "token": "legacy-next" }
+        } } });
+        assert_eq!(continuation_token(&page).as_deref(), Some("legacy-next"));
+        assert_eq!(continuation_token(&json!({})), None);
     }
 
     #[test]
