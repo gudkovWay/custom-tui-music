@@ -819,9 +819,9 @@ function onIpc(event, payload)
       poke({ "play-context", ids, "--start", tostring(math.max(0, tonumber(index) or 0)) })
     end
   elseif event == "rate" and payload then
-    -- Панель шлёт "like|dislike|none:<provider>:<id>"; argv CLI —
-    -- `tmus rate <provider>:<id> like|dislike|none`. Ответ не нужен:
-    -- демон разошлёт rating_changed, и запись обновится сама.
+    -- Панель шлёт "like|dislike|none:<provider>:<id>".
+    -- rating_changed обновляет локальную отметку; Home перечитываем
+    -- после успешного ответа rate, когда удалённое зеркало уже завершено.
     local want, id = tostring(payload):match("^([%a]+):(.+)$")
     -- Защита в глубину: панель шлёт канонические like|dislike, но
     -- принимаем и snapshot-формы "liked"/"disliked" — молчаливый
@@ -829,7 +829,12 @@ function onIpc(event, payload)
     if want == "liked" then want = "like" end
     if want == "disliked" then want = "dislike" end
     if (want == "like" or want == "dislike" or want == "none") and id and id ~= "" then
-      poke({ "rate", id, want })
+      call({ "rate", id, want }, function()
+        local provider = id:match("^([^:]+):")
+        if provider ~= "local" and (data.source == "all" or data.source == provider) then
+          pullHome(true)
+        end
+      end)
     end
   elseif event == "pl" and payload then
     -- Кастомные плейлисты: панель шлёт "new:<title>" |

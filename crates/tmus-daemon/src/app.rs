@@ -1054,6 +1054,41 @@ mod tests {
         app.player.mpv().shutdown().await;
     }
 
+    #[tokio::test]
+    async fn home_successful_rating_expires_provider_and_aggregate_recommendations() {
+        for scope in [None, Some("ytmusic")] {
+            let (app, provider, _dir) = app_full(false, false).await;
+            *provider.home_pages.lock().expect("home pages") =
+                vec![home_fixture("old", Some("1")), home_fixture("tail", None)];
+            let old = app.home(scope, false).await.expect("home");
+            *provider.home_pages.lock().expect("home pages") =
+                vec![home_fixture("fresh", Some("1")), home_fixture("tail", None)];
+            app.rate_track(&TrackId::new(ProviderId::YTMUSIC, "old"), Rating::Liked)
+                .await.expect("remote rating");
+            assert!(app.home_more(scope, old.next.as_deref().expect("old cursor")).await.is_err());
+            let fresh = app.home(scope, false).await.expect("invalidated home");
+            assert_eq!(fresh.shelves, home_fixture("fresh", None).shelves);
+            assert_ne!(fresh.next, old.next, "invalidated cursors cannot be reused");
+            app.player.mpv().shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn home_failed_or_local_rating_preserves_provider_snapshot() {
+        let (app, provider, _dir) = app_full(true, false).await;
+        *provider.home_pages.lock().expect("home pages") =
+            vec![home_fixture("old", Some("1")), home_fixture("tail", None)];
+        let old = app.home(Some("ytmusic"), false).await.expect("home");
+        *provider.home_pages.lock().expect("home pages") = vec![home_fixture("fresh", None)];
+        assert!(app.rate_track(&TrackId::new(ProviderId::YTMUSIC, "old"), Rating::Liked)
+            .await.is_err());
+        assert_eq!(app.home(Some("ytmusic"), false).await.expect("cached"), old);
+        app.rate_track(&TrackId::new(ProviderId::LOCAL, "local-track"), Rating::Liked)
+            .await.expect("local rating");
+        assert_eq!(app.home(Some("ytmusic"), false).await.expect("unrelated cached"), old);
+        app.player.mpv().shutdown().await;
+    }
+
     /// Успешная оценка: пишется в кэш, вещается событие и видна в
     /// `Cmd::Ratings` — весь путь панели.
     #[tokio::test]

@@ -904,7 +904,19 @@ impl App {
             .get(id.provider)
             .ok_or_else(|| anyhow::anyhow!("провайдер {} не подключён", id.provider))?;
         match provider.catalog().rate(id, rating).await {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                let mut guard = self.home_cache.lock().await;
+                if let Some(cache) = guard.as_mut() {
+                    if cache.key == "all" || cache.key == id.provider.as_str() {
+                        // Нумерация сохраняется: старый hN не должен
+                        // адресовать страницу новой ленты после оценки.
+                        cache.at = Instant::now() - Duration::from_secs(HOME_TTL_SECS);
+                        cache.page.next = None;
+                        cache.cursors.clear();
+                    }
+                }
+                Ok(())
+            }
             Err(tmus_provider::ProviderError::Unsupported { .. }) => {
                 tracing::debug!(provider = %provider.id(), "провайдер не умеет оценки — отметка только локальная");
                 Ok(())
