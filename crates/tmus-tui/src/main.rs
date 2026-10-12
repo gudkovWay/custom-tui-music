@@ -96,6 +96,9 @@ enum CliCmd {
     /// Треки плейлиста.
     LibraryTracks {
         playlist_id: String,
+        /// Перечитать состав из сети, минуя TTL-кэш.
+        #[arg(long)]
+        refresh: bool,
         #[arg(long)]
         json: bool,
     },
@@ -356,8 +359,8 @@ async fn main() -> Result<()> {
             };
             return print_payload(client.call(cmd).await?, json);
         }
-        CliCmd::LibraryTracks { playlist_id, json } => {
-            let cmd = Cmd::LibraryTracks { playlist: parse_playlist_id(&playlist_id)? };
+        CliCmd::LibraryTracks { playlist_id, refresh, json } => {
+            let cmd = Cmd::LibraryTracks { playlist: parse_playlist_id(&playlist_id)?, refresh };
             return print_payload(client.call(cmd).await?, json);
         }
         CliCmd::LibraryTracksMore { playlist_id, json } => {
@@ -418,7 +421,7 @@ async fn main() -> Result<()> {
                 // фонового прогрева. Ошибка любого хода — Err в caller,
                 // как у остальных подкоманд.
                 let ids = match client
-                    .call(Cmd::LibraryTracks { playlist: parse_playlist_id(&playlist_id)? })
+                    .call(Cmd::LibraryTracks { playlist: parse_playlist_id(&playlist_id)?, refresh: false })
                     .await?
                 {
                     Payload::Tracks(tracks) => tracks.into_iter().map(|t| t.id).collect::<Vec<_>>(),
@@ -944,6 +947,23 @@ mod tests {
     fn provider_flag_maps_all_to_none_else_provider() {
         assert_eq!(parse_provider_flag("all"), None);
         assert_eq!(parse_provider_flag("soundcloud"), Some("soundcloud".to_owned()));
+    }
+
+    #[test]
+    fn library_tracks_subcommand_parses_explicit_refresh() {
+        for (args, expected_refresh) in [
+            (vec!["tmus", "library-tracks", "local:liked", "--json"], false),
+            (vec!["tmus", "library-tracks", "local:liked", "--refresh", "--json"], true),
+        ] {
+            match Cli::try_parse_from(args).expect("valid playlist read").cmd {
+                Some(CliCmd::LibraryTracks { playlist_id, refresh, json }) => {
+                    assert_eq!(playlist_id, "local:liked");
+                    assert_eq!(refresh, expected_refresh);
+                    assert!(json);
+                }
+                _ => panic!("expected library-tracks"),
+            }
+        }
     }
 
     /// Контракт `home`: провайдер и json — флаги, оба по умолчанию пусты.

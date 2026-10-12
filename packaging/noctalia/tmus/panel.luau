@@ -3612,6 +3612,13 @@ function draw()
     }
   elseif view == "playlist" then
     local body = {}
+    local refreshError = tostring(s.tracksError or "")
+    if refreshError ~= "" then
+      table.insert(body, lbl(refreshError, {
+        key = "playlist-refresh-error", size = 11, color = COLORS.error,
+        maxLines = KU and 2 or nil,
+      }))
+    end
     if state then
       table.insert(body, state)
     else
@@ -3620,7 +3627,26 @@ function draw()
       }))
     end
     wsChildren = {
-      lbl(shorten(playlistTitle, 40), { key = "ws-title", size = 18, color = COLORS.text }),
+      ui.row({ key = "playlist-controls", height = 28, gap = 8, align = "center" }, compact(
+        lbl(shorten(playlistTitle, 40), { key = "ws-title", size = 18, color = COLORS.text, grow = 1 }),
+        (playlistId == "local:liked" or playlistId == "ytmusic:LM") and
+          lbl(s.tracksLoading and "Refreshing…" or "Refresh", {
+            key = "playlist-refresh-label", size = 11, color = COLORS.muted,
+          }) or nil,
+        (playlistId == "local:liked" or playlistId == "ytmusic:LM") and ui.button({
+          key = "playlist-refresh",
+          hintIdentity = playlistId .. ":refresh",
+          enabled = not s.tracksLoading,
+          glyph = s.tracksLoading and "loader" or "refresh",
+          controlSize = "sm",
+          variant = "ghost",
+          onClick = function()
+            if not snapshot.tracksLoading then
+              poke("tracks-refresh", playlistId)
+            end
+          end,
+        }) or nil
+      )),
       ui.column({ key = "ws-body", gap = GAP, flexGrow = 1 }, body),
     }
   elseif view == "eq" then

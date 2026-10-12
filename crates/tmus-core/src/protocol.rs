@@ -107,7 +107,12 @@ pub enum Cmd {
     Search { query: String, kind: SearchKind, provider: Option<String> },
     /// Плейлисты библиотеки; `provider = None` — из всех.
     Library { provider: Option<String> },
-    LibraryTracks { playlist: PlaylistId },
+    /// Состав плейлиста; refresh перечитывает первую страницу, минуя TTL.
+    LibraryTracks {
+        playlist: PlaylistId,
+        #[serde(default)]
+        refresh: bool,
+    },
     /// Следующая страница состава плейлиста по сохранённому курсору
     /// догрузки. Ответ [`Payload::TracksPage`]; пустая страница с
     /// `next: None` значит «дочитано».
@@ -582,6 +587,19 @@ mod tests {
             }
             other => panic!("expected a playlist_created payload, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn library_tracks_request_distinguishes_cached_read_from_explicit_refresh() {
+        let cached: Request = serde_json::from_str(
+            r#"{"id":30,"cmd":"library_tracks","playlist":{"provider":"local","id":"liked"}}"#,
+        ).expect("legacy playlist request");
+        let playlist = PlaylistId::new(ProviderId::LOCAL, "liked");
+        assert_eq!(cached.cmd, Cmd::LibraryTracks { playlist: playlist.clone(), refresh: false });
+        let fresh: Request = serde_json::from_str(
+            r#"{"id":31,"cmd":"library_tracks","playlist":{"provider":"local","id":"liked"},"refresh":true}"#,
+        ).expect("explicit refresh");
+        assert_eq!(fresh.cmd, Cmd::LibraryTracks { playlist, refresh: true });
     }
 
     #[test]

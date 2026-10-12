@@ -468,7 +468,7 @@ async fn apply_event(app: &mut App, event: Event) -> bool {
                     .and_then(|index| app.playlist_tracks.get(index))
                     .map(|track| track.id.clone());
                 if let Ok(Payload::Tracks(tracks)) =
-                    app.client.call(Cmd::LibraryTracks { playlist: id.clone() }).await
+                    app.client.call(Cmd::LibraryTracks { playlist: id.clone(), refresh: false }).await
                 {
                     let selected = previous_selection
                         .as_ref()
@@ -946,7 +946,7 @@ async fn flush_pending_load(app: &mut App) -> bool {
         _ => None,
     };
     let Some(id) = due else { return false };
-    match app.client.call(Cmd::LibraryTracks { playlist: id.clone() }).await {
+    match app.client.call(Cmd::LibraryTracks { playlist: id.clone(), refresh: false }).await {
         Ok(Payload::Tracks(tracks)) => {
             app.playlist_cache.insert(id, PlaylistCacheEntry {
                 tracks: tracks.clone(),

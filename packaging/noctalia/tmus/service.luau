@@ -37,6 +37,8 @@ local data = {
   results = {},
   tracks = {},
   tracksId = "",
+  tracksLoading = false,
+  tracksError = "",
   -- Хвост плейлиста: true/nil — догрузка возможна, false — демон
   -- отдал пустую страницу (дочитано). Начальное true: пока не
   -- доказано обратное, за потолком первой страницы могут быть треки.
@@ -520,7 +522,7 @@ local function pullLibrary()
   end)
 end
 
-local function pullTracks(id)
+local function pullTracks(id, force)
   -- Синхронный захват до инкремента поколения: playlists_changed
   -- маршрутизируется по запрошенному сейчас плейлисту, а не по
   -- последнему успешному снапшоту (data.tracksId).
@@ -528,7 +530,14 @@ local function pullTracks(id)
   tracksRequestGeneration = tracksRequestGeneration + 1
   local generation = tracksRequestGeneration
   tracksRefreshInFlight = true
-  call({ "library-tracks", id, "--json" }, function(got)
+  data.tracksLoading = true
+  data.tracksError = ""
+  publish()
+  local args = { "library-tracks", id, "--json" }
+  if force then
+    table.insert(args, "--refresh")
+  end
+  call(args, function(got)
     -- Ответ чужой, если пока летел запрос, ушёл более новый
     -- library-tracks (другой плейлист или повторное открытие того же).
     -- Guard не трогаем: его поставило и снимет текущее поколение.
@@ -536,6 +545,7 @@ local function pullTracks(id)
       return
     end
     tracksRefreshInFlight = false
+    data.tracksLoading = false
     local tracks = type(got) == "table" and got or {}
     data.tracks = tracks
     data.tracksId = id
@@ -548,6 +558,10 @@ local function pullTracks(id)
     -- если это по-прежнему актуальное поколение.
     if generation == tracksRequestGeneration then
       tracksRefreshInFlight = false
+      data.tracksLoading = false
+      if force then
+        data.tracksError = data.error or ""
+      end
     end
   end)
 end
@@ -1077,6 +1091,11 @@ function onIpc(event, payload)
     end)
   elseif event == "tracks" and payload then
     pullTracks(tostring(payload))
+  elseif event == "tracks-refresh" and payload then
+    local want = tostring(payload)
+    if LIKED_IDS[want] and want == tracksRequestedId and not tracksRefreshInFlight then
+      pullTracks(want, true)
+    end
   elseif event == "tracks-more" and payload then
     -- Ленивая догрузка хвоста: панель стучится, когда курсор подошёл
     -- к концу списка. Повторный запрос, пока летит предыдущий, и запрос

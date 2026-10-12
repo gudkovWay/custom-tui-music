@@ -413,8 +413,8 @@ impl App {
                 release_memory();
                 Ok(Payload::Playlists(out))
             }
-            Cmd::LibraryTracks { playlist } => {
-                let out = self.playlist_tracks(&playlist).await?;
+            Cmd::LibraryTracks { playlist, refresh } => {
+                let out = self.playlist_tracks(&playlist, refresh).await?;
                 release_memory();
                 Ok(Payload::Tracks(out))
             }
@@ -618,7 +618,7 @@ impl App {
     async fn play_playlist(&self, id: &PlaylistId, requested: Option<&TrackId>) -> anyhow::Result<()> {
         // Явная замена контекста хоронит радио-сессию.
         self.cancel_radio().await;
-        let mut tracks = self.playlist_tracks(id).await?;
+        let mut tracks = self.playlist_tracks(id, false).await?;
         let mut empty_nonterminal = 0usize;
         while tracks.is_empty()
             || requested.is_some_and(|track| !tracks.iter().any(|candidate| &candidate.id == track))
@@ -758,6 +758,7 @@ mod tests {
         playlist_calls: std::sync::Mutex<Vec<String>>,
         /// Постраничные данные состава: страница по индексу курсора.
         pages: std::sync::Mutex<Vec<Vec<Track>>>,
+        fail_pages: AtomicBool,
         home_pages: std::sync::Mutex<Vec<tmus_core::model::HomePage>>,
         fail_home: AtomicBool,
     }
@@ -825,6 +826,9 @@ mod tests {
             _playlist: &tmus_core::model::PlaylistId,
             cursor: Option<&str>,
         ) -> Result<tmus_provider::TrackPage, ProviderError> {
+            if self.fail_pages.load(Ordering::SeqCst) {
+                return Err(self.playlist_error());
+            }
             let idx: usize = match cursor {
                 None => 0,
                 Some(token) => token.parse().map_err(|_| ProviderError::Format {
@@ -1001,6 +1005,7 @@ mod tests {
             fail_playlist: AtomicBool::new(fail_playlist),
             playlist_calls: std::sync::Mutex::new(Vec::new()),
             pages: std::sync::Mutex::new(Vec::new()),
+            fail_pages: AtomicBool::new(false),
             home_pages: std::sync::Mutex::new(Vec::new()),
             fail_home: AtomicBool::new(false),
         });
@@ -1042,15 +1047,70 @@ mod tests {
         provider.set_pages(vec![vec![track("a"), track("b")], vec![track("b"), track("c")]]);
         let playlist = PlaylistId::new(ProviderId::LOCAL, "liked");
         let ids = |tracks: Vec<Track>| tracks.into_iter().map(|t| t.id.id).collect::<Vec<_>>();
-        assert_eq!(ids(app.playlist_tracks(&playlist).await.expect("first page")), ["a", "b"]);
+        assert_eq!(ids(app.playlist_tracks(&playlist, false).await.expect("first page")), ["a", "b"]);
         let (tail, next) = app.playlist_tracks_page(&playlist).await.expect("next page");
         assert_eq!(ids(tail), ["c"]);
         assert_eq!(next, None);
-        assert_eq!(ids(app.playlist_tracks(&playlist).await.expect("cached snapshot")),
+        assert_eq!(ids(app.playlist_tracks(&playlist, false).await.expect("cached snapshot")),
             ["a", "b", "c"]);
         let (tail, next) = app.playlist_tracks_page(&playlist).await.expect("exhausted page");
         assert_eq!(tail, Vec::new());
         assert_eq!(next, None);
+        app.player.mpv().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn liked_explicit_refresh_replaces_snapshot_and_restarts_paging() {
+        let (app, provider, _dir) = app_full(false, false).await;
+        let track = |id| sample_track(&TrackId::new(ProviderId::YTMUSIC, id));
+        for playlist in [
+            PlaylistId::new(ProviderId::LOCAL, "liked"),
+            PlaylistId::new(ProviderId::YTMUSIC, "LM"),
+        ] {
+            provider.set_pages(vec![vec![track("old")], vec![track("old-tail")]]);
+            assert_eq!(app.playlist_tracks(&playlist, false).await.expect("first page"), [track("old")]);
+            app.playlist_tracks_page(&playlist).await.expect("old tail");
+            provider.set_pages(vec![vec![track("new")], vec![track("new-tail")]]);
+            assert_eq!(app.playlist_tracks(&playlist, false).await.expect("cached"),
+                [track("old"), track("old-tail")]);
+
+            let request: tmus_core::protocol::Request = serde_json::from_value(serde_json::json!({
+                "id": 1, "cmd": "library_tracks", "playlist": playlist, "refresh": true,
+            })).expect("refresh request");
+            match app.handle(request.cmd).await.expect("refresh") {
+                Payload::Tracks(tracks) => assert_eq!(tracks, [track("new")]),
+                other => panic!("unexpected refresh payload: {other:?}"),
+            }
+            let (tail, next) = app.playlist_tracks_page(&playlist).await.expect("new tail");
+            assert_eq!(tail, [track("new-tail")]);
+            assert_eq!(next, None);
+            assert_eq!(app.playlist_tracks(&playlist, false).await.expect("new snapshot"),
+                [track("new"), track("new-tail")]);
+        }
+        app.player.mpv().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn liked_explicit_refresh_failure_preserves_snapshot_and_cursor() {
+        let (app, provider, _dir) = app_full(false, false).await;
+        let track = |id| sample_track(&TrackId::new(ProviderId::YTMUSIC, id));
+        for playlist in [
+            PlaylistId::new(ProviderId::LOCAL, "liked"),
+            PlaylistId::new(ProviderId::YTMUSIC, "LM"),
+        ] {
+            provider.set_pages(vec![vec![track("old")], vec![track("old-tail")]]);
+            app.playlist_tracks(&playlist, false).await.expect("initial snapshot");
+            provider.fail_pages.store(true, Ordering::SeqCst);
+            assert!(app.handle(Cmd::LibraryTracks {
+                playlist: playlist.clone(), refresh: true,
+            }).await.is_err(), "failed refresh must not report success");
+            assert_eq!(app.playlist_tracks(&playlist, false).await.expect("retained snapshot"),
+                [track("old")]);
+            provider.fail_pages.store(false, Ordering::SeqCst);
+            let (tail, next) = app.playlist_tracks_page(&playlist).await.expect("retained cursor");
+            assert_eq!(tail, [track("old-tail")]);
+            assert_eq!(next, None);
+        }
         app.player.mpv().shutdown().await;
     }
 
@@ -1061,14 +1121,14 @@ mod tests {
         provider.set_pages(vec![vec![track("old")]]);
         *provider.home_pages.lock().expect("home pages") = vec![home_fixture("old", None)];
         let playlist = PlaylistId::new(ProviderId::LOCAL, "liked");
-        assert_eq!(app.playlist_tracks(&playlist).await.expect("liked"), [track("old")]);
+        assert_eq!(app.playlist_tracks(&playlist, false).await.expect("liked"), [track("old")]);
         let old_home = app.home(Some("ytmusic"), false).await.expect("home");
         assert_eq!(old_home.shelves, home_fixture("old", None).shelves);
         provider.set_pages(vec![vec![track("fresh")]]);
         *provider.home_pages.lock().expect("home pages") = vec![home_fixture("fresh", None)];
         app.rate_track(&TrackId::new(ProviderId::YTMUSIC, "old"), Rating::None)
             .await.expect("remote rating");
-        assert_eq!(app.playlist_tracks(&playlist).await.expect("refreshed liked"), [track("fresh")]);
+        assert_eq!(app.playlist_tracks(&playlist, false).await.expect("refreshed liked"), [track("fresh")]);
         let fresh_home = app.home(Some("ytmusic"), false).await.expect("refreshed home");
         assert_eq!(fresh_home.shelves, home_fixture("fresh", None).shelves);
         app.player.mpv().shutdown().await;
@@ -1466,7 +1526,7 @@ mod tests {
         provider.set_pages((0..11).map(|i| page_of(i, 1)).collect());
         let playlist = PlaylistId::new(ProviderId::YTMUSIC, "LM");
 
-        let out = app.playlist_tracks(&playlist).await.expect("full read");
+        let out = app.playlist_tracks(&playlist, false).await.expect("full read");
         assert_eq!(out.len(), 10, "батч обязан взять первые десять страниц");
         assert_eq!(
             app.with_cache(|c| c.playlist_tracks(&playlist)).expect("cached").len(),
@@ -1512,7 +1572,7 @@ mod tests {
         let playlist = PlaylistId::new(ProviderId::YTMUSIC, "LM");
 
         // Срез протух: полное чтение берёт батч 10 страниц, курсор "10".
-        let slice = app.playlist_tracks(&playlist).await.expect("full read");
+        let slice = app.playlist_tracks(&playlist, false).await.expect("full read");
         assert_eq!(slice.len(), 10, "свежий срез — только батч");
 
         app.handle(Cmd::PlayPlaylist {
@@ -1570,7 +1630,7 @@ mod tests {
         provider.set_pages(vec![page_of(0, 2), page_of(2, 1)]);
         let playlist = PlaylistId::new(ProviderId::YTMUSIC, "PL1");
 
-        let out = app.playlist_tracks(&playlist).await.expect("full read");
+        let out = app.playlist_tracks(&playlist, false).await.expect("full read");
         assert_eq!(out.len(), 3);
         assert_eq!(
             app.with_cache(|c| c.playlist_continuation(playlist.provider.as_str(), &playlist))
@@ -1605,7 +1665,7 @@ mod tests {
         provider.set_pages((0..12).map(|i| page_of(i, 1)).collect());
         let playlist = PlaylistId::new(ProviderId::YTMUSIC, "LM");
 
-        app.handle(Cmd::LibraryTracks { playlist: playlist.clone() })
+        app.handle(Cmd::LibraryTracks { playlist: playlist.clone(), refresh: false })
             .await
             .expect("full read");
 
@@ -1662,7 +1722,7 @@ mod tests {
         let (app, provider, _dir) = app_full(false, false).await;
         provider.set_pages((0..11).map(|i| page_of(i, 1)).collect());
         let playlist = PlaylistId::new(ProviderId::YTMUSIC, "LM");
-        app.playlist_tracks(&playlist).await.expect("full read");
+        app.playlist_tracks(&playlist, false).await.expect("full read");
         assert!(
             app.with_cache(|c| c.playlist_continuation(playlist.provider.as_str(), &playlist))
                 .expect("cursor")

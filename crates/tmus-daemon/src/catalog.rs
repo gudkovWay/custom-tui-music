@@ -309,12 +309,12 @@ impl App {
         Ok(out)
     }
 
-    pub(crate) async fn playlist_tracks(&self, id: &PlaylistId) -> anyhow::Result<Vec<Track>> {
+    pub(crate) async fn playlist_tracks(&self, id: &PlaylistId, refresh: bool) -> anyhow::Result<Vec<Track>> {
         // Виртуальный агрегат лайков идёт через свой пейджинг-стейт-машин.
         // Повторное открытие возвращает уже накопленный срез, а не
         // продвигает курсор; хвост двигает только playlist_tracks_page.
         if is_liked_virtual(id) {
-            return self.liked_virtual_tracks().await;
+            return self.liked_virtual_tracks(refresh).await;
         }
         let _liked_guard = if is_native_liked(id) {
             Some(self.liked_pager.lock().await)
@@ -333,8 +333,10 @@ impl App {
             .ok_or_else(|| anyhow::anyhow!("провайдер {} не подключён", id.provider))?;
         // Свежий кэш отвечает мгновенно: состав нужен на каждый шаг
         // курсора, и сеть там не пережить.
-        if let Some(tracks) = self.with_cache(|c| c.playlist_tracks_if_fresh(id, PLAYLIST_TTL_SECS))? {
-            return Ok(tracks);
+        if !refresh {
+            if let Some(tracks) = self.with_cache(|c| c.playlist_tracks_if_fresh(id, PLAYLIST_TTL_SECS))? {
+                return Ok(tracks);
+            }
         }
         // Полное чтение — одна страница провайдера: состав нужен быстро
         // (панель дёргает его на каждый шаг курсора), а хвост с токеном
@@ -368,10 +370,13 @@ impl App {
                 Ok(tracks)
             }
             Some(err) => {
-                tracing::warn!(playlist = %id, %err, "плейлист не прочитался, беру из кэша");
+                tracing::warn!(playlist = %id, %err, "плейлист не прочитался");
                 self.report_auth(provider, &err);
                 if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
                     self.try_reauth(provider).await;
+                }
+                if refresh {
+                    return Err(err.into());
                 }
                 Ok(self.with_cache(|c| c.playlist_tracks(id))?)
             }
@@ -434,15 +439,17 @@ impl App {
     /// Открыть виртуальный агрегат `local:liked`. Первый или протухший
     /// заход собирает начальный срез; повторный в пределах TTL отдаёт
     /// весь уже накопленный кэш и не двигает курсоры провайдеров.
-    async fn liked_virtual_tracks(&self) -> anyhow::Result<Vec<Track>> {
+    async fn liked_virtual_tracks(&self, refresh: bool) -> anyhow::Result<Vec<Track>> {
         let _guard = self.liked_pager.lock().await;
         let liked = liked_playlist();
-        if let Some(tracks) =
-            self.with_cache(|c| c.playlist_tracks_if_fresh(&liked, PLAYLIST_TTL_SECS))?
-        {
-            return Ok(tracks);
+        if !refresh {
+            if let Some(tracks) =
+                self.with_cache(|c| c.playlist_tracks_if_fresh(&liked, PLAYLIST_TTL_SECS))?
+            {
+                return Ok(tracks);
+            }
         }
-        self.liked_virtual_first(&liked).await.map(|(tracks, _)| tracks)
+        self.liked_virtual_first(&liked, refresh).await.map(|(tracks, _)| tracks)
     }
 
     /// Одна страница виртуального агрегата `local:liked`. tokio-замок
@@ -460,7 +467,7 @@ impl App {
                 self.liked_virtual_next(&liked, LikedCursor::parse(&raw))
                     .await
             }
-            None => self.liked_virtual_first(&liked).await,
+            None => self.liked_virtual_first(&liked, false).await,
         }
     }
 
@@ -468,9 +475,11 @@ impl App {
     /// по странице от каждого успешного провайдера, дедуп по TrackId.
     /// Сбой провайдера не стирает ни локальные, ни чужие треки и не
     /// помечает его исчерпанным — ключа в состоянии просто нет.
+    /// При явном refresh ошибка оставляет прежний срез и курсоры нетронутыми.
     async fn liked_virtual_first(
         &self,
         liked: &PlaylistId,
+        refresh: bool,
     ) -> anyhow::Result<(Vec<Track>, Option<String>)> {
         let mut tracks: Vec<Track> = self
             .with_cache(|c| c.liked_tracks())?
@@ -503,6 +512,9 @@ impl App {
                     self.report_auth(target, &err);
                     if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
                         self.try_reauth(target).await;
+                    }
+                    if refresh {
+                        return Err(err.into());
                     }
                 }
             }
