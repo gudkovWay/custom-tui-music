@@ -420,6 +420,13 @@ local TEXT_CHARS = {
   ["0"] = "0", ["1"] = "1", ["2"] = "2", ["3"] = "3", ["4"] = "4",
   ["5"] = "5", ["6"] = "6", ["7"] = "7", ["8"] = "8", ["9"] = "9",
   minus = "-", comma = ",", apostrophe = "'", period = ".",
+  exclam = "!", quotedbl = '"', numbersign = "#", dollar = "$",
+  percent = "%", ampersand = "&", parenleft = "(", parenright = ")",
+  asterisk = "*", plus = "+", slash = "/", colon = ":", semicolon = ";",
+  less = "<", equal = "=", greater = ">", question = "?", at = "@",
+  bracketleft = "[", backslash = "\\", bracketright = "]", asciicircum = "^",
+  underscore = "_", grave = "`", braceleft = "{", bar = "|", braceright = "}",
+  asciitilde = "~", numerosign = "№",
   Cyrillic_a = "а", Cyrillic_be = "б", Cyrillic_ve = "в", Cyrillic_ghe = "г",
   Cyrillic_de = "д", Cyrillic_ie = "е", Cyrillic_io = "ё", Cyrillic_zhe = "ж",
   Cyrillic_ze = "з", Cyrillic_i = "и", Cyrillic_shorti = "й",
@@ -440,6 +447,14 @@ local TEXT_CHARS = {
   Cyrillic_HARDSIGN = "Ъ", Cyrillic_YERU = "Ы", Cyrillic_SOFTSIGN = "Ь",
   Cyrillic_E = "Э", Cyrillic_YU = "Ю", Cyrillic_YA = "Я",
 }
+
+local function textChar(chord)
+  -- capture_keys delivers the declared chord verbatim, including Shift.
+  if string.sub(chord, 1, 6) == "Shift+" then
+    chord = string.sub(chord, 7)
+  end
+  return TEXT_CHARS[chord]
+end
 -- ── Редактор поиска: код-поинтовая арифметика ────────────────────────
 -- Курсор queryCursor — ЧИСЛО КОД-ПОИНТОВ до каретки (0..len),
 -- queryLeft — левый край видимого окна, тоже в код-поинтах. Все
@@ -4060,7 +4075,7 @@ function onKey(chord, pressed)
         plName = plName .. " "
       end
     else
-      local ch = TEXT_CHARS[chord]
+      local ch = textChar(chord)
       if ch and #plName < 64 then
         plName = plName .. ch
       end
@@ -4217,7 +4232,7 @@ function onKey(chord, pressed)
       else
         -- Вставка В ПОЗИЦИЮ КУРСОРА (Space — тот же текстовый символ).
         -- Лимит буфера — по код-поинтам, не по байтам.
-        local ch = chord == "Space" and " " or TEXT_CHARS[chord]
+        local ch = chord == "Space" and " " or textChar(chord)
         if ch and charCount(query) < QUERY_MAX_CHARS then
           query, queryCursor = insertAt(query, queryCursor, ch)
           if isJ then

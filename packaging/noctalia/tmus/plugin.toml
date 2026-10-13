@@ -58,10 +58,22 @@ height = 760
 # подсказок; keysym один в обеих раскладках (ЙЦУКЕН — Shift+7).
 # Имена по канону xkb: голые «</» хост отвергает весь плагин — только
 # канонические кейсимы.
+# Printable symbols need both bare and Shift chords: modifier matching is exact.
 capture_keys = [
   "Left", "Right", "Up", "Down", "Return", "Escape", "Space", "slash",
   "period", "comma", "minus", "apostrophe", "BackSpace", "less", "greater",
   "question", "Shift+question", "Home", "End", "Delete",
+  "exclam", "quotedbl", "numbersign", "dollar", "percent", "ampersand",
+  "parenleft", "parenright", "asterisk", "plus", "colon", "semicolon",
+  "equal", "at", "bracketleft", "backslash", "bracketright", "asciicircum",
+  "underscore", "grave", "braceleft", "bar", "braceright", "asciitilde", "numerosign",
+  "Shift+exclam", "Shift+quotedbl", "Shift+numbersign", "Shift+dollar",
+  "Shift+percent", "Shift+ampersand", "Shift+apostrophe", "Shift+parenleft",
+  "Shift+parenright", "Shift+asterisk", "Shift+plus", "Shift+comma", "Shift+minus",
+  "Shift+period", "Shift+slash", "Shift+colon", "Shift+semicolon", "Shift+less",
+  "Shift+equal", "Shift+greater", "Shift+at", "Shift+bracketleft", "Shift+backslash",
+  "Shift+bracketright", "Shift+asciicircum", "Shift+underscore", "Shift+grave",
+  "Shift+braceleft", "Shift+bar", "Shift+braceright", "Shift+asciitilde", "Shift+numerosign",
   "ctrl+j", "ctrl+k", "ctrl+Cyrillic_o", "ctrl+Cyrillic_el",
   "Tab", "ctrl+l", "ctrl+h", "ctrl+Cyrillic_de", "ctrl+Cyrillic_er",
   "ctrl+BackSpace",
