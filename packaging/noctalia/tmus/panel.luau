@@ -570,7 +570,6 @@ local query = ""
 -- Курсор и левый край видимого окна поиска — в код-поинтах (0..len).
 local queryCursor = 0
 local queryLeft = 0
-local lastSearched = nil
 -- Home-лента ("tmus.home"): курсор (полка/карточка), верхнее окно
 -- полок и левые индексы горизонтальных окон по полке. homeFeed —
 -- payload лёгкого ключа; рендер-модель полок кэшируется
@@ -589,6 +588,7 @@ local homeShelfCache = {}
 -- БОЛЬШЕ НЕ является: обе «o» вставляются как текст.
 local typing = false
 local insertPending = nil
+local searchEnterDown = false
 local INSERT_ESCAPE_MS = 250
 local searchKind = "all"
 -- Фильтр выдачи по клиенту-провайдеру (§19): чипы над результатами
@@ -3958,12 +3958,15 @@ end
 
 function onKey(chord, pressed)
   if not pressed then
+    if chord == "Return" then searchEnterDown = false end
     hints:release(chord)
     if held and held.chord == chord then
       endHold()
     end
     return
   end
+  -- A submit changes insert to normal; its held press must not activate a row.
+  if chord == "Return" and searchEnterDown then return end
   if hints:isDown(chord) then return end
 
 
@@ -4172,14 +4175,10 @@ function onKey(chord, pressed)
       end
       insertPending = nil
       if chord == "Return" then
-        -- Enter двоякий, как в каждом лаунчере: изменившийся запрос
-        -- уходит в поиск, неизменный (выдача уже на экране) —
-        -- активирует выбранную строку. Обе ветки выводят в normal:
-        -- витрина INSERT/NORMAL не должна рассинхронизироваться.
-        if query ~= "" and query ~= lastSearched then
+        -- Insert Enter only submits. Playback requires a new press in normal.
+        searchEnterDown = true
+        if noctalia.string.trim(query) ~= "" then
           doSearch()
-        else
-          activate(rows()[cursor], cursor)
         end
         typing = false
         queryCursor = charCount(query)
@@ -4542,6 +4541,7 @@ local function clearTransient()
   plAddAfterCreate = nil
   helpShown = false
   insertPending = nil
+  searchEnterDown = false
 end
 
 function onOpen()
@@ -4569,7 +4569,6 @@ end
 
 function doSearch()
   lastSearchSerial = snapshot.searchSerial
-  lastSearched = query
   searching = true
   poke("search", (SEARCH_KIND_TOKENS[searchKind] or "all") .. "|" .. noctalia.string.urlEncode(query))
   draw()
