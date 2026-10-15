@@ -931,8 +931,8 @@ function onIpc(event, payload)
     end
   elseif event == "rate" and payload then
     -- Панель шлёт "like|dislike|none:<provider>:<id>".
-    -- rating_changed обновляет локальную отметку; Home перечитываем
-    -- после успешного ответа rate, когда удалённое зеркало уже завершено.
+    -- rating_changed обновляет отметку, playlists_changed — список лайков.
+    -- Ленту Home сохраняем до явного или планового обновления.
     local want, id = tostring(payload):match("^([%a]+):(.+)$")
     -- Защита в глубину: панель шлёт канонические like|dislike, но
     -- принимаем и snapshot-формы "liked"/"disliked" — молчаливый
@@ -940,12 +940,7 @@ function onIpc(event, payload)
     if want == "liked" then want = "like" end
     if want == "disliked" then want = "dislike" end
     if (want == "like" or want == "dislike" or want == "none") and id and id ~= "" then
-      call({ "rate", id, want }, function()
-        local provider = id:match("^([^:]+):")
-        if provider ~= "local" and (data.source == "all" or data.source == provider) then
-          pullHome(true)
-        end
-      end)
+      poke({ "rate", id, want })
     end
   elseif event == "pl" and payload then
     -- Кастомные плейлисты: панель шлёт "new:<title>" |
