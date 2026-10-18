@@ -471,9 +471,10 @@ impl App {
         }
     }
 
-    /// Первая страница агрегата: локальные отметки (по свежести) плюс
-    /// по странице от каждого успешного провайдера, дедуп по TrackId.
-    /// Сбой провайдера не стирает ни локальные, ни чужие треки и не
+    /// Первая страница агрегата: YouTube Music, остальные провайдеры,
+    /// затем локальные отметки вне выдачи; внутри провайдера — серверный порядок.
+    /// Старые локальные лайки не должны оттеснять новые серверные.
+    /// Сбой провайдера не стирает локальные или чужие треки и не
     /// помечает его исчерпанным — ключа в состоянии просто нет.
     /// При явном refresh ошибка оставляет прежний срез и курсоры нетронутыми.
     async fn liked_virtual_first(
@@ -481,14 +482,11 @@ impl App {
         liked: &PlaylistId,
         refresh: bool,
     ) -> anyhow::Result<(Vec<Track>, Option<String>)> {
-        let mut tracks: Vec<Track> = self
-            .with_cache(|c| c.liked_tracks())?
-            .into_iter()
-            .map(|(track, _)| track)
-            .collect();
-        let mut seen: HashSet<TrackId> = tracks.iter().map(|t| t.id.clone()).collect();
+        let mut tracks = Vec::new();
+        let mut seen = HashSet::new();
         let mut state = LikedCursor::default();
-        let targets = self.targets(None)?;
+        let mut targets = self.targets(None)?;
+        targets.sort_unstable_by_key(|target| (target.id() != ProviderId::YTMUSIC, target.id()));
         let results = futures_util::future::join_all(targets.iter().map(|target| async move {
             (*target, target.catalog().liked_page(None).await)
         }))
@@ -517,6 +515,11 @@ impl App {
                         return Err(err.into());
                     }
                 }
+            }
+        }
+        for (track, _) in self.with_cache(|c| c.liked_tracks())? {
+            if seen.insert(track.id.clone()) {
+                tracks.push(track);
             }
         }
         self.with_cache(|c| {
@@ -647,27 +650,27 @@ impl App {
     }
 
     /// Агрегат лайкнутого для `Cmd::Liked { provider: None }`:
-    /// локально отмеченные (по свежести отметки) идут первыми, затем
-    /// провайдерские в порядке Registry и выдачи провайдера. Свежие
-    /// метаданные провайдера пишутся в кэш до чтения локальных строк,
-    /// поэтому локальные дубли приходят с теми же свежими полями.
+    /// YouTube Music, остальные провайдеры в серверном порядке, затем локальные
+    /// без дублей. Метаданные провайдера пишутся в кэш до чтения локальных.
     async fn liked_aggregate(&self) -> anyhow::Result<Vec<Track>> {
-        let targets = self.targets(None)?;
+        let mut targets = self.targets(None)?;
+        targets.sort_unstable_by_key(|target| (target.id() != ProviderId::YTMUSIC, target.id()));
         let results = futures_util::future::join_all(
             targets
                 .iter()
                 .map(|target| async move { (*target, target.catalog().liked().await) }),
         )
         .await;
-        let mut provider_order: Vec<TrackId> = Vec::new();
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
         for (target, result) in results {
             match result {
                 Ok(found) => {
                     if !found.is_empty() {
                         self.with_cache(|c| c.put_tracks(&found))?;
                         for track in found {
-                            if provider_order.iter().all(|id| id != &track.id) {
-                                provider_order.push(track.id);
+                            if seen.insert(track.id.clone()) {
+                                out.push(track);
                             }
                         }
                     }
@@ -681,14 +684,9 @@ impl App {
                 }
             }
         }
-        let local = self.with_cache(|c| c.liked_tracks())?;
-        let mut out: Vec<Track> = local.into_iter().map(|(track, _)| track).collect();
-        for id in provider_order {
-            if !out.iter().any(|track| track.id == id) {
-                // Метаданные только что легли в кэш, строка обязана быть.
-                if let Some(track) = self.with_cache(|c| c.track(&id))? {
-                    out.push(track);
-                }
+        for (track, _) in self.with_cache(|c| c.liked_tracks())? {
+            if seen.insert(track.id.clone()) {
+                out.push(track);
             }
         }
         Ok(out)

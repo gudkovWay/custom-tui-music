@@ -854,7 +854,10 @@ mod tests {
                 .cloned().ok_or_else(|| self.playlist_error())
         }
         async fn liked(&self) -> Result<Vec<Track>, ProviderError> {
-            Ok(Vec::new())
+            if self.fail_pages.load(Ordering::SeqCst) {
+                return Err(self.playlist_error());
+            }
+            Ok(self.pages.lock().expect("pages").iter().flatten().cloned().collect())
         }
         async fn liked_page(
             &self,
@@ -1056,6 +1059,80 @@ mod tests {
         let (tail, next) = app.playlist_tracks_page(&playlist).await.expect("exhausted page");
         assert_eq!(tail, Vec::new());
         assert_eq!(next, None);
+        app.player.mpv().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn liked_remote_order_precedes_cached_local_ratings() {
+        let (app, provider, _dir) = app_full(false, false).await;
+        let track = |id| sample_track(&TrackId::new(ProviderId::YTMUSIC, id));
+        let local = sample_track(&TrackId::new(ProviderId::SOUNDCLOUD, "local-only"));
+        app.with_cache(|cache| {
+            cache.put_tracks(&[track("old"), local.clone()])?;
+            cache.set_rating(&track("old").id, Rating::Liked)?;
+            cache.set_rating(&local.id, Rating::Liked)
+        }).expect("local likes");
+        provider.set_pages(vec![
+            vec![track("new-youtube"), track("new-music"), track("old")],
+            vec![track("old"), track("tail")],
+        ]);
+        let playlist = PlaylistId::new(ProviderId::LOCAL, "liked");
+        let expected = vec![track("new-youtube"), track("new-music"), track("old"), local];
+        assert_eq!(app.playlist_tracks(&playlist, true).await.expect("refresh"), expected);
+        assert_eq!(app.playlist_tracks(&playlist, false).await.expect("cached"), expected);
+        let (tail, next) = app.playlist_tracks_page(&playlist).await.expect("tail");
+        assert_eq!(tail, [track("tail")]);
+        assert_eq!(next, None);
+        let mut complete = expected;
+        complete.push(track("tail"));
+        assert_eq!(app.playlist_tracks(&playlist, false).await.expect("complete"), complete);
+        app.player.mpv().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn liked_remote_order_is_shared_by_full_aggregate_and_offline_fallback() {
+        let (app, provider, _dir) = app_full(false, false).await;
+        let track = |id| sample_track(&TrackId::new(ProviderId::YTMUSIC, id));
+        app.with_cache(|cache| {
+            cache.put_tracks(&[track("old")])?;
+            cache.set_rating(&track("old").id, Rating::Liked)
+        }).expect("local like");
+        provider.set_pages(vec![vec![track("new"), track("old"), track("new")]]);
+        assert_eq!(app.liked(None).await.expect("full aggregate"), [track("new"), track("old")]);
+        provider.fail_pages.store(true, Ordering::SeqCst);
+        assert_eq!(app.liked(None).await.expect("offline"), [track("old")]);
+        let playlist = PlaylistId::new(ProviderId::LOCAL, "liked");
+        assert_eq!(app.playlist_tracks(&playlist, false).await.expect("offline page"), [track("old")]);
+        app.player.mpv().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn liked_remote_order_keeps_youtube_ahead_of_other_providers() {
+        let (original, youtube, _dir) = app_full(false, false).await;
+        let yt = sample_track(&TrackId::new(ProviderId::YTMUSIC, "new-youtube"));
+        let sc = sample_track(&TrackId::new(ProviderId::SOUNDCLOUD, "soundcloud-like"));
+        youtube.set_pages(vec![vec![yt.clone()]]);
+        let soundcloud = Arc::new(FakeProvider {
+            id: ProviderId::SOUNDCLOUD,
+            audio: youtube.audio.clone(),
+            fail_rate: AtomicBool::new(false),
+            fail_playlist: AtomicBool::new(false),
+            playlist_calls: std::sync::Mutex::new(Vec::new()),
+            pages: std::sync::Mutex::new(vec![vec![sc.clone()]]),
+            fail_pages: AtomicBool::new(false),
+            home_pages: std::sync::Mutex::new(Vec::new()),
+            fail_home: AtomicBool::new(false),
+        });
+        let mut registry = original.registry.clone();
+        registry.insert(soundcloud as Arc<dyn Provider>);
+        let app = App::new(
+            original.player.clone(), registry, original.cache.clone(),
+            original.config.clone(), original.paths.clone(), original.resolve_gate.clone(),
+        );
+        let playlist = PlaylistId::new(ProviderId::LOCAL, "liked");
+        assert_eq!(app.playlist_tracks(&playlist, true).await.expect("mixed page"),
+            [yt.clone(), sc.clone()]);
+        assert_eq!(app.liked(None).await.expect("mixed full collection"), [yt, sc]);
         app.player.mpv().shutdown().await;
     }
 
