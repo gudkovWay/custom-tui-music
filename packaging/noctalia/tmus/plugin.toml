@@ -80,6 +80,10 @@ capture_keys = [
   "XF86AudioNext", "XF86AudioPrev",
   "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
   "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+  "Shift+A", "Shift+B", "Shift+C", "Shift+D", "Shift+E", "Shift+F", "Shift+G",
+  "Shift+H", "Shift+I", "Shift+J", "Shift+K", "Shift+L", "Shift+M", "Shift+N",
+  "Shift+O", "Shift+P", "Shift+Q", "Shift+R", "Shift+S", "Shift+T", "Shift+U",
+  "Shift+V", "Shift+W", "Shift+X", "Shift+Y", "Shift+Z",
   "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
   "Cyrillic_a", "Cyrillic_be", "Cyrillic_ve", "Cyrillic_ghe", "Cyrillic_de",
   "Cyrillic_ie", "Cyrillic_io", "Cyrillic_zhe", "Cyrillic_ze", "Cyrillic_i",
@@ -96,6 +100,15 @@ capture_keys = [
   "Cyrillic_TSE", "Cyrillic_CHE", "Cyrillic_SHA", "Cyrillic_SHCHA",
   "Cyrillic_HARDSIGN", "Cyrillic_YERU", "Cyrillic_SOFTSIGN", "Cyrillic_E",
   "Cyrillic_YU", "Cyrillic_YA",
+  "Shift+Cyrillic_A", "Shift+Cyrillic_BE", "Shift+Cyrillic_VE", "Shift+Cyrillic_GHE",
+  "Shift+Cyrillic_DE", "Shift+Cyrillic_IE", "Shift+Cyrillic_IO", "Shift+Cyrillic_ZHE",
+  "Shift+Cyrillic_ZE", "Shift+Cyrillic_I", "Shift+Cyrillic_SHORTI", "Shift+Cyrillic_KA",
+  "Shift+Cyrillic_EL", "Shift+Cyrillic_EM", "Shift+Cyrillic_EN", "Shift+Cyrillic_O",
+  "Shift+Cyrillic_PE", "Shift+Cyrillic_ER", "Shift+Cyrillic_ES", "Shift+Cyrillic_TE",
+  "Shift+Cyrillic_U", "Shift+Cyrillic_EF", "Shift+Cyrillic_HA", "Shift+Cyrillic_TSE",
+  "Shift+Cyrillic_CHE", "Shift+Cyrillic_SHA", "Shift+Cyrillic_SHCHA",
+  "Shift+Cyrillic_HARDSIGN", "Shift+Cyrillic_YERU", "Shift+Cyrillic_SOFTSIGN",
+  "Shift+Cyrillic_E", "Shift+Cyrillic_YU", "Shift+Cyrillic_YA",
 ]
 
 [[service]]

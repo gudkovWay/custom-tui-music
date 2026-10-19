@@ -452,6 +452,11 @@ local function textChar(chord)
   -- capture_keys delivers the declared chord verbatim, including Shift.
   if string.sub(chord, 1, 6) == "Shift+" then
     chord = string.sub(chord, 7)
+    -- Latin capture names are uppercase even without Shift; only text mode
+    -- interprets Shift as case. Cyrillic keysyms already encode their case.
+    if #chord == 1 and chord >= "A" and chord <= "Z" then
+      return chord
+    end
   end
   return TEXT_CHARS[chord]
 end
