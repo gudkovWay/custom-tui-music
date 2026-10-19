@@ -609,6 +609,7 @@ local homeShelfCache = {}
 local typing = false
 local insertPending = nil
 local searchEnterDown = false
+local searchPasteDown = false
 local INSERT_ESCAPE_MS = 250
 local searchKind = "all"
 -- Фильтр выдачи по клиенту-провайдеру (§19): чипы над результатами
@@ -3391,6 +3392,7 @@ local function helpNode()
         { "bs", "BackSpace", "стереть слева" },
         { "del", "Delete", "стереть справа" },
         { "kill", "ctrl+BackSpace", "стереть слово" },
+        { "paste", "ctrl+v", "вставить из буфера" },
         { "enter", "Return", "искать" },
         { "esc", "Esc · jj · jk", "в normal" },
         { "prov", "c", "фильтр клиента" },
@@ -3977,8 +3979,10 @@ function onFrameTick(deltaMs)
 end
 
 function onKey(chord, pressed)
+  local pasteChord = string.lower(chord) == "ctrl+v" or string.lower(chord) == "ctrl+cyrillic_em"
   if not pressed then
     if chord == "Return" then searchEnterDown = false end
+    if pasteChord then searchPasteDown = false end
     hints:release(chord)
     if held and held.chord == chord then
       endHold()
@@ -3987,6 +3991,7 @@ function onKey(chord, pressed)
   end
   -- A submit changes insert to normal; its held press must not activate a row.
   if chord == "Return" and searchEnterDown then return end
+  if pasteChord and searchPasteDown then return end
   if hints:isDown(chord) then return end
 
 
@@ -4207,6 +4212,22 @@ function onKey(chord, pressed)
         typing = false
         queryCursor = charCount(query)
         insertPending = nil
+      elseif pasteChord then
+        -- One insertion per physical press, using the host's current text
+        -- selection (nil for an empty/non-text clipboard). Never submit here.
+        searchPasteDown = true
+        local text = noctalia.clipboardText()
+        local room = QUERY_MAX_CHARS - charCount(query)
+        if type(text) == "string" and room > 0 then
+          text = string.gsub(text, "%c+", " ")
+          local count = utf8.len(text)
+          if count and count >= 0 then
+            if count > room then
+              text = string.sub(text, 1, byteOffset(text, room) - 1)
+            end
+            query, queryCursor = insertAt(query, queryCursor, text)
+          end
+        end
       elseif chord == "Left" then
         -- Курсор ходит по код-поинтам; удержание — темп текста.
         queryCursor = math.max(0, queryCursor - 1)
@@ -4562,6 +4583,7 @@ local function clearTransient()
   helpShown = false
   insertPending = nil
   searchEnterDown = false
+  searchPasteDown = false
 end
 
 function onOpen()
