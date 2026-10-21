@@ -251,6 +251,14 @@ impl Queue {
         self.track_at_cursor(cursor)
     }
 
+    /// Ошибка воспроизведения не должна повторять сломанный трек.
+    pub fn next_after_failure(&mut self) -> Option<&Track> {
+        if self.tracks.len() <= 1 {
+            return None;
+        }
+        self.next()
+    }
+
     /// Ручная навигация назад: `LoopMode::Track` игнорируется, на
     /// первом треке — wrap к последнему (симметрично `next`).
     pub fn prev(&mut self) -> Option<&Track> {
@@ -405,6 +413,34 @@ mod tests {
         q.goto(1);
         assert_next(&mut q, "a");
         assert_next(&mut q, "b");
+    }
+
+    #[test]
+    fn failure_advance_ignores_track_repeat() {
+        let mut q = queue(&["ytmusic:a", "soundcloud:b", "ytmusic:c"]);
+        q.set_loop_mode(LoopMode::Track);
+        q.goto(1);
+        assert_eq!(q.next_after_failure().unwrap().id.id, "c");
+        assert_eq!(q.next_after_failure().unwrap().id.id, "a");
+        assert_eq!(q.loop_mode(), LoopMode::Track);
+    }
+
+    #[test]
+    fn failure_advance_stops_on_only_track() {
+        for mode in [LoopMode::None, LoopMode::Track, LoopMode::Queue] {
+            let mut q = queue(&["soundcloud:a"]);
+            q.set_loop_mode(mode);
+            q.goto(0);
+            assert!(q.next_after_failure().is_none());
+        }
+    }
+
+    #[test]
+    fn failure_advance_respects_queue_end_without_loop() {
+        let mut q = queue(&["ytmusic:a", "soundcloud:b"]);
+        q.goto(0);
+        assert_eq!(q.next_after_failure().unwrap().id.id, "b");
+        assert!(q.next_after_failure().is_none());
     }
 
     #[test]

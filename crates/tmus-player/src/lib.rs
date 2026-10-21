@@ -265,7 +265,7 @@ impl Player {
                     *self.inner.position.lock().await = None;
                     let next = {
                         let mut queue = self.inner.queue.lock().await;
-                        queue.next_natural().map(|t| t.id.clone())
+                        queue.next_after_failure().map(|t| t.id.clone())
                     };
                     match next {
                         Some(next_id) => {
@@ -783,7 +783,7 @@ impl Player {
                     self.inner
                         .failure_streak
                         .store(0, std::sync::atomic::Ordering::SeqCst);
-                    self.on_track_end().await
+                    self.on_track_end(false).await
                 },
                 MpvEvent::PlaybackFailed { reason } => {
                     // Причина привязывается к текущему треку из `current`:
@@ -812,7 +812,7 @@ impl Player {
                     match failure_action(streak) {
                         FailureAction::Advance => {
                             tracing::warn!(track = %track, streak, "трек не сыграл — перехожу к следующему");
-                            self.on_track_end().await;
+                            self.on_track_end(true).await;
                         }
                         FailureAction::Stop => {
                             tracing::warn!("подряд не сыграли {} треков — останавливаюсь", streak);
@@ -889,10 +889,11 @@ impl Player {
         }
     }
 
-    async fn on_track_end(&self) {
+    async fn on_track_end(&self, failed: bool) {
         let next = {
             let mut queue = self.inner.queue.lock().await;
-            queue.next_natural().map(|t| t.id.clone())
+            let next = if failed { queue.next_after_failure() } else { queue.next_natural() };
+            next.map(|t| t.id.clone())
         };
         *self.inner.position.lock().await = None;
         match next {
