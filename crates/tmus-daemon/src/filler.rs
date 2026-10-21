@@ -392,14 +392,186 @@ async fn fetch_into_cache(app: &Arc<App>, id: &TrackId) -> anyhow::Result<()> {
             anyhow::bail!("размер не совпал: скачано {written} из {total}");
         }
     }
-    app.emit(Event::CacheProgress { track: id.clone(), bytes: written, total: expected });
     file.flush().await?;
     drop(file);
+    // HLS — это список сегментов, не файл трека. Собираем аудио без
+    // перекодирования до публикации; отмена и таймаут не регистрируют .part.
+    let prepared = {
+        let prepare = prepare_cached_audio(&partial, url, user_agent.as_deref());
+        tokio::pin!(prepare);
+        loop {
+            tokio::select! {
+                result = &mut prepare => break result.map(Some),
+                _ = tokio::time::sleep(RELEVANCE_INTERVAL) => {
+                    let (current, ahead) = relevance_snapshot(app).await;
+                    if !still_wanted(id, current.as_ref(), &ahead) {
+                        break Ok(None);
+                    }
+                }
+            }
+        }
+    };
+    let (ext, written) = match prepared {
+        Ok(Some(audio)) => audio,
+        result => {
+            let _ = tokio::fs::remove_file(&partial).await;
+            return result.map(|_| ());
+        }
+    };
+    let target = target.with_extension(ext);
     tokio::fs::rename(&partial, &target).await?;
 
     app.with_cache(|c| c.register_audio(id, &target, ext))?;
+    app.emit(Event::CacheProgress { track: id.clone(), bytes: written, total: Some(written) });
     let _ = expires_at;
     Ok(())
+}
+
+async fn prepare_cached_audio(
+    partial: &std::path::Path,
+    url: &str,
+    user_agent: Option<&str>,
+) -> anyhow::Result<(&'static str, u64)> {
+    if !tmus_core::cache::is_audio_manifest(partial)? {
+        return Ok(("webm", tokio::fs::metadata(partial).await?.len()));
+    }
+    let mut command = tokio::process::Command::new("ffmpeg");
+    command.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+        "-rw_timeout", "10000000"]);
+    if let Some(ua) = user_agent {
+        command.args(["-user_agent", ua]);
+    }
+    // Matroska допускает AAC, MP3 и Opus; WebM не допускает AAC.
+    // ffmpeg читает исходный URL, чтобы относительные ссылки HLS работали.
+    command.args(["-i", url, "-map", "0:a:0", "-vn", "-c:a", "copy", "-f", "matroska"])
+        .arg(partial)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command.spawn()?;
+    let status = match tokio::time::timeout(Duration::from_secs(120), child.wait()).await {
+        Ok(status) => status?,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            anyhow::bail!("загрузка HLS не завершилась за 120с");
+        }
+    };
+    anyhow::ensure!(status.success(), "ffmpeg не смог скачать HLS: {status}");
+    let bytes = tokio::fs::metadata(partial).await?.len();
+    anyhow::ensure!(bytes > 0, "пустое аудио после загрузки HLS");
+    Ok(("mka", bytes))
+}
+
+#[cfg(test)]
+mod hls_cache_tests {
+    use super::prepare_cached_audio;
+
+    #[tokio::test]
+    async fn hls_cache_contains_audio_without_original_segments() {
+        assert_hls_cache("mpegts", "ts").await;
+    }
+
+    #[tokio::test]
+    async fn hls_cache_handles_fragmented_mp4() {
+        assert_hls_cache("fmp4", "m4s").await;
+    }
+
+    async fn assert_hls_cache(segment_type: &str, extension: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let manifest = source.join("index.m3u8");
+        let generated = tokio::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                "-i", "sine=frequency=440:sample_rate=44100", "-t", "1", "-threads", "1",
+                "-c:a", "aac", "-f", "hls", "-hls_segment_type", segment_type,
+                "-hls_segment_filename"])
+            .arg(source.join(format!("segment%03d.{extension}")))
+            .arg(&manifest)
+            .status().await.unwrap();
+        assert!(generated.success());
+        let valid_fixture = tokio::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
+            .arg(&manifest).args(["-f", "null", "-"]).status().await.unwrap();
+        assert!(valid_fixture.success(), "HLS fixture must decode before caching");
+        let partial = dir.path().join("audio.part");
+        std::fs::copy(&manifest, &partial).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/index.m3u8", listener.local_addr().unwrap());
+        let fixture = source.clone();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let n = socket.read(&mut request).await.unwrap();
+                let request = std::str::from_utf8(&request[..n]).unwrap();
+                assert!(request.contains("User-Agent: tmus-hls-test\r\n"));
+                let path = request.split_whitespace().nth(1).unwrap();
+                let name = match path {
+                    "/index.m3u8" => "index.m3u8",
+                    "/segment000.ts" => "segment000.ts",
+                    "/segment000.m4s" => "segment000.m4s",
+                    "/init.mp4" => "init.mp4",
+                    _ => panic!("unexpected HLS request: {path}"),
+                };
+                let body = std::fs::read(fixture.join(name)).unwrap();
+                let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                socket.write_all(header.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+            }
+        });
+
+        let result = prepare_cached_audio(&partial, &url, Some("tmus-hls-test")).await;
+        server.abort();
+        let _ = server.await;
+        let (ext, bytes) = result.unwrap();
+        assert_eq!(ext, "mka");
+        assert_eq!(bytes, std::fs::metadata(&partial).unwrap().len());
+        assert!(bytes > 0);
+        std::fs::remove_dir_all(&source).unwrap();
+        let decoded = tokio::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
+            .arg(&partial)
+            .args(["-f", "null", "-"])
+            .status().await.unwrap();
+        assert!(decoded.success(), "кэш обязан играть без исходного плейлиста и сегментов");
+    }
+
+    #[tokio::test]
+    async fn hls_cache_preserves_direct_audio_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let partial = dir.path().join("audio.part");
+        let audio = b"ID3direct audio bytes";
+        std::fs::write(&partial, audio).unwrap();
+        let (ext, bytes) = prepare_cached_audio(&partial, "unused", None).await.unwrap();
+        assert_eq!(ext, "webm");
+        assert_eq!(bytes, audio.len() as u64);
+        assert_eq!(std::fs::read(partial).unwrap(), audio);
+    }
+
+    #[tokio::test]
+    async fn hls_cache_reports_download_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let partial = dir.path().join("audio.part");
+        std::fs::write(&partial, b"#EXTM3U\n#EXT-X-VERSION:7\n").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/missing.m3u8", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await.unwrap();
+        });
+        let result = prepare_cached_audio(&partial, &url, None).await;
+        server.abort();
+        let _ = server.await;
+        assert!(result.is_err());
+    }
 }
 
 /// Заголовок запроса — ровно один, `User-Agent`, как и у mpv:

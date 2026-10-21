@@ -845,6 +845,19 @@ impl Cache {
             self.forget_audio(id.provider.as_str(), &id.id)?;
             return Ok(None);
         }
+        if is_audio_manifest(&path).map_err(|source| CoreError::Cache {
+            path: path.clone(),
+            source,
+        })? {
+            // Старый загрузчик принимал HLS-плейлисты за готовое аудио.
+            // Удаляем только такой файл: следующий резолв вернётся в сеть.
+            std::fs::remove_file(&path).map_err(|source| CoreError::Cache {
+                path: path.clone(),
+                source,
+            })?;
+            self.forget_audio(id.provider.as_str(), &id.id)?;
+            return Ok(None);
+        }
 
         if now_secs() - accessed_at >= ACCESS_TOUCH_INTERVAL_SECS {
             self.conn
@@ -861,6 +874,15 @@ impl Cache {
     /// берётся параметром: переданное число рано или поздно разойдётся с
     /// диском (обрезка, чужая запись) и лимит поедет.
     pub fn register_audio(&self, id: &TrackId, path: &Path, ext: &str) -> Result<()> {
+        if is_audio_manifest(path).map_err(|source| CoreError::Cache {
+            path: path.to_path_buf(),
+            source,
+        })? {
+            return Err(CoreError::Cache {
+                path: path.to_path_buf(),
+                source: io::Error::new(io::ErrorKind::InvalidData, "HLS-плейлист вместо аудио"),
+            });
+        }
         let bytes = std::fs::metadata(path)
             .map_err(|source| CoreError::Cache {
                 path: path.to_path_buf(),
@@ -1071,6 +1093,24 @@ impl Cache {
             source,
         }
     }
+}
+
+/// HLS-плейлист не является автономным аудио, независимо от расширения.
+/// Читаем только префикс: попадание в кэш не должно читать весь трек.
+pub fn is_audio_manifest(path: &Path) -> io::Result<bool> {
+    use std::io::Read;
+    let mut prefix = [0_u8; 64];
+    let mut file = std::fs::File::open(path)?;
+    let mut len = 0;
+    while len < prefix.len() {
+        let n = file.read(&mut prefix[len..])?;
+        if n == 0 {
+            break;
+        }
+        len += n;
+    }
+    let prefix = prefix[..len].strip_prefix(b"\xef\xbb\xbf").unwrap_or(&prefix[..len]);
+    Ok(prefix.trim_ascii_start().starts_with(b"#EXTM3U"))
 }
 
 /// Кандидат на вытеснение.
@@ -1568,6 +1608,32 @@ mod tests {
         let stats = cache.stats().expect("stats");
         assert_eq!(stats.tracks, 0);
         assert_eq!(stats.bytes, 0);
+    }
+
+    #[test]
+    fn audio_cache_rejects_hls_manifests() {
+        let (_dir, cache) = bench(u64::MAX);
+        let id = TrackId::new(ProviderId::SOUNDCLOUD, "manifest");
+        let path = cache.audio_path(&id, "webm");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"#EXTM3U\n#EXT-X-VERSION:7\nsegment.m4s\n").unwrap();
+        assert!(cache.register_audio(&id, &path, "webm").is_err());
+        assert_eq!(cache.stats().unwrap().tracks, 0);
+    }
+
+    #[test]
+    fn audio_cache_discards_legacy_manifest_but_keeps_audio() {
+        let (_dir, cache) = bench(u64::MAX);
+        let bad = TrackId::new(ProviderId::SOUNDCLOUD, "legacy");
+        let good = TrackId::new(ProviderId::SOUNDCLOUD, "audio");
+        let bad_path = put_audio(&cache, &bad, 16);
+        let good_path = put_audio(&cache, &good, 32);
+        std::fs::write(&bad_path, b"\xef\xbb\xbf \n#EXTM3U\nsegment.m4s\n").unwrap();
+        assert_eq!(cache.lookup_audio(&bad).unwrap(), None);
+        assert!(!bad_path.exists());
+        assert_eq!(cache.lookup_audio(&good).unwrap(), Some(good_path));
+        assert_eq!(cache.stats().unwrap().tracks, 1);
+        assert_eq!(cache.stats().unwrap().bytes, 32);
     }
 
     #[test]
