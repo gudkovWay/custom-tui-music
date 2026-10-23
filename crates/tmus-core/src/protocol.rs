@@ -505,9 +505,10 @@ mod tests {
         assert_eq!(back.cmd, Cmd::PlaylistRemove { playlist: playlist.clone(), track: track_id.clone() });
 
         // Локальные операции: переименование и удаление по позиции.
+        let local_playlist = PlaylistId::new(ProviderId::LOCAL, "1");
         let rename = line(&Request {
             id: 25,
-            cmd: Cmd::PlaylistRename { playlist: playlist.clone(), title: "New".into() },
+            cmd: Cmd::PlaylistRename { playlist: local_playlist.clone(), title: "New".into() },
         });
         assert_eq!(
             rename,
@@ -516,19 +517,19 @@ mod tests {
         let back: Request = serde_json::from_str(&rename).expect("parse");
         assert_eq!(
             back.cmd,
-            Cmd::PlaylistRename { playlist: playlist.clone(), title: "New".into() }
+            Cmd::PlaylistRename { playlist: local_playlist.clone(), title: "New".into() }
         );
 
         let remove_at = line(&Request {
             id: 26,
-            cmd: Cmd::PlaylistRemoveAt { playlist: playlist.clone(), position: 3 },
+            cmd: Cmd::PlaylistRemoveAt { playlist: local_playlist.clone(), position: 3 },
         });
         assert_eq!(
             remove_at,
             r#"{"id":26,"cmd":"playlist_remove_at","playlist":{"provider":"local","id":"1"},"position":3}"#
         );
         let back: Request = serde_json::from_str(&remove_at).expect("parse");
-        assert_eq!(back.cmd, Cmd::PlaylistRemoveAt { playlist: playlist.clone(), position: 3 });
+        assert_eq!(back.cmd, Cmd::PlaylistRemoveAt { playlist: local_playlist, position: 3 });
 
         let delete = line(&Request { id: 23, cmd: Cmd::PlaylistDelete { playlist: playlist.clone() } });
         assert_eq!(delete, r#"{"id":23,"cmd":"playlist_delete","playlist":{"provider":"ytmusic","id":"PL1"}}"#);
