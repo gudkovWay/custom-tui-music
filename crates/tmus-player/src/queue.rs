@@ -155,11 +155,13 @@ impl Queue {
         } else {
             self.order.clear();
         }
-        // Держим играющий трек на месте: при включении курсор маппится
-        // в позицию трека в новой перестановке, при выключении это
-        // просто индекс в векторе.
+        // Start the new traversal at the current track, not halfway through it.
         self.cursor = match current {
-            Some(index) if shuffle => self.order.iter().position(|&i| i == index),
+            Some(index) if shuffle => {
+                let pos = self.order.iter().position(|&i| i == index).expect("current track");
+                self.order.swap(0, pos);
+                Some(0)
+            }
             current => current,
         };
     }
@@ -330,6 +332,17 @@ impl Queue {
         &self.tracks
     }
 
+    /// Canonical indices in playback order; empty means the original track order.
+    #[must_use]
+    pub fn playback_order(&self) -> &[usize] {
+        &self.order
+    }
+
+    /// Replace the context while keeping shuffle and repeat settings.
+    pub fn replace(&mut self, tracks: Vec<Track>, start: usize) {
+        self.restore(tracks, Some(start), self.loop_mode, self.shuffle);
+    }
+
     /// Восстановление из персиста: треки, позиция, режимы. Порядок обхода
     /// при shuffle пересобирается через set_shuffle — курсор остаётся на месте.
     pub fn restore(&mut self, tracks: Vec<Track>, index: Option<usize>, loop_mode: LoopMode, shuffle: bool) {
@@ -337,12 +350,11 @@ impl Queue {
         self.order.clear();
         self.cursor = None;
         self.loop_mode = loop_mode;
-        if shuffle {
-            self.set_shuffle(true);
-        }
+        self.shuffle = false;
         if let Some(i) = index {
             self.goto(i);
         }
+        self.set_shuffle(shuffle);
     }
 }
 
@@ -667,6 +679,43 @@ mod tests {
         assert!(q.shuffle());
         assert_eq!(q.current_index(), Some(2));
         assert_eq!(q.current().expect("текущий трек").id.id, "c");
+    }
+
+    #[test]
+    fn restore_rebuilds_an_already_shuffled_queue() {
+        let mut q = queue(&["ytmusic:old"]);
+        q.set_shuffle(true);
+        q.restore(
+            vec![track("ytmusic:a"), track("ytmusic:b"), track("ytmusic:c")],
+            Some(1),
+            LoopMode::None,
+            true,
+        );
+        assert_eq!(q.current_index(), Some(1));
+        assert_eq!(q.current().unwrap().id.id, "b");
+        assert_eq!(q.positions_remaining(), 2);
+        let mut heard = vec![q.current().unwrap().id.id.clone()];
+        while let Some(t) = q.next() {
+            heard.push(t.id.id.clone());
+        }
+        heard.sort();
+        assert_eq!(heard, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn restore_can_disable_existing_shuffle() {
+        let mut q = queue(&["ytmusic:old"]);
+        q.set_shuffle(true);
+        q.restore(
+            vec![track("ytmusic:a"), track("ytmusic:b")],
+            Some(0),
+            LoopMode::None,
+            false,
+        );
+        assert!(!q.shuffle());
+        assert_eq!(q.current().unwrap().id.id, "a");
+        assert_next(&mut q, "b");
+        assert!(q.next().is_none());
     }
 
     #[test]

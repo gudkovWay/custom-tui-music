@@ -33,6 +33,7 @@ local data = {
   ratings = {},
   trackId = "",
   queue = {},
+  queueOrder = {},
   queueIndex = nil,
   results = {},
   tracks = {},
@@ -738,17 +739,26 @@ local function pullQueue()
   call({ "queue", "--json" }, function(got)
     if type(got) == "table" then
       data.queue = type(got.tracks) == "table" and got.tracks or {}
+      data.queueOrder = type(got.order) == "table" and got.order or {}
       data.queueIndex = tonumber(got.index)
       -- Кэш артов ключуется по URL и привязан к прошлой очереди:
       -- без сброса он рос без предела на каждое queue_changed.
       -- pending не трогаем — там висят колбэки живых загрузок.
       artCache.done = {}
-      -- Панель показывает 10 строк: качать арты всей очереди —
-      -- раздувать каталог art и трафик. Украшаем только видимое
-      -- окно: от текущего трека (queueIndex 0-based) и 14 следующих.
+      -- Decorate the current track and the next 14 in playback order.
       local start = (data.queueIndex or 0) + 1
+      if #data.queueOrder > 0 then
+        start = 1
+        for pos, index in ipairs(data.queueOrder) do
+          if index == data.queueIndex then
+            start = pos
+            break
+          end
+        end
+      end
       for i = start, math.min(#data.queue, start + 14) do
-        decorateArt("track", data.queue[i])
+        local index = data.queueOrder[i] or i - 1
+        decorateArt("track", data.queue[index + 1])
       end
     end
   end)

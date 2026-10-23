@@ -959,11 +959,7 @@ impl App {
         let len = self
             .player
             .with_queue(|q| {
-                q.clear();
-                for track in &tracks {
-                    q.append(track.clone());
-                }
-                q.goto(0);
+                q.replace(tracks, 0);
                 q.len()
             })
             .await;

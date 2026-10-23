@@ -281,6 +281,9 @@ pub struct QueueView {
     pub tracks: Vec<Track>,
     #[serde(default)]
     pub index: Option<usize>,
+    /// Canonical track indices in playback order. Empty means original order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -783,6 +786,24 @@ mod tests {
         assert_eq!(line(&Payload::Tracks(vec![track("c")])), wire, "wire shape is unchanged");
     }
 
+    #[test]
+    fn queue_payload_accepts_playback_order_and_legacy_snapshot() {
+        let shuffled = serde_json::json!({
+            "tracks": [track("a"), track("b"), track("c")],
+            "index": 2,
+            "order": [2, 0, 1],
+        });
+        let payload: Payload = serde_json::from_value(shuffled).expect("shuffled queue");
+        assert!(matches!(payload, Payload::Queue(_)));
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["index"], 2);
+        assert_eq!(value["order"], serde_json::json!([2, 0, 1]));
+
+        let legacy: Payload = serde_json::from_str(r#"{"tracks":[],"index":null}"#).unwrap();
+        assert!(matches!(legacy, Payload::Queue(_)));
+        assert!(serde_json::to_value(legacy).unwrap().get("order").is_none());
+    }
+
     /// Страница догрузки обязана переживать untagged-перебор вариантов:
     /// `QueueView` стоит раньше и без `deny_unknown_fields` съедал её
     /// молча (клиент видел `index` вместо `next` — живой замер 20.09).
@@ -810,7 +831,7 @@ mod tests {
         }
         // Зеркало очереди при этом остаётся собой: strict-режим не
         // обязан резать собственную форму.
-        let queue = Payload::Queue(QueueView { tracks: vec![track("q")], index: Some(3) });
+        let queue = Payload::Queue(QueueView { tracks: vec![track("q")], index: Some(3), order: vec![] });
         match serde_json::from_str::<Payload>(&line(&queue)).expect("parse queue") {
             Payload::Queue(view) => {
                 assert_eq!(view.index, Some(3));

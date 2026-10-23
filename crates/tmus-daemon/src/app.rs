@@ -321,7 +321,11 @@ impl App {
                 Ok(Payload::Ack(Ack::default()))
             }
             Cmd::SetShuffle { shuffle } => {
-                self.player.with_queue(|q| q.set_shuffle(shuffle)).await;
+                let (len, index) = self.player.with_queue(|q| {
+                    q.set_shuffle(shuffle);
+                    (q.len(), q.current_index())
+                }).await;
+                self.emit(Event::QueueChanged { len, index });
                 self.emit_state().await;
                 Ok(Payload::Ack(Ack::default()))
             }
@@ -330,10 +334,9 @@ impl App {
                 let view = self
                     .player
                     .with_queue(|q| QueueView {
-                        tracks: (0..q.len())
-                            .filter_map(|i| q.track_at(i).cloned())
-                            .collect(),
+                        tracks: q.tracks().to_vec(),
                         index: q.current_index(),
+                        order: q.playback_order().to_vec(),
                     })
                     .await;
                 Ok(Payload::Queue(view))
@@ -550,13 +553,11 @@ impl App {
         // без добавления в очередь `tmus play <id>` играл бы «в никуда»:
         // музыка идёт, а `status`, MPRIS и Discord показывают пустоту.
         // Замерено на стенде.
-        let track = self.hydrate(std::slice::from_ref(id))?.remove(0);
+        let tracks = self.hydrate(std::slice::from_ref(id))?;
         let len = self
             .player
             .with_queue(|q| {
-                q.clear();
-                q.append(track);
-                q.goto(0);
+                q.replace(tracks, 0);
                 q.len()
             })
             .await;
@@ -604,20 +605,12 @@ impl App {
         let len = self
             .player
             .with_queue(|q| {
-                q.clear();
-                for track in tracks {
-                    q.append(track);
-                }
-                q.goto(start);
+                q.replace(tracks, start);
                 q.len()
             })
             .await;
         self.emit(Event::QueueChanged { len, index: Some(start) });
-        // Резолв и запуск — напрямую, а не через `play_known`: тот ищет
-        // трек в очереди по id (`find_index`) и переводит курсор на
-        // первое совпадение, из-за чего при дублях в контексте старт
-        // уезжал с выбранного вхождения на более раннее. Курсор уже
-        // выставлен `goto(start)` выше.
+        // The context already selected the exact occurrence, including duplicate IDs.
         self.player.resolve_and_play(&current).await?;
         Ok(())
     }
@@ -664,11 +657,7 @@ impl App {
         let len = self
             .player
             .with_queue(|q| {
-                q.clear();
-                for track in tracks {
-                    q.append(track);
-                }
-                q.goto(start);
+                q.replace(tracks, start);
                 q.len()
             })
             .await;
@@ -1563,6 +1552,29 @@ mod tests {
         assert_eq!(state.track.map(|t| t.id), Some(ids[1].clone()));
     }
 
+    #[tokio::test]
+    async fn play_context_with_existing_shuffle_keeps_a_complete_traversal() {
+        let (app, _dir) = app(false).await;
+        app.handle(Cmd::SetShuffle { shuffle: true }).await.unwrap();
+        let ids = ["a", "b", "c", "d"]
+            .map(|id| TrackId::new(ProviderId::YTMUSIC, id))
+            .to_vec();
+        for _ in 0..2 {
+            app.handle(Cmd::PlayContext { tracks: ids.clone(), start: 2 }).await.unwrap();
+            let state = app.player.state().await;
+            assert_eq!(state.queue_index, Some(2));
+            assert_eq!(state.track.unwrap().id, ids[2]);
+            let (order, remaining) = app.player.with_queue(|q| {
+                (q.playback_order().to_vec(), q.positions_remaining())
+            }).await;
+            assert_eq!(remaining, 3);
+            assert_eq!(order[0], 2);
+            let mut sorted = order;
+            sorted.sort_unstable();
+            assert_eq!(sorted, [0, 1, 2, 3]);
+        }
+    }
+
     /// QueueGoto после PlayContext двигает курсор, не трогая очередь.
     #[tokio::test]
     async fn queue_goto_after_play_context_moves_cursor_only() {
@@ -1596,6 +1608,42 @@ mod tests {
             app.player.with_queue(|q| q.peek_next().unwrap().id.clone()).await,
             ids[3],
         );
+    }
+
+    #[tokio::test]
+    async fn queue_shuffle_change_invalidates_snapshot_and_preserves_indices() {
+        let (app, _dir) = app(false).await;
+        app.handle(Cmd::QueueAppend {
+            tracks: ["a", "b", "c"].map(|id| TrackId::new(ProviderId::YTMUSIC, id)).to_vec(),
+        }).await.unwrap();
+        app.player.with_queue(|q| q.goto(1)).await;
+        let mut events = app.subscribe();
+        app.handle(Cmd::SetShuffle { shuffle: true }).await.unwrap();
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            Event::QueueChanged { len: 3, index: Some(1) },
+        ));
+        let Payload::Queue(view) = app.handle(Cmd::Queue).await.unwrap() else {
+            panic!("expected queue");
+        };
+        let wire = serde_json::to_value(&view).unwrap();
+        let order: Vec<usize> = serde_json::from_value(wire["order"].clone()).unwrap();
+        assert_eq!(order[0], 1);
+        assert_eq!(view.index, Some(1));
+        assert_eq!(view.tracks.iter().map(|t| t.id.id.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
+        let mut traversed = vec![app.player.with_queue(|q| q.current_index().unwrap()).await];
+        while let Some(index) = app.player.with_queue(|q| {
+            q.next()?;
+            q.current_index()
+        }).await {
+            traversed.push(index);
+        }
+        assert_eq!(traversed, order);
+        app.handle(Cmd::SetShuffle { shuffle: false }).await.unwrap();
+        let Payload::Queue(view) = app.handle(Cmd::Queue).await.unwrap() else {
+            panic!("expected queue");
+        };
+        assert!(serde_json::to_value(view).unwrap().get("order").is_none());
     }
 
     /// Пустой контекст — ошибка команды, очередь не трогается.

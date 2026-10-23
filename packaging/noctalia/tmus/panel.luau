@@ -624,6 +624,24 @@ local maybeLoadMore -- defined below; used by move/g-jumps (догрузка х�
 local maybeHomeMore -- defined below; used by home move/clamp (догрузка ленты)
 local endHold -- defined below; used by hintable volume and search controls
 
+-- Display positions follow playback; commands retain canonical zero-based indices.
+local queueOrder = {}
+function queueOrder.index(s, pos)
+  return (s.queueOrder or {})[pos] or pos - 1
+end
+function queueOrder.position(s, index)
+  if index == nil then return nil end
+  local order = s.queueOrder or {}
+  if #order == 0 then return index + 1 end
+  for pos, original in ipairs(order) do
+    if original == index then return pos end
+  end
+  return nil
+end
+function queueOrder.track(s, pos)
+  return (s.queue or {})[queueOrder.index(s, pos) + 1]
+end
+
 function playlistNavigation.section()
   local origin = playlistNavigation.origin
   return view == "playlist" and (origin and origin.view or "library") or view
@@ -995,7 +1013,7 @@ end
 local function rateQueueRow(want)
   local idstr = tostring(snapshot.trackId or "")
   if idstr == "" then
-    local t = (snapshot.queue or {})[queueCursor]
+    local t = queueOrder.track(snapshot, queueCursor)
     idstr = t and idOf(t) or ""
   end
   if idstr == "" then
@@ -2976,29 +2994,26 @@ end
 local lastQueueIndex = nil
 local function followQueue()
   if hints:isActive() then return end
-  local index = tonumber(snapshot.queueIndex)
-  if index == lastQueueIndex then
+  local index = queueOrder.position(snapshot, tonumber(snapshot.queueIndex))
+  if index == lastQueueIndex and queueOrder.last == snapshot.queueOrder then
     return
   end
   lastQueueIndex = index
+  queueOrder.last = snapshot.queueOrder
   if not followPlaying or index == nil then
     return
   end
-  queueCursor, queueWindowTop = clampScroll(index + 1, index + 1 - 2, #(snapshot.queue or {}), QUEUE_WINDOW)
+  queueCursor, queueWindowTop = clampScroll(index, index - 2, #(snapshot.queue or {}), QUEUE_WINDOW)
 end
 
--- Правая колонка-очередь: ЕДИНЫЙ context для всех видов. Рисуется
--- напрямую из snapshot.queue (без фильтра дизлайкнутых — зеркало
--- живой очереди) и со своим окном/курсором; счётчик берём из
--- #snapshot.queue, а не queueLen: state-событие может обгонять массив.
+-- Rows follow playback order without copying tracks; commands use canonical indices.
 local function queueContextNode(s)
   local queue = s.queue or {}
   clampQueue(queue)
   local index = tonumber(s.queueIndex)
-  local playingIdx = index ~= nil and index + 1 or nil
   local children = {
     ui.row({ key = "q-head", gap = 8, align = "center", height = KU and 20 or nil }, {
-      lbl("Queue", {
+      lbl(s.shuffle and "Queue · shuffled" or "Queue", {
         key = "q-title",
         size = 12,
         color = focusBuf == 3 and COLORS.accent or COLORS.muted,
@@ -3024,8 +3039,8 @@ local function queueContextNode(s)
     local rowsOut = {}
     local last = math.min(queueWindowTop + QUEUE_WINDOW - 1, #queue)
     for i = queueWindowTop, last do
-      local t = queue[i]
-      local isPlaying = playingIdx ~= nil and i == playingIdx
+      local t = queueOrder.track(s, i)
+      local isPlaying = index ~= nil and queueOrder.index(s, i) == index
       -- Подсветка курсора — только при фокусе буфера 3: после
       -- ctrl+h очередь остаётся зеркалом без «селекта-призрака»,
       -- играющий трек подсвечен всегда.
@@ -4335,7 +4350,7 @@ function onKey(chord, pressed)
       -- Активация строки очереди: 0-базный индекс, сервис уже мапит
       -- на CLI queue-goto. Жест пользователя — автоскролл за играющим
       -- снова включён.
-      poke("queue-goto", tostring(queueCursor - 1))
+      poke("queue-goto", tostring(queueOrder.index(snapshot, queueCursor)))
       followPlaying = true
     elseif chord == "Space" then
       poke("toggle")
@@ -4349,7 +4364,7 @@ function onKey(chord, pressed)
       -- курсора очереди (решение хозяина: цель f/d/a — играющий).
       local track = tostring(snapshot.trackId or "")
       if track == "" then
-        track = idOf((snapshot.queue or {})[queueCursor])
+        track = idOf(queueOrder.track(snapshot, queueCursor))
       end
       if track ~= "" then
         plPicker = { track = track, cursor = 1 }
