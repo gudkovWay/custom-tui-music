@@ -1612,13 +1612,27 @@ mod tests {
 
     #[test]
     fn audio_cache_rejects_hls_manifests() {
-        let (_dir, cache) = bench(u64::MAX);
-        let id = TrackId::new(ProviderId::SOUNDCLOUD, "manifest");
-        let path = cache.audio_path(&id, "webm");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, b"#EXTM3U\n#EXT-X-VERSION:7\nsegment.m4s\n").unwrap();
-        assert!(cache.register_audio(&id, &path, "webm").is_err());
-        assert_eq!(cache.stats().unwrap().tracks, 0);
+        for provider in [ProviderId::SOUNDCLOUD, ProviderId::YTMUSIC] {
+            for content in [
+                "#EXTM3U\n#EXT-X-VERSION:7\nsegment.m4s\n",
+                "\u{feff}#EXTM3U\nsegment.ts\n",
+            ] {
+                let (_dir, cache) = bench(u64::MAX);
+                let id = TrackId::new(provider, "manifest");
+                let path = cache.audio_path(&id, "webm");
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, content).unwrap();
+                assert!(matches!(
+                    cache.register_audio(&id, &path, "webm"),
+                    Err(CoreError::Cache { source, .. })
+                        if source.kind() == io::ErrorKind::InvalidData
+                ));
+                assert_eq!(cache.lookup_audio(&id).unwrap(), None);
+                let stats = cache.stats().unwrap();
+                assert_eq!((stats.tracks, stats.bytes), (0, 0));
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+            }
+        }
     }
 
     #[test]
@@ -1628,12 +1642,35 @@ mod tests {
         let good = TrackId::new(ProviderId::SOUNDCLOUD, "audio");
         let bad_path = put_audio(&cache, &bad, 16);
         let good_path = put_audio(&cache, &good, 32);
+        cache.set_pinned(&[bad.clone(), good.clone()], true).unwrap();
         std::fs::write(&bad_path, b"\xef\xbb\xbf \n#EXTM3U\nsegment.m4s\n").unwrap();
+        assert_eq!(cache.lookup_audio(&bad).unwrap(), None);
         assert_eq!(cache.lookup_audio(&bad).unwrap(), None);
         assert!(!bad_path.exists());
         assert_eq!(cache.lookup_audio(&good).unwrap(), Some(good_path));
-        assert_eq!(cache.stats().unwrap().tracks, 1);
-        assert_eq!(cache.stats().unwrap().bytes, 32);
+        let stats = cache.stats().unwrap();
+        assert_eq!((stats.tracks, stats.bytes), (1, 32));
+        assert_eq!((stats.pinned_tracks, stats.pinned_bytes), (1, 32));
+    }
+
+    #[test]
+    fn audio_cache_rejected_manifest_does_not_replace_pinned_audio() {
+        let (_dir, cache) = bench(u64::MAX);
+        let id = TrackId::new(ProviderId::SOUNDCLOUD, "audio");
+        let good_path = put_audio(&cache, &id, 3);
+        cache.set_pinned(std::slice::from_ref(&id), true).unwrap();
+        let manifest_path = cache.audio_path(&id, "webm");
+        std::fs::write(&manifest_path, "#EXTM3U\n").unwrap();
+
+        assert!(matches!(
+            cache.register_audio(&id, &manifest_path, "webm"),
+            Err(CoreError::Cache { source, .. })
+                if source.kind() == io::ErrorKind::InvalidData
+        ));
+        assert_eq!(cache.lookup_audio(&id).unwrap(), Some(good_path));
+        let stats = cache.stats().unwrap();
+        assert_eq!((stats.tracks, stats.bytes), (1, 3));
+        assert_eq!((stats.pinned_tracks, stats.pinned_bytes), (1, 3));
     }
 
     #[test]
