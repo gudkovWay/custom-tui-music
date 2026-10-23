@@ -1,6 +1,6 @@
 id = "q/tmus"
 name = "Музыка"
-version = "0.6.4"
+version = "0.6.5"
 # 32 = текущая версия хоста (kCurrentPluginApiVersion). Требуется не вообще
 # «32», а конкретные возможности, взятые по минимуму:
 #   22 — локальный require общего модуля ./desktop_skin.luau (kModuleRequire);
@@ -56,6 +56,7 @@ height = 760
 # ctrl+BackSpace = удалить слово в поиске. Home/End/Delete — курсор
 # поисковой строки (границы/удаление справа). «?» (question) — модал
 # подсказок; keysym один в обеих раскладках (ЙЦУКЕН — Shift+7).
+# ctrl+v (физическая V на ЙЦУКЕН — м) вставляет clipboard в insert поиска.
 # Имена по канону xkb: голые «</» хост отвергает весь плагин — только
 # канонические кейсимы.
 # Printable symbols need both bare and Shift chords: modifier matching is exact.
@@ -77,6 +78,7 @@ capture_keys = [
   "ctrl+j", "ctrl+k", "ctrl+Cyrillic_o", "ctrl+Cyrillic_el",
   "Tab", "ctrl+l", "ctrl+h", "ctrl+Cyrillic_de", "ctrl+Cyrillic_er",
   "ctrl+BackSpace",
+  "ctrl+v", "ctrl+Cyrillic_em", "ctrl+Cyrillic_EM",
   "XF86AudioNext", "XF86AudioPrev",
   "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
   "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
