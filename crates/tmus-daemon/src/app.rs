@@ -1637,20 +1637,16 @@ mod tests {
         );
     }
 
-    /// Выбор трека глубже свежего среза обязан догрузиться до него, а
-    /// не играть хвост батча: панель шлёт стабильный TrackId из
-    /// снапшота, который пережил TTL кэша. Раньше позиция клампилась в
-    /// последний трек батча — человек выбирал трек на 11-й странице, а
-    /// играл последний из первых десяти.
+    /// A selected track beyond the fresh first page must be fetched by stable ID.
     #[tokio::test]
     async fn play_playlist_fetches_pages_until_requested_track_found() {
         let (app, provider, _dir) = app_full(false, false).await;
         provider.set_pages((0..11).map(|i| page_of(i, 1)).collect());
         let playlist = PlaylistId::new(ProviderId::YTMUSIC, "LM");
 
-        // Срез протух: полное чтение берёт батч 10 страниц, курсор "10".
-        let slice = app.playlist_tracks(&playlist, false).await.expect("full read");
-        assert_eq!(slice.len(), 10, "свежий срез — только батч");
+        // Opening a playlist reads one page; playback fetches through the selected ID.
+        let slice = app.playlist_tracks(&playlist, false).await.expect("first page");
+        assert_eq!(slice.len(), 1, "fresh playlist read is limited to the first page");
 
         app.handle(Cmd::PlayPlaylist {
             playlist: playlist.clone(),
