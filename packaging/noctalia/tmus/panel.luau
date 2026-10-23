@@ -568,6 +568,7 @@ local selected = nil
 local playlistId = ""
 local playlistTitle = ""
 local playlistArtPath = ""
+local playlistNavigation = {}
 -- Спектр: CSV-строка значений полос, публикуемая виджетом в лёгкий
 -- ключ "tmus.spectrum" (троттлинг ≥125 мс — 8 Гц, тяжёлый snapshot
 -- KEY "tmus" не дёргается). nil — бары не рисуются.
@@ -622,6 +623,11 @@ local activate -- defined below; used by trackRow onClick (клик = Enter)
 local maybeLoadMore -- defined below; used by move/g-jumps (догрузка хвоста)
 local maybeHomeMore -- defined below; used by home move/clamp (догрузка ленты)
 local endHold -- defined below; used by hintable volume and search controls
+
+function playlistNavigation.section()
+  local origin = playlistNavigation.origin
+  return view == "playlist" and (origin and origin.view or "library") or view
+end
 
 local function poke(event, payload)
   local argv = { "noctalia", "msg", "plugin", SERVICE, "all", event }
@@ -1975,12 +1981,22 @@ function KUF.searchSlice(items, budget)
 end
 
 local function openPlaylist(row)
+  if view ~= "playlist" then
+    playlistNavigation.origin = {
+      view = view, cursor = cursor, windowTop = windowTop, typing = typing,
+      homeShelf = homeShelf, homeItem = homeItem, homeTop = homeTop, homeLeft = homeLeft,
+    }
+  end
   playlistTitle = row.openTitle or row.title
   playlistId = row.open
   playlistArtPath = row.openArt or ""
   view = "playlist"
   cursor = 1
   windowTop = 1
+  selected = nil
+  focusBuf = 2
+  typing = false
+  inputMode = false
   poke("tracks", row.open)
 end
 
@@ -2270,11 +2286,24 @@ local function setView(id)
   end
 end
 
+function playlistNavigation.back()
+  local origin = playlistNavigation.origin
+  setView(origin and origin.view or "library")
+  playlistNavigation.origin = nil
+  focusBuf = 2
+  if origin then
+    cursor, windowTop = origin.cursor, origin.windowTop
+    homeShelf, homeItem, homeTop, homeLeft = origin.homeShelf, origin.homeItem, origin.homeTop, origin.homeLeft
+    typing = origin.typing
+    inputMode = view == "search"
+  end
+end
+
 local function railNode()
   local items = {}
   local sc = SC
   for i, v in ipairs(VIEWS) do
-    local active = view == v.id or (view == "playlist" and v.id == "library")
+    local active = playlistNavigation.section() == v.id
     table.insert(items, ui.column({
       key = "rail-" .. v.id,
       width = 48,
@@ -2310,10 +2339,7 @@ local function railNode()
   }, items)
 end
 
--- Кумихимо: пять горизонтальных подвесных вкладок вместо левого рейла.
--- Источник — тот же VIEWS; активная вкладка — плюс Library для вложенного
--- playlist (как в рейле). Каждая вкладка — shared-ярлык skin.kumihimoTag:
--- подвес декоративен, цель нажатия — тело. Подпись и глиф — как в рейле.
+-- Кумихимо: те же секции, что и в рейле; вложенный плейлист сохраняет родителя.
 function KUF.tabWidth()
   return math.max(72, math.floor((GEO.bodyW - (#VIEWS - 1) * GAP) / #VIEWS))
 end
@@ -2322,7 +2348,7 @@ function KUF.tabs()
   local tabs = {}
   local w = KUF.tabWidth()
   for _, v in ipairs(VIEWS) do
-    local active = view == v.id or (view == "playlist" and v.id == "library")
+    local active = playlistNavigation.section() == v.id
     table.insert(tabs, skin.kumihimoTag({
       key = "ku-tab-" .. v.id,
       width = w,
@@ -4045,7 +4071,7 @@ function onKey(chord, pressed)
 
   if chord == "ctrl+j" or chord == "ctrl+Cyrillic_o" or chord == "ctrl+k" or chord == "ctrl+Cyrillic_el" then
     local forward = chord == "ctrl+j" or chord == "ctrl+Cyrillic_o"
-    local section = view == "playlist" and "library" or view
+    local section = playlistNavigation.section()
     local i = VIEW_IDS[section] or 1
     i = i + (forward and 1 or -1)
     if i < 1 then
@@ -4516,15 +4542,9 @@ function onKey(chord, pressed)
     -- `period` — та же физическая клавиша на ЙЦУКЕН: точка входит в
     -- поиск и без переключения раскладки.
     setView("search")
-  elseif chord == "BackSpace" then
-    -- Назад по иерархии видов: из плейлиста — в Library (бывший h),
-    -- из search-normal — на home (бывший no-op, зеркало Esc; в
-    -- search-insert BackSpace обслуживает поле в inputMode-блоке
-    -- выше, сюда попадает только не-input случай — ветка оставлена
-    -- как защита). Прочее — глотаем, чтобы не утекала в приложения
-    -- под панелью.
+  elseif lc == "backspace" then
     if view == "playlist" then
-      setView("library")
+      playlistNavigation.back()
     elseif view == "search" and not inputMode then
       setView("home")
     end
