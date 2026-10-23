@@ -574,11 +574,18 @@ impl App {
     /// Запуск трека, который гарантированно уже в очереди: только
     /// навигация и резолв, очередь не трогаем.
     pub(crate) async fn play_known(&self, id: &TrackId) -> anyhow::Result<()> {
-        let index = match self.player.with_queue(|q| q.find_index(id)).await {
-            Some(index) => index,
-            None => anyhow::bail!("трека {id} нет в очереди"),
-        };
-        self.player.with_queue(|q| q.goto(index)).await;
+        let found = self.player.with_queue(|q| {
+            if q.current().is_some_and(|track| &track.id == id) {
+                return true;
+            }
+            match q.find_index(id) {
+                Some(index) => q.goto(index),
+                None => false,
+            }
+        }).await;
+        if !found {
+            anyhow::bail!("трека {id} нет в очереди");
+        }
         self.player.resolve_and_play(id).await?;
         Ok(())
     }
@@ -1572,6 +1579,23 @@ mod tests {
         assert_eq!(state.queue_len, 3, "goto не должен менять размер очереди");
         assert_eq!(state.queue_index, Some(2));
         assert_eq!(state.track.map(|t| t.id), Some(TrackId::new(ProviderId::YTMUSIC, "c")));
+    }
+
+    #[tokio::test]
+    async fn queue_goto_keeps_selected_duplicate_occurrence() {
+        let (app, _dir) = app(false).await;
+        let ids = ["a", "b", "a", "c"]
+            .map(|id| TrackId::new(ProviderId::YTMUSIC, id))
+            .to_vec();
+        app.handle(Cmd::PlayContext { tracks: ids.clone(), start: 0 }).await.unwrap();
+        app.handle(Cmd::QueueGoto { index: 2 }).await.unwrap();
+        let state = app.player.state().await;
+        assert_eq!(state.queue_index, Some(2));
+        assert_eq!(state.track.unwrap().id, ids[2]);
+        assert_eq!(
+            app.player.with_queue(|q| q.peek_next().unwrap().id.clone()).await,
+            ids[3],
+        );
     }
 
     /// Пустой контекст — ошибка команды, очередь не трогается.
