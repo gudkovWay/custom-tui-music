@@ -16,6 +16,7 @@ local data = {
   status = "stopped",
   title = "",
   artist = "",
+  artists = {},
   album = "",
   provider = "",
   artUrl = "",
@@ -364,6 +365,7 @@ end
 
 local function applyTrack(track)
   data.title, data.artist, data.album, data.provider, data.artUrl = trackFields(track)
+  data.artists = type(track) == "table" and type(track.artists) == "table" and track.artists or {}
   -- Строка "provider:id" для биндов f/d панели: текущий трек в
   -- Now-Playing не лежит ни в одном списке, панели нужен его id.
   local tid = type(track) == "table" and track.id or nil
