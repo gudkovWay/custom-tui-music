@@ -286,14 +286,16 @@ fn track_from_panel(item: &Value) -> Option<Track> {
         return None;
     }
 
-    // longBylineText: «Артист • Альбом» либо «Артист — Сингл»: длина
-    // сегментов сервис не размечает, поэтому альбомом считаем последний
-    // фрагмент после разделителя, артистами — остальное.
-    let byline = item
-        .get("longBylineText")
-        .map(runs_text)
-        .unwrap_or_default();
-    let (artists, album) = split_byline(&byline);
+    let byline = item.get("longBylineText");
+    let (artists, album) = match byline {
+        Some(text) if text.get("runs").and_then(Value::as_array)
+            .is_some_and(|runs| runs.iter().any(links_to_artist)) =>
+        {
+            credit(&[item.get("title")?, text])
+        }
+        Some(text) => split_byline(&runs_text(text)),
+        None => (Vec::new(), None),
+    };
     Some(Track {
         id: TrackId::new(PROVIDER, id),
         title,
@@ -652,7 +654,7 @@ fn credit(columns: &[&Value]) -> (Vec<String>, Option<String>) {
     };
     let parts: Vec<Segment> = segments(column)
         .into_iter()
-        .filter(|segment| !is_metadata(&segment.text))
+        .filter(|segment| segment.artist || !is_metadata(&segment.text))
         .collect();
 
     if parts.is_empty() {
@@ -660,13 +662,22 @@ fn credit(columns: &[&Value]) -> (Vec<String>, Option<String>) {
     }
     let marked = parts.iter().any(|part| part.artist);
 
-    let mut artists = Vec::new();
+    let mut artists: Vec<String> = if marked {
+        column.get("runs").and_then(Value::as_array)
+            .into_iter().flatten()
+            .filter(|run| links_to_artist(run))
+            .filter_map(|run| run.get("text").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut album = None;
     for (index, part) in parts.iter().enumerate() {
         if marked {
-            if part.artist {
-                artists.push(part.text.clone());
-            } else if album.is_none() {
+            if !part.artist && album.is_none() {
                 album = Some(part.text.clone());
             }
         } else if parts.len() > 1 && index + 1 == parts.len() {
@@ -956,6 +967,53 @@ mod tests {
             track.page_url.as_deref(),
             Some("https://music.youtube.com/watch?v=dQw4w9WgXcQ")
         );
+    }
+
+    #[test]
+    fn linked_artist_credits_preserve_individual_names() {
+        for separator in [" & ", ", ", " feat. "] {
+            let mut page = song_renderer();
+            let runs = &mut page["musicResponsiveListItemRenderer"]["flexColumns"][1]
+                ["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"];
+            runs[0]["text"] = json!("5opka");
+            runs[1]["text"] = json!(separator);
+            runs[2]["text"] = json!("6055");
+            let track = tracks(&page).remove(0);
+            assert_eq!(track.artists, ["5opka", "6055"], "{separator}");
+            assert_eq!(track.album.as_deref(), Some("Album"));
+        }
+    }
+
+    #[test]
+    fn linked_artist_name_with_punctuation_is_not_split() {
+        for name in ["Earth, Wind & Fire", "6055"] {
+            let mut page = song_renderer();
+            let text = &mut page["musicResponsiveListItemRenderer"]["flexColumns"][1]
+                ["musicResponsiveListItemFlexColumnRenderer"]["text"];
+            let mut artist = text["runs"][0].clone();
+            artist["text"] = json!(name);
+            *text = json!({ "runs": [artist, { "text": " • " }, { "text": "Album" }] });
+            let track = tracks(&page).remove(0);
+            assert_eq!(track.artists, [name]);
+            assert_eq!(track.album.as_deref(), Some("Album"));
+        }
+    }
+
+    #[test]
+    fn radio_uses_linked_artists_instead_of_joined_byline() {
+        let page = song_renderer();
+        let runs = &page["musicResponsiveListItemRenderer"]["flexColumns"][1]
+            ["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"];
+        let mut byline = runs.clone();
+        byline[1]["text"] = json!(" & ");
+        let page = json!({ "playlistPanelVideoRenderer": {
+            "videoId": "duet",
+            "title": { "simpleText": "42" },
+            "longBylineText": { "runs": byline }
+        } });
+        let (tracks, _) = radio(&page);
+        assert_eq!(tracks[0].artists, ["Artist A", "Artist B"]);
+        assert_eq!(tracks[0].album.as_deref(), Some("Album"));
     }
 
     #[test]
