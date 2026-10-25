@@ -919,7 +919,7 @@ local function rebuildHomeShelves()
             id = idOf(it),
             title = tostring(it.title or ""),
             subtitle = type(it.artists) == "table" and table.concat(it.artists, ", ") or "",
-            artist = type(it.artists) == "table" and table.concat(it.artists, ", ") or "",
+            artists = it.artists,
             art = tostring(it.art_path or ""),
             time = durationLabel(it.duration),
             event = "radio",
@@ -1065,6 +1065,29 @@ local function searchLabel(text, props, value, identity)
     hintIdentity = tostring(identity) .. ":" .. queryText,
     onClick = function() submitSearch(queryText) end,
   }, { label })
+end
+
+local function artistLabels(text, props, artists, identity)
+  local names = {}
+  for _, value in ipairs(type(artists) == "table" and artists or {}) do
+    local name = noctalia.string.trim(tostring(value or ""))
+    if name ~= "" then table.insert(names, name) end
+  end
+  if #names == 0 then return lbl(text, props) end
+  if #names == 1 then return searchLabel(text, props, names[1], identity) end
+  local children = {}
+  for i, name in ipairs(names) do
+    if i > 1 then
+      table.insert(children, lbl(", ", { key = "separator-" .. i, size = props.size, color = props.color }))
+    end
+    table.insert(children, searchLabel(name, {
+      key = "artist-" .. i, size = props.size, color = props.color, grow = 1,
+    }, name, identity .. ":" .. i))
+  end
+  return ui.row({
+    key = props.key .. "-artists", width = props.width or props.maxWidth,
+    height = props.height, flexGrow = props.grow, align = "center",
+  }, children)
 end
 
 local function hintTarget(node, identity, badge)
@@ -1366,13 +1389,13 @@ local function npNode(s)
         maxLines = KU and 1 or nil,
         maxWidth = KU and GEO.npTextW or nil,
       }, s.title, "playing-title:" .. tostring(s.trackId)),
-      searchLabel(shorten(tostring(s.artist or ""), 48), {
+      artistLabels(shorten(tostring(s.artist or ""), 48), {
         key = "np-artist",
         size = 12,
         color = COLORS.muted,
         maxLines = KU and 1 or nil,
         maxWidth = KU and GEO.npTextW or nil,
-      }, s.artist, "playing-artist:" .. tostring(s.trackId)),
+      }, s.artists, "playing-artist:" .. tostring(s.trackId)),
       -- Только дефолт держит причину отдельной строкой текста: у
       -- Kumihimo она переезжает в правую колонку под время (ниже),
       -- чтобы высота арт-строки осталась 48 и бюджет транспорта — 110.
@@ -1622,12 +1645,12 @@ local function trackRow(i, t, opts)
           maxLines = 1,
         }, (t.kind == "track" or t.kind == "artist") and t.rawTitle or "",
           "row-title:" .. tostring(t.id)),
-        searchLabel(tostring(o.subtitle or ""), {
+        artistLabels(tostring(o.subtitle or ""), {
           key = "ksub" .. i,
           size = 11,
           color = COLORS.muted,
           maxLines = 1,
-        }, t.artist, "row-artist:" .. tostring(t.id)),
+        }, t.artists, "row-artist:" .. tostring(t.id)),
       }),
       (time ~= nil and time ~= "") and ui.row({
         key = "ktime-w" .. i,
@@ -1655,8 +1678,8 @@ local function trackRow(i, t, opts)
       color = current and COLORS.accent or (active and COLORS.text or COLORS.muted),
     }, (t.kind == "track" or t.kind == "artist") and t.rawTitle or "",
       "row-title:" .. tostring(t.id)),
-    searchLabel(shorten(o.subtitle, 32), { key = "sub" .. i, color = COLORS.muted, maxWidth = 220 },
-      t.artist, "row-artist:" .. tostring(t.id)),
+    artistLabels(shorten(o.subtitle, 32), { key = "sub" .. i, color = COLORS.muted, width = 220 },
+      t.artists, "row-artist:" .. tostring(t.id)),
     lbl(o.time or "", { key = "time" .. i, color = COLORS.muted, width = 56, mono = true }),
   }
   return ui.row({
@@ -1684,7 +1707,7 @@ local function resultRow(r)
     id = idOf(r),
     title = tostring(r.title or r.name or ""),
     rawTitle = tostring(r.title or r.name or ""),
-    artist = artists,
+    artists = r.artists,
     subtitle = artists ~= "" and artists or tostring(r.album or ""),
     art = tostring(r.art_path or ""),
   }
@@ -1777,7 +1800,7 @@ function rows()
             rating = ratingOf(s, idstr),
             title = tostring(t.title or ""),
             rawTitle = tostring(t.title or ""),
-            artist = type(t.artists) == "table" and table.concat(t.artists, ", ") or "",
+            artists = t.artists,
             subtitle = type(t.artists) == "table" and #t.artists > 0
               and table.concat(t.artists, ", ") or tostring(t.album or ""),
             art = tostring(t.art_path or ""),
@@ -2738,8 +2761,8 @@ local function homeWorkspace(s)
       lbl("Now Playing", { key = "np-over", size = 11, color = COLORS.muted }),
       searchLabel(providerGlyph(s.provider) .. shorten(tostring(s.title or ""), 40),
         { key = "np-title", size = 18, color = COLORS.text }, s.title, "hero-title:" .. tostring(s.trackId)),
-      searchLabel(shorten(tostring(s.artist or ""), 40),
-        { key = "np-artist", size = 13, color = COLORS.accent }, s.artist, "hero-artist:" .. tostring(s.trackId)),
+      artistLabels(shorten(tostring(s.artist or ""), 40),
+        { key = "np-artist", size = 13, color = COLORS.accent }, s.artists, "hero-artist:" .. tostring(s.trackId)),
       lbl(
         (tostring(s.album or "") ~= "" and shorten(s.album, 40) .. " · " or "")
           .. clock(pos) .. (dur > 0 and ("/" .. clock(dur)) or "")
@@ -2819,13 +2842,13 @@ local function homeCardNode(shelfIndex, cardIndex, c)
         }, c.kind == "track" and c.title or "", identity .. ":title"),
       }),
       ui.row({ key = "s-w", height = 16, align = "center" }, {
-        searchLabel(c.subtitle, {
+        artistLabels(c.subtitle, {
           key = "s",
           size = 11,
           color = COLORS.muted,
           maxLines = 1,
           maxWidth = HOME_CARD_WIDTH - 14,
-        }, c.artist, identity .. ":artist"),
+        }, c.artists, identity .. ":artist"),
       }),
     }), identity, badge)
   end
@@ -2850,8 +2873,8 @@ local function homeCardNode(shelfIndex, cardIndex, c)
     }),
     searchLabel(shorten(c.title, 18), { key = "t", height = 16, color = COLORS.text },
       c.kind == "track" and c.title or "", identity .. ":title"),
-    searchLabel(shorten(c.subtitle, 22), { key = "s", height = 16, color = COLORS.muted },
-      c.artist, identity .. ":artist"),
+    artistLabels(shorten(c.subtitle, 22), { key = "s", height = 16, color = COLORS.muted },
+      c.artists, identity .. ":artist"),
   }), identity, badge)
 end
 
@@ -3068,10 +3091,9 @@ local function queueContextNode(s)
             color = isPlaying and COLORS.accent or (isCursor and COLORS.text or COLORS.muted),
             maxLines = 1,
           }, t.title, "queue-title:" .. i .. ":" .. idOf(t)),
-          searchLabel(type(t.artists) == "table" and table.concat(t.artists, ", ") or "", {
+          artistLabels(type(t.artists) == "table" and table.concat(t.artists, ", ") or "", {
             key = "q-artist" .. i, size = 10, color = COLORS.muted, maxLines = 1,
-          }, type(t.artists) == "table" and table.concat(t.artists, ", ") or "",
-            "queue-artist:" .. i .. ":" .. idOf(t)),
+          }, t.artists, "queue-artist:" .. i .. ":" .. idOf(t)),
         }),
         -- Длительность Kumihimo — ограниченный слот 44 (label.width хост
         -- игнорирует, поэтому ширину держит flex-обёртка).
