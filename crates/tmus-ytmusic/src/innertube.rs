@@ -24,7 +24,7 @@ const BASE: &str = "https://music.youtube.com/youtubei/v1/";
 /// `hl=en` запинен намеренно: разбор опирается на английские служебные
 /// строки («12 songs», «1.2M views»), а локализованные он бы не узнал.
 const CLIENT_NAME: &str = "WEB_REMIX";
-const CLIENT_VERSION: &str = "1.20240401.01.00";
+const CLIENT_VERSION: &str = "1.20261031.09.00";
 const HL: &str = "en";
 const GL: &str = "US";
 
@@ -283,7 +283,7 @@ impl InnerTube {
     /// `Origin`/`X-Origin`/`X-Goog-AuthUser` сервис требует для запросов с
     /// подписью — без них он отвечает отказом, хотя подпись верна.
     async fn post(&self, endpoint: &str, body: Value) -> Result<Value> {
-        self.post_client(endpoint, body, web_remix_client(), None)
+        self.post_client(endpoint, body, web_remix_client(), Some("67"))
             .await
     }
 
@@ -304,8 +304,12 @@ impl InnerTube {
             .post(url)
             .header("Origin", ORIGIN)
             .header("X-Origin", ORIGIN)
-            .header("X-Goog-AuthUser", "0")
-            .json(&with_context(body, client));
+            .header("X-Goog-AuthUser", "0");
+
+        if let Some(version) = client.get("clientVersion").and_then(Value::as_str) {
+            request = request.header("X-YouTube-Client-Version", version);
+        }
+        request = request.json(&with_context(body, client));
 
         if let Some(num) = client_num {
             request = request.header("X-YouTube-Client-Name", num);
