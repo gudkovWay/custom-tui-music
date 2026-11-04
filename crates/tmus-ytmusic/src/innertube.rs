@@ -558,8 +558,11 @@ fn search_params(kind: SearchKind) -> &'static str {
     }
 }
 
-/// Признак разлогина в теле ответа: `{"error":{"code":403,…}}`.
+/// HTTP 200 может содержать экран входа вместо приватной библиотеки.
 fn unauth_reason(value: &Value) -> Option<String> {
+    if has_sign_in_message(value) {
+        return Some("YouTube требует вход в аккаунт".to_owned());
+    }
     let error = value.get("error")?;
     let status = error.get("status").and_then(Value::as_str).unwrap_or_default();
     let code = error.get("code").and_then(Value::as_u64);
@@ -574,6 +577,18 @@ fn unauth_reason(value: &Value) -> Option<String> {
             .unwrap_or(status)
             .to_owned()
     })
+}
+
+fn has_sign_in_message(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) => {
+            fields.get("messageRenderer").is_some_and(|message| {
+                message.pointer("/button/buttonRenderer/navigationEndpoint/signInEndpoint").is_some()
+            }) || fields.values().any(has_sign_in_message)
+        }
+        Value::Array(items) => items.iter().any(has_sign_in_message),
+        _ => false,
+    }
 }
 
 fn now_unix() -> u64 {
@@ -628,6 +643,54 @@ pub(crate) async fn probe(url: &str, user_agent: Option<&str>) -> Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sign_in_message_is_an_auth_failure_without_matching_english_text() {
+        let mut page: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/signed-out-liked.json"
+        )).expect("captured anonymous liked response");
+        let message = &mut page["contents"]["singleColumnBrowseResultsRenderer"]["tabs"][0]
+            ["tabRenderer"]["content"]["sectionListRenderer"]["contents"][0]
+            ["itemSectionRenderer"]["contents"][0]["messageRenderer"];
+        message["text"] = json!({ "runs": [{ "text": "Войдите в аккаунт" }] });
+        message["subtext"] = json!({});
+        assert!(unauth_reason(&page).is_some());
+    }
+
+    #[test]
+    fn anonymous_catalog_with_header_sign_in_button_is_not_an_auth_failure() {
+        let page = json!({
+            "responseContext": { "serviceTrackingParams": [{
+                "service": "GFEEDBACK",
+                "params": [{ "key": "logged_in", "value": "0" }]
+            }] },
+            "header": { "buttonRenderer": {
+                "navigationEndpoint": { "signInEndpoint": {} }
+            } },
+            "contents": { "musicPlaylistShelfRenderer": { "contents": [] } }
+        });
+        assert!(unauth_reason(&page).is_none());
+        assert!(unauth_reason(&json!({
+            "contents": { "messageRenderer": {
+                "text": { "runs": [{ "text": "No results" }] }
+            } }
+        })).is_none());
+    }
+
+    #[test]
+    fn explicit_auth_errors_are_distinct_from_other_api_errors() {
+        for error in [
+            json!({ "code": 401 }),
+            json!({ "code": 403 }),
+            json!({ "status": "UNAUTHENTICATED" }),
+            json!({ "status": "PERMISSION_DENIED", "message": "Denied" }),
+        ] {
+            assert!(unauth_reason(&json!({ "error": error })).is_some());
+        }
+        assert!(unauth_reason(&json!({ "error": {
+            "code": 500, "status": "INTERNAL", "message": "Unavailable"
+        } })).is_none());
+    }
 
     #[test]
     fn rating_maps_to_like_endpoints() {

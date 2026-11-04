@@ -706,6 +706,36 @@ fn extractor_arg(client: &str) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    #[ignore = "requires TMUS_TEST_YTM_PROFILE and TMUS_TEST_YTM_SIGNED_OUT_PROFILE"]
+    async fn live_liked_browser_sessions_and_continuation() {
+        let config = Config::default();
+        let signed_out = YtMusic::new(&config, CookieSource::Browser {
+            spec: std::env::var("TMUS_TEST_YTM_SIGNED_OUT_PROFILE")
+                .expect("signed-out browser profile"),
+        }).expect("load signed-out profile");
+        assert!(matches!(
+            signed_out.liked_page(None).await,
+            Err(ProviderError::Auth { .. })
+        ));
+        assert!(matches!(signed_out.auth(), AuthStatus::Expired { .. }));
+
+        let connected = YtMusic::new(&config, CookieSource::Browser {
+            spec: std::env::var("TMUS_TEST_YTM_PROFILE").expect("authenticated browser profile"),
+        }).expect("load authenticated profile");
+        assert!(matches!(connected.refresh().await, Ok(AuthStatus::Ready)));
+        let first = connected.liked_page(None).await.expect("first liked page");
+        assert!(!first.tracks.is_empty());
+        let cursor = first.next.as_deref().expect("liked continuation");
+        let second = connected.liked_page(Some(cursor)).await.expect("next liked page");
+        assert!(!second.tracks.is_empty());
+        let first_ids: HashSet<_> = first.tracks.iter().map(|track| &track.id).collect();
+        assert!(second.tracks.iter().all(|track| {
+            track.id.provider == ProviderId::YTMUSIC && !first_ids.contains(&track.id)
+        }));
+        println!("authenticated liked pages: {} + {} tracks", first.tracks.len(), second.tracks.len());
+    }
+
     #[test]
     fn probe_accepts_full_and_range_responses() {
         assert!(probe_passed(200));
