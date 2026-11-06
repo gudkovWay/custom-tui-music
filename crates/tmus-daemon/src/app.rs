@@ -1041,6 +1041,28 @@ mod tests {
         (app, provider, dir)
     }
 
+    async fn app_with_soundcloud() -> (Arc<App>, Arc<FakeProvider>, Arc<FakeProvider>, tempfile::TempDir) {
+        let (original, youtube, dir) = app_full(false, false).await;
+        let soundcloud = Arc::new(FakeProvider {
+            id: ProviderId::SOUNDCLOUD,
+            audio: youtube.audio.clone(),
+            fail_rate: AtomicBool::new(false),
+            fail_playlist: AtomicBool::new(false),
+            playlist_calls: std::sync::Mutex::new(Vec::new()),
+            pages: std::sync::Mutex::new(Vec::new()),
+            fail_pages: AtomicBool::new(false),
+            home_pages: std::sync::Mutex::new(Vec::new()),
+            fail_home: AtomicBool::new(false),
+        });
+        let mut registry = original.registry.clone();
+        registry.insert(soundcloud.clone() as Arc<dyn Provider>);
+        let app = App::new(
+            original.player.clone(), registry, original.cache.clone(),
+            original.config.clone(), original.paths.clone(), original.resolve_gate.clone(),
+        );
+        (app, youtube, soundcloud, dir)
+    }
+
     #[tokio::test]
     async fn auth_changed_broadcasts_transitions_not_repeated_observations() {
         let (app, _dir) = app(false).await;
@@ -1066,6 +1088,39 @@ mod tests {
             ("ytmusic".into(), AuthStatus::Ready),
             ("ytmusic".into(), expired),
         ]);
+        app.player.mpv().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn liked_library_remains_accessible_with_soundcloud_focus() {
+        let (app, _, _, _dir) = app_with_soundcloud().await;
+        for scope in [None, Some("soundcloud"), Some("ytmusic")] {
+            let library = app.library(scope).await.expect("library");
+            assert_eq!(library.iter().filter(|p| p.id == PlaylistId::new(ProviderId::LOCAL, "liked")).count(), 1);
+        }
+        assert!(app.library(Some("local")).await.expect("local").is_empty());
+        app.player.mpv().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn liked_refresh_updates_soundcloud_when_youtube_fails_without_losing_its_cursor() {
+        let (app, youtube, soundcloud, _dir) = app_with_soundcloud().await;
+        let yt = |id| sample_track(&TrackId::new(ProviderId::YTMUSIC, id));
+        let sc = |id| sample_track(&TrackId::new(ProviderId::SOUNDCLOUD, id));
+        youtube.set_pages(vec![vec![yt("yt-old")], vec![yt("yt-tail")]]);
+        soundcloud.set_pages(vec![vec![sc("sc-old")], vec![sc("sc-old-tail")]]);
+        let liked = PlaylistId::new(ProviderId::LOCAL, "liked");
+        app.playlist_tracks(&liked, true).await.expect("initial");
+        youtube.fail_pages.store(true, Ordering::SeqCst);
+        soundcloud.set_pages(vec![vec![sc("sc-new")], vec![sc("sc-tail")]]);
+        assert_eq!(app.playlist_tracks(&liked, true).await.expect("partial refresh"),
+            [yt("yt-old"), sc("sc-new")]);
+        assert_eq!(app.playlist_tracks(&liked, false).await.expect("cached"),
+            [yt("yt-old"), sc("sc-new")]);
+        youtube.fail_pages.store(false, Ordering::SeqCst);
+        let (tail, next) = app.playlist_tracks_page(&liked).await.expect("preserved cursors");
+        assert_eq!(tail, [sc("sc-tail"), yt("yt-tail")]);
+        assert_eq!(next, None);
         app.player.mpv().shutdown().await;
     }
 

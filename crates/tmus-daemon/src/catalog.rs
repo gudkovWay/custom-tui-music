@@ -292,19 +292,17 @@ impl App {
         // показа прячется — его заменяет виртуальный `local:liked`;
         // по прямому адресу плейлист по-прежнему читается.
         let mut out = locals;
-        if provider.is_none() {
-            remote.retain(|playlist| {
-                !(playlist.id.provider == ProviderId::YTMUSIC
-                    && playlist.id.id == YTM_LIKED_PLAYLIST_ID)
-            });
-            out.push(Playlist {
-                id: liked_playlist(),
-                title: "Liked Music".to_owned(),
-                subtitle: None,
-                art_url: None,
-                track_count: None,
-            });
-        }
+        remote.retain(|playlist| {
+            !(playlist.id.provider == ProviderId::YTMUSIC
+                && playlist.id.id == YTM_LIKED_PLAYLIST_ID)
+        });
+        out.push(Playlist {
+            id: liked_playlist(),
+            title: "Liked Music".to_owned(),
+            subtitle: None,
+            art_url: None,
+            track_count: None,
+        });
         out.extend(remote);
         Ok(out)
     }
@@ -474,9 +472,9 @@ impl App {
     /// Первая страница агрегата: YouTube Music, остальные провайдеры,
     /// затем локальные отметки вне выдачи; внутри провайдера — серверный порядок.
     /// Старые локальные лайки не должны оттеснять новые серверные.
-    /// Сбой провайдера не стирает локальные или чужие треки и не
-    /// помечает его исчерпанным — ключа в состоянии просто нет.
-    /// При явном refresh ошибка оставляет прежний срез и курсоры нетронутыми.
+    /// При частичном сбое сохраняются старые треки и живой курсор
+    /// отказавшего провайдера; успешные провайдеры обновляются независимо.
+    /// Полный отказ явного refresh оставляет снимок нетронутым и возвращает ошибку.
     async fn liked_virtual_first(
         &self,
         liked: &PlaylistId,
@@ -485,6 +483,8 @@ impl App {
         let mut tracks = Vec::new();
         let mut seen = HashSet::new();
         let mut state = LikedCursor::default();
+        let mut succeeded = false;
+        let mut failure = None;
         let mut targets = self.targets(None)?;
         targets.sort_unstable_by_key(|target| (target.id() != ProviderId::YTMUSIC, target.id()));
         let results = futures_util::future::join_all(targets.iter().map(|target| async move {
@@ -494,6 +494,7 @@ impl App {
         for (target, result) in results {
             match result {
                 Ok(page) => {
+                    succeeded = true;
                     state
                         .providers
                         .insert(target.id().as_str().to_owned(), page.next);
@@ -511,10 +512,30 @@ impl App {
                     if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
                         self.try_reauth(target).await;
                     }
-                    if refresh {
-                        return Err(err.into());
+                    let (cached, previous) = self.with_cache(|c| -> anyhow::Result<_> {
+                        Ok((
+                            c.playlist_tracks(liked)?,
+                            c.playlist_continuation(ProviderId::LOCAL.as_str(), liked)?,
+                        ))
+                    })?;
+                    for track in cached {
+                        if track.id.provider == target.id() && seen.insert(track.id.clone()) {
+                            tracks.push(track);
+                        }
                     }
+                    if let Some(raw) = previous {
+                        let mut previous = LikedCursor::parse(&raw);
+                        if let Some(Some(cursor)) = previous.providers.remove(target.id().as_str()) {
+                            state.providers.insert(target.id().as_str().to_owned(), Some(cursor));
+                        }
+                    }
+                    failure = Some(err);
                 }
+            }
+        }
+        if refresh && !succeeded {
+            if let Some(err) = failure {
+                return Err(err.into());
             }
         }
         for (track, _) in self.with_cache(|c| c.liked_tracks())? {
