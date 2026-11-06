@@ -50,6 +50,7 @@ pub struct App {
     config: Config,
     paths: Paths,
     events: broadcast::Sender<Event>,
+    auth_events: std::sync::Mutex<std::collections::HashMap<String, tmus_core::model::AuthStatus>>,
     pub(crate) catalog_source: std::sync::Mutex<CatalogSource>,
     /// Кэш домашней ленты. tokio-замок: держится через await —
     /// параллельные `Cmd::Home` сливаются в один сетевой заход
@@ -110,6 +111,7 @@ impl App {
             config,
             paths,
             events,
+            auth_events: std::sync::Mutex::new(std::collections::HashMap::new()),
             catalog_source: std::sync::Mutex::new(catalog_source),
             home_cache: tokio::sync::Mutex::new(None),
             radio: tokio::sync::Mutex::new(None),
@@ -177,6 +179,19 @@ impl App {
     /// Разослать событие. Отсутствие подписчиков — не ошибка: демон
     /// штатно работает без единого клиента.
     pub fn emit(&self, event: Event) {
+        if let Event::AuthChanged { provider, auth } = &event {
+            let mut states = self.auth_events.lock().expect("auth events");
+            if let Some(previous) = states.get_mut(provider) {
+                if previous == auth {
+                    return;
+                }
+                previous.clone_from(auth);
+            } else {
+                states.insert(provider.clone(), auth.clone());
+            }
+            let _ = self.events.send(event);
+            return;
+        }
         let _ = self.events.send(event);
     }
 
@@ -1024,6 +1039,34 @@ mod tests {
         ));
         let app = App::new(player, registry, cache, Config::default(), paths, gate);
         (app, provider, dir)
+    }
+
+    #[tokio::test]
+    async fn auth_changed_broadcasts_transitions_not_repeated_observations() {
+        let (app, _dir) = app(false).await;
+        let mut events = app.subscribe();
+        let expired = AuthStatus::Expired { hint: "Sign in again".into() };
+        for (provider, auth) in [
+            ("ytmusic", expired.clone()),
+            ("ytmusic", expired.clone()),
+            ("soundcloud", expired.clone()),
+            ("ytmusic", AuthStatus::Ready),
+            ("ytmusic", AuthStatus::Ready),
+            ("ytmusic", expired.clone()),
+        ] {
+            app.emit(Event::AuthChanged { provider: provider.into(), auth });
+        }
+        let mut received = Vec::new();
+        while let Ok(Event::AuthChanged { provider, auth }) = events.try_recv() {
+            received.push((provider, auth));
+        }
+        assert_eq!(received, [
+            ("ytmusic".into(), expired.clone()),
+            ("soundcloud".into(), expired.clone()),
+            ("ytmusic".into(), AuthStatus::Ready),
+            ("ytmusic".into(), expired),
+        ]);
+        app.player.mpv().shutdown().await;
     }
 
     fn home_fixture(id: &str, next: Option<&str>) -> tmus_core::model::HomePage {

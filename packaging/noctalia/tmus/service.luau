@@ -54,6 +54,7 @@ local streaming = false
 local retryAt = 0
 local libraryAt = 0
 local sourceReady = false
+local authErrors = {}
 -- Летящая догрузка хвоста плейлиста: повторный tracks-more, пока не
 -- вернулся предыдущий call, игнорируется. Сбрасывается в cb и onDone.
 local tracksMoreInFlight = false
@@ -839,9 +840,20 @@ local function onEvent(line)
     pullQueue()
   elseif kind == "auth_changed" then
     local auth = got.auth
-    local hint = type(auth) == "table" and (auth.hint or auth.Missing or auth.Expired) or nil
-    data.error = type(hint) == "string" and hint or ("сессия " .. tostring(got.provider))
-    noctalia.notifyError("Музыка", data.error)
+    local provider = tostring(got.provider or "")
+    local kind = type(auth) == "table" and tostring(next(auth) or "") or tostring(auth or "")
+    if kind == "Missing" or kind == "Expired" then
+      local details = auth[kind]
+      local hint = type(details) == "table" and details.hint or nil
+      data.error = type(hint) == "string" and hint or ("сессия " .. provider)
+      local signature = kind .. ":" .. data.error
+      if authErrors[provider] ~= signature then
+        authErrors[provider] = signature
+        noctalia.notifyError("Музыка", data.error)
+      end
+    elseif kind == "Ready" or kind == "Anonymous" then
+      authErrors[provider] = nil
+    end
     pullProviders()
   end
   publish()
