@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::aes::Aes128;
@@ -381,12 +382,20 @@ fn read_firefox(db: &Path, domain_suffix: &str) -> Result<CookieJar> {
     )
     .map_err(|err| cookies_err(db, format!("база не открылась: {err}")))?;
 
+    let schema: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|err| cookies_err(db, format!("версия схемы cookies не прочиталась: {err}")))?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| cookies_err(db, format!("системное время некорректно: {err}")))?;
+    // Firefox 142 / схема 16 перевели expiry из секунд в миллисекунды.
+    let cutoff = if schema >= 16 { now.as_millis() as i64 } else { now.as_secs() as i64 };
     let pattern = format!("%{domain_suffix}");
     let mut stmt = conn
-        .prepare("SELECT name, value FROM moz_cookies WHERE host LIKE ?1")
+        .prepare("SELECT name, value FROM moz_cookies WHERE host LIKE ?1 AND expiry > ?2")
         .map_err(|err| cookies_err(db, format!("таблица moz_cookies читается не так: {err}")))?;
     let rows = stmt
-        .query_map([pattern], |row| {
+        .query_map(rusqlite::params![pattern, cutoff], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .map_err(|err| cookies_err(db, format!("запрос к moz_cookies не выполнился: {err}")))?;
@@ -743,6 +752,53 @@ mod tests {
         assert_eq!(jar.get("FAKE"), None);
         assert_eq!(jar.get("OTHER"), None);
         assert_eq!(jar.get("SSID"), None);
+    }
+
+    #[test]
+    fn firefox_import_excludes_expired_cookies_in_seconds_and_milliseconds() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_secs() as i64;
+        for (schema, scale) in [(15, 1), (16, 1000), (17, 1000)] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db = dir.path().join("cookies.sqlite");
+            let conn = rusqlite::Connection::open(&db).expect("open");
+            conn.pragma_update(None, "user_version", schema).expect("schema version");
+            conn.execute_batch(
+                "CREATE TABLE moz_cookies(
+                    host TEXT NOT NULL, name TEXT NOT NULL,
+                    value TEXT NOT NULL, expiry INTEGER NOT NULL);",
+            )
+            .expect("schema");
+            for (host, name, value, expiry) in [
+                (".youtube.com", "SAPISID", "current-sid", (now + 3600) * scale),
+                (".youtube.com", "ST-old", "expired-session-token", (now - 3600) * scale),
+                (".youtube.com", "SAPISID", "expired-sid", (now - 1) * scale),
+                (".youtube.com", "SID", "session", (now + 3600) * scale),
+                (".example.com", "OTHER", "unrelated", (now + 3600) * scale),
+            ] {
+                conn.execute(
+                    "INSERT INTO moz_cookies(host, name, value, expiry) VALUES(?1, ?2, ?3, ?4)",
+                    rusqlite::params![host, name, value, expiry],
+                )
+                .expect("cookie");
+            }
+            drop(conn);
+
+            let jar = jar_for_domain(
+                &CookieSource::Browser {
+                    spec: format!("firefox:{}", dir.path().display()),
+                },
+                "youtube.com",
+            )
+            .expect("Firefox cookies");
+
+            assert_eq!(
+                jar.header(),
+                "SAPISID=current-sid; SID=session",
+                "schema {schema}: expired values must neither be sent nor replace current credentials",
+            );
+        }
     }
 
     #[test]
