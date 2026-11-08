@@ -3,11 +3,7 @@
 local KEY = "tmus"
 local SERVICE = "q/tmus:watch"
 
--- Общий скин десктопа: модуль и skin-assets кладутся рядом с плагином
--- при деплое (раскладку ведёт оркестратор). Свой модуль НЕ заводим —
--- контракт один на все панели, иначе скины разъедутся. Локальный
--- require требует plugin_api >= 22; у плагина 32 (минимум модуля —
--- 22, плюс getSetting 26 и getColor 31, см. комментарий манифеста).
+-- Shared fonts and the non-Mina desktop families remain in the desktop helper.
 local skin = require('./desktop_skin.luau')
 local Hint = require('./hint_navigation.luau')
 local hints = Hint.new()
@@ -74,6 +70,7 @@ local COLORS = {}
 -- чанка жёсткий лимит локальных имён, и каждая отдельная `local function`
 -- занимает слот до конца файла.
 local KUF = {}
+KUF.mina = require('./mina_panel.luau')
 function KUF.rolePalette()
   for k, v in pairs(COLORS_ROLE) do
     COLORS[k] = v
@@ -168,8 +165,8 @@ local GAP = 12
 local PAD = 16
 -- Хост режет манифестную площадь панели ДО plugin.layout: native
 -- panel_manager вычитает 2*Style::panelPadding (14) с каждой оси, поэтому
--- 1180×760 из манифеста — внешний размер, а рисовать панель может в
--- 1152×732. Без этой поправки бюджеты разъезжаются с фактом на 28 px по
+-- 1120×760 из манифеста — внешний размер, а рисовать панель может в
+-- 1092×732. Без этой поправки бюджеты разъезжаются с фактом на 28 px по
 -- обеим осям (окно считалось по 468, а вьюпорт был 440).
 local HOST_PANEL_PAD = 14
 -- ScrollView при переполнении контента резервирует под полосу прокрутки
@@ -177,7 +174,7 @@ local HOST_PANEL_PAD = 14
 -- резервом ЗАРАНЕЕ, чтобы третья обложка не лезла под полосу.
 local SCROLL_GUTTER = 14
 -- ── Геометрия панели и бюджет окон ──────────────────────────────────
--- Панель 1180×760 (plugin.toml). Рамка скина резервирует EDGE=12 px
+-- Панель 1120×760 (plugin.toml). Рамка скина резервирует EDGE=12 px
 -- с КАЖДОЙ стороны прямо в потоке (2*EDGE по оси); у активного Kumihimo
 -- периметр тонкий, но сверху ещё шнур-акцент, поэтому ringX/ringY
 -- считаются раздельно. Сверх рамки идут собственный отступ (PAD),
@@ -195,7 +192,7 @@ local GEO = {
   -- прогресс 4 + два зазора по 8. В дефолте — последний ребёнок
   -- workspace; у Kumihimo вынесен под main во всю ширину.
   transport = 110,
-  panelW = 1180,
+  panelW = 1120,
   panelH = 760,
 }
 
@@ -248,7 +245,7 @@ function KUF.recomputeLayout(ku, kuPad, kuView)
     -- бюджет не должен разъезжаться с фактическим узлом frame().
     local cord = skin.KUMIHIMO_CORD
     local frameGap = skin.KUMIHIMO_FRAME_GAP
-    -- Плагин рисует уже ОБРЕЗАННУЮ хостом площадь: 1180×760 из манифеста
+    -- Плагин рисует уже ОБРЕЗАННУЮ хостом площадь: 1120×760 из манифеста
     -- минус 2*HOST_PANEL_PAD по каждой оси.
     local panelW = GEO.panelW - 2 * HOST_PANEL_PAD
     local panelH = GEO.panelH - 2 * HOST_PANEL_PAD
@@ -677,19 +674,163 @@ local function cyclePreset(step)
   poke("eq", "preset-on:" .. EQ_PRESET_NAMES[idx])
 end
 
--- Мини-бар полосы: 15 позиций от центра (8-я), усиление ±15 дБ → до
--- 7 шагов в сторону знака. Символы те же, что в прогрессах панели.
-local function eqBar(gain)
-  local center = 8
-  local cells = {}
-  for i = 1, 15 do
-    cells[i] = "·"
+-- ── Эквалайзер: кривая с ручками ────────────────────────────────────
+-- Полосы правятся прямо по графику: клик по точке берёт полосу «в
+-- руку», вертикальное движение мыши по графику меняет её усиление, уход
+-- указателя с графика отправляет значение демону. Почему отдельный
+-- клик, а не drag: у ui.graph в API 32 есть только hover-координаты
+-- (onPointerMove/onPointerLeave), press/release хост не отдаёт. Захват
+-- живёт до ухода с графика или повторного клика, поэтому обычное
+-- движение мыши по кривой звук не меняет.
+--
+-- Состояние и геометрия лежат в KUF, а не в новых локалах: у главного
+-- чанка панели жёсткий лимит локальных имён (см. KUF.rolePalette).
+KUF.eqChartH = 196   -- высота области графика
+KUF.eqDot = 10       -- диаметр ручки-точки
+KUF.eqScaleW = 40    -- колонка подписей дБ
+KUF.eqSamples = 91   -- сэмплов кривой: узел каждой полосы — внутри
+KUF.eqPad = 0.06     -- верхний/нижний отступ шейдера графика (graphPadNorm)
+KUF.eqTicks = {}
+KUF.eqTickText = { "32", "64", "125", "250", "500", "1k", "2k", "4k", "8k", "16k" }
+for g = EQ_GAIN_LIMIT, -EQ_GAIN_LIMIT, -3 do
+  table.insert(KUF.eqTicks, g)
+end
+-- Взятая полоса (nil — ничего не держим) и черновик её усиления до
+-- подтверждения демоном.
+KUF.eqGrab = nil
+KUF.eqDraft = {}
+
+-- Усиление полосы: черновик перетаскивания важнее снимка демона.
+function KUF.eqGain(bands, i)
+  local draft = KUF.eqDraft[i]
+  if draft ~= nil then
+    return draft
   end
-  local steps = math.floor(math.abs(gain) / EQ_GAIN_LIMIT * 7 + 0.5)
-  for i = 1, steps do
-    cells[center + (gain >= 0 and i or -i)] = "█"
+  return tonumber(bands and bands[i]) or 0
+end
+
+-- −15…+15 дБ → 0…1 (1 — верх графика).
+function KUF.eqNorm(gain)
+  return math.clamp(((tonumber(gain) or 0) + EQ_GAIN_LIMIT) / (2 * EQ_GAIN_LIMIT), 0, 1)
+end
+
+-- Норма → доля высоты от верха: та же формула, что у шейдера
+-- (mapToPlotRange: pad + (1-2pad)*y), иначе ручки и сетка съезжали бы с
+-- линии.
+function KUF.eqPlotY(norm)
+  return 1 - (KUF.eqPad + (1 - 2 * KUF.eqPad) * math.clamp(norm, 0, 1))
+end
+
+function KUF.eqTickY(gain)
+  return KUF.eqPlotY(KUF.eqNorm(gain)) * KUF.eqChartH
+end
+
+-- Y курсора на графике (доля высоты от верха) → целые дБ ±15.
+function KUF.eqGainAtY(frac)
+  local y = math.clamp(tonumber(frac) or 0.5, 0, 1)
+  local norm = math.clamp((1 - KUF.eqPad - y) / (1 - 2 * KUF.eqPad), 0, 1)
+  return math.clamp(math.floor(norm * 2 * EQ_GAIN_LIMIT + 0.5) - EQ_GAIN_LIMIT, -EQ_GAIN_LIMIT, EQ_GAIN_LIMIT)
+end
+
+-- Кривая: монотонная кубическая интерполяция (Fritsch–Carlson, он же
+-- PCHIP). Проходит ровно через десять точек и не выплёскивает волны
+-- между ними — Catmull-Rom на крутом подъёме давал бы overshoot, и
+-- ручка уезжала бы с линии. Узлы стоят в центрах десятых графика, там
+-- же, где ручки и подписи частот.
+function KUF.eqCurve(gains, count)
+  local xs, ys, d, m = {}, {}, {}, {}
+  for i = 1, count do
+    xs[i] = (i - 0.5) / count
+    ys[i] = KUF.eqNorm(gains[i])
   end
-  return table.concat(cells)
+  for i = 1, count - 1 do
+    d[i] = (ys[i + 1] - ys[i]) / (xs[i + 1] - xs[i])
+  end
+  m[1], m[count] = d[1], d[count - 1]
+  for i = 2, count - 1 do
+    m[i] = (d[i - 1] + d[i]) / 2
+  end
+  for i = 1, count - 1 do
+    if d[i] == 0 then
+      m[i], m[i + 1] = 0, 0
+    else
+      local a, b = m[i] / d[i], m[i + 1] / d[i]
+      local sum = a * a + b * b
+      if sum > 9 then
+        local k = 3 / math.sqrt(sum)
+        m[i], m[i + 1] = k * a * d[i], k * b * d[i]
+      end
+    end
+  end
+  local out = {}
+  local samples = KUF.eqSamples
+  for s = 1, samples do
+    local x = (s - 1) / (samples - 1)
+    local seg = 1
+    while seg < count - 1 and x > xs[seg + 1] do
+      seg = seg + 1
+    end
+    local h = xs[seg + 1] - xs[seg]
+    local t = math.clamp((x - xs[seg]) / h, 0, 1)
+    local t2, t3 = t * t, t * t * t
+    local y = (2 * t3 - 3 * t2 + 1) * ys[seg]
+      + (t3 - 2 * t2 + t) * h * m[seg]
+      + (-2 * t3 + 3 * t2) * ys[seg + 1]
+      + (t3 - t2) * h * m[seg + 1]
+    out[s] = math.clamp(y, 0, 1)
+  end
+  return out
+end
+
+-- Клик по ручке или подписи полосы: поставить курсор на полосу, чтобы
+-- h/l правили ту же; grab=true (ручка) ещё и берёт полосу в руку.
+function KUF.eqFocus(i, grab)
+  -- Смена полосы подтверждает предыдущую: черновик, брошенный без ухода
+  -- указателя с графика, иначе остался бы висеть в кривой до конца сессии.
+  local previous = KUF.eqGrab
+  if previous ~= nil and previous ~= i then
+    local pending = KUF.eqDraft[previous]
+    if pending ~= nil then
+      poke("eq", string.format("band:%d:%d", previous, pending))
+    end
+  end
+  if grab then
+    KUF.eqGrab = (KUF.eqGrab == i) and nil or i
+  end
+  -- Полосы идут в rows() после power и preset, поэтому +2.
+  cursor = i + 2
+  draw()
+end
+
+-- Именованные (а не замыкания) обработчики графика: имя обязано
+-- выживать перерисовку, иначе реконсилятор пересобирает поток
+-- указателя и роняет hover на каждом кадре.
+function eqGraphMove(_, y)
+  local i = KUF.eqGrab
+  if type(i) ~= "number" then
+    return
+  end
+  local gain = KUF.eqGainAtY(y)
+  if KUF.eqGain(snapshot.equalizer and snapshot.equalizer.bands, i) == gain then
+    return
+  end
+  KUF.eqDraft[i] = gain
+  draw()
+end
+
+-- Уход указателя с графика = отпускание: отправляем накопленное и
+-- снимаем захват.
+function eqGraphLeave()
+  local i = KUF.eqGrab
+  if type(i) ~= "number" then
+    return
+  end
+  KUF.eqGrab = nil
+  local gain = KUF.eqDraft[i]
+  if gain ~= nil then
+    poke("eq", string.format("band:%d:%d", i, gain))
+  end
+  draw()
 end
 
 -- Ряд полос спектра из CSV-строки ("0.12,0.87,..."). Разбираем каждый
@@ -1045,6 +1186,9 @@ local function lbl(text, props)
     height = p.height,
     maxWidth = p.maxWidth,
     maxLines = p.maxLines,
+    -- p.textAlign ("start"/"center"/"end") нужен подписям шкалы дБ и
+    -- ячейкам частот эквалайзера: ширина у них фиксированная.
+    textAlign = p.textAlign,
     opacity = p.opacity,
   })
 end
@@ -1713,6 +1857,7 @@ local function resultRow(r)
   }
   if kind == "track" then
     row.rating = ratingOf(snapshot, row.id)
+    row.time = durationLabel(r.duration)
     -- event/payload — одиночный фолбэк для activate: основной путь —
     -- контекст всей видимой выдачи через play-context (contextPayload).
     row.event = "radio"
@@ -1841,6 +1986,7 @@ function rows()
     -- способ перечитать cookies браузера без терминала: залогинился в
     -- SoundCloud — жми сюда. Сокет обрывается, watch сервиса
     -- переподключается и перечитывает состояние.
+    if not KUF.mina.active then
     table.insert(out, {
       kind = "client",
       title = "Restart tmusd",
@@ -1849,6 +1995,7 @@ function rows()
       payload = "1",
       restart = true,
     })
+    end
   elseif view == "eq" then
     -- Старый демон (без equalizer в PlayerState) не даёт строк —
     -- вью покажет заглушку «eq недоступен».
@@ -1880,6 +2027,12 @@ function rows()
 end
 
 local function windowSize()
+  if KUF.mina.active then
+    if view == "library" then return CARD_WINDOW end
+    if view == "clients" then return math.max(1, math.floor(GEO.viewH / 70)) end
+    if view == "eq" then return 12 end
+    return LIST_WINDOW
+  end
   if view == "library" then
     return CARD_WINDOW
   elseif view == "search" then
@@ -2152,6 +2305,8 @@ function activate(row, pos)
   end
   if row.open then
     openPlaylist(row)
+  elseif row.kind == "artist" then
+    submitSearch(row.rawTitle or row.title)
   elseif row.event == "radio" then
     -- Трек-строка поиска (event "radio" ставят только треки выдачи):
     -- играем контекст всей видимой выдачи в порядке rows(), старт — с
@@ -2296,6 +2451,9 @@ local function moveY(dy)
 end
 
 local function setView(id)
+  KUF.mina.menu, KUF.mina.confirm, KUF.mina.info = nil, nil, nil
+  KUF.mina.resetEq()
+  KUF.mina.seekDraft = nil
   hints:cancel()
   volumeKeys = false
   view = id
@@ -3163,48 +3321,213 @@ local function queueContextNode(s)
   return ui.column({ key = "queue-context", gap = GAP, flexGrow = 3 }, children)
 end
 
--- Строки вью eq: курсорная — подсветка selected, как в списках.
+-- Вью эквалайзера: кривая с ручками вместо списка полос. Ширина графика
+-- считается от бюджета воркспейса — у ui.graph нет собственного размера,
+-- поэтому width задаётся явно. Сетка и подписи строятся из тех же Y, что
+-- и кривая (KUF.eqTickY), поэтому шкала дБ честная.
 local function eqWorkspace(s)
   local eq = s.equalizer
   if type(eq) ~= "table" then
     return card({ lbl("eq недоступен", { key = "eq-na", color = COLORS.muted }) }, { key = "eq-card" })
   end
-  local lines = {}
-  for i, row in ipairs(rows()) do
-    local text
-    if row.kind == "eq-power" then
-      text = "[" .. row.title .. "]"
-    elseif row.kind == "eq-preset" then
-      text = "[Preset " .. row.title .. "]"
-    else
-      text = string.format("%-7s %+5.1f  %s", row.freq, row.gain, eqBar(row.gain))
+  local bands = type(eq.bands) == "table" and eq.bands or {}
+  -- Черновик снимаем, когда демон подтвердил значение: иначе кривая
+  -- отпрыгивала бы к старому снимку на каждом круге состояния.
+  for i, gain in pairs(KUF.eqDraft) do
+    if tonumber(bands[i]) == gain then
+      KUF.eqDraft[i] = nil
     end
-    local active = cursor == i
-    table.insert(lines, ui.row({
-      key = "eq-line-" .. i,
-      hintIdentity = "eq:" .. i .. ":" .. text,
-      onClick = function()
-        cursor = i
-        focusBuf = 2
-        if row.kind ~= "eq-band" then activate(row, i) end
-        draw()
-      end,
-      gap = 8,
-      paddingH = 10,
-      paddingV = 4,
-      radius = 6,
-      shape = SC and "chamfer" or nil,
-      fill = active and COLORS.selected or COLORS.surface,
-    }, {
-      lbl(text, {
-        key = "eq-text-" .. i,
-        grow = 1,
-        color = active and COLORS.text or COLORS.muted,
+  end
+  local count = #EQ_FREQ_LABELS
+  local gains = {}
+  for i = 1, count do
+    gains[i] = KUF.eqGain(bands, i)
+  end
+  local chartH, scaleW, dot = KUF.eqChartH, KUF.eqScaleW, KUF.eqDot
+  local plotW = math.max(240, (GEO.workspaceW or 700) - scaleW - 12)
+  local cellW = plotW / count
+  local focus = cursor - 2
+
+  local scale, scaleTop = {}, 0
+  for _, g in ipairs(KUF.eqTicks) do
+    local y = math.clamp(KUF.eqTickY(g), 7, chartH - 7)
+    table.insert(scale, ui.spacer({ key = "eq-scale-gap-" .. g, height = math.max(0, y - 7 - scaleTop) }))
+    table.insert(scale, ui.row({ key = "eq-scale-row-" .. g, height = 14, gap = 0, align = "center" }, {
+      lbl(g == 0 and "0" or string.format("%+d", g), {
+        key = "eq-scale-" .. g,
+        size = 10,
+        color = COLORS.muted,
         mono = true,
+        width = scaleW - 6,
+        textAlign = "end",
       }),
     }))
+    scaleTop = y + 7
   end
-  return ui.column({ key = "eq-lines", gap = 4 }, lines)
+  table.insert(scale, ui.spacer({ key = "eq-scale-tail", flexGrow = 1 }))
+
+  local grid, lineTop = {}, 0
+  for _, g in ipairs(KUF.eqTicks) do
+    local y = KUF.eqTickY(g)
+    if y > 0.5 and y < chartH - 0.5 then
+      table.insert(grid, ui.spacer({ key = "eq-grid-gap-" .. g, height = math.max(0, y - 1 - lineTop) }))
+      table.insert(grid, ui.box({ key = "eq-grid-" .. g, height = 1, fill = COLORS.border, opacity = 0.4 }))
+      lineTop = y
+    end
+  end
+
+  -- Ручки: столбец каждой полосы в строке из десяти ячеек, точка стоит
+  -- на своей кривой, потянуть её можно и вверх, и вниз.
+  local handles = {}
+  for i = 1, count do
+    local norm = KUF.eqNorm(gains[i])
+    handles[i] = ui.column({
+      key = "eq-handle-cell-" .. i,
+      width = cellW,
+      height = chartH,
+      gap = 0,
+      align = "center",
+    }, {
+      -- eqPlotY — доля высоты ОТ ВЕРХА, поэтому верхний распорок растёт
+      -- вместе с ней, а нижний — от её дополнения.
+      ui.spacer({ key = "eq-handle-top-" .. i, flexGrow = math.max(0.001, KUF.eqPlotY(norm) * chartH - dot / 2) }),
+      ui.box({
+        key = "eq-handle-" .. i,
+        width = dot,
+        height = dot,
+        radius = dot / 2,
+        fill = focus == i and COLORS.text or COLORS.accent,
+        border = COLORS.border,
+        borderWidth = 1,
+        onClick = function()
+          KUF.eqFocus(i, true)
+        end,
+        tooltip = string.format("%s · %+d дБ", EQ_FREQ_LABELS[i], math.floor(gains[i] + 0.5)),
+      }),
+      ui.spacer({
+        key = "eq-handle-bottom-" .. i,
+        flexGrow = math.max(0.001, (1 - KUF.eqPlotY(norm)) * chartH - dot / 2),
+      }),
+    })
+  end
+
+  local chips = {}
+  for i = 1, count do
+    local active = focus == i
+    chips[i] = ui.column({
+      key = "eq-band-" .. i,
+      width = cellW,
+      height = 30,
+      gap = 0,
+      align = "center",
+      onClick = function()
+        KUF.eqFocus(i, false)
+      end,
+    }, {
+      lbl(KUF.eqTickText[i] or tostring(i), {
+        key = "eq-band-freq-" .. i,
+        size = 10,
+        color = active and COLORS.accent or COLORS.muted,
+        mono = true,
+        width = cellW,
+        textAlign = "center",
+        maxLines = 1,
+      }),
+      lbl(string.format("%+d", math.floor(gains[i] + 0.5)), {
+        key = "eq-band-db-" .. i,
+        size = 10,
+        color = active and COLORS.text or COLORS.muted,
+        mono = true,
+        width = cellW,
+        textAlign = "center",
+        maxLines = 1,
+      }),
+    })
+  end
+
+  local presetAt = 0
+  for i, name in ipairs(EQ_PRESET_NAMES) do
+    if name == tostring(eq.preset or "") then
+      presetAt = i - 1
+      break
+    end
+  end
+  local readout = "клик по точке · ↑↓ мышью · h/l ±1 дБ"
+  if focus >= 1 and focus <= count then
+    readout = string.format("%s · %+d дБ · клик по точке и ↑↓ мышью", KUF.eqTickText[focus], math.floor(gains[focus] + 0.5))
+  end
+
+  local head = ui.row({ key = "eq-head", gap = 10, height = 34, align = "center" }, {
+    ui.toggle({
+      key = "eq-power",
+      checked = eq.enabled == true,
+      onChange = function(value)
+        poke("eq", value == "true" and "on" or "off")
+      end,
+    }),
+    lbl(eq.enabled == true and "Включён" or "Выключен", {
+      key = "eq-power-state",
+      size = 12,
+      color = eq.enabled == true and COLORS.text or COLORS.muted,
+    }),
+    ui.select({
+      key = "eq-preset",
+      options = EQ_PRESET_NAMES,
+      selectedIndex = presetAt,
+      width = 200,
+      onChange = function(value)
+        local name = EQ_PRESET_NAMES[(tonumber(value) or -1) + 1]
+        if name then
+          poke("eq", "preset-on:" .. name)
+        end
+      end,
+    }),
+    ui.button({
+      key = "eq-flat",
+      text = "Flat",
+      controlSize = "sm",
+      variant = "ghost",
+      onClick = function()
+        poke("eq", "flat")
+      end,
+    }),
+    lbl(readout, { key = "eq-readout", grow = 1, size = 11, color = COLORS.muted, mono = true, maxLines = 1 }),
+  })
+
+  return ui.column({ key = "eq-workspace", gap = 10 }, {
+    head,
+    ui.row({ key = "eq-chart", gap = 8, align = "start" }, {
+      ui.column({ key = "eq-scale", width = scaleW, height = chartH, gap = 0 }, scale),
+      ui.column({ key = "eq-plot-col", gap = 2 }, {
+        -- Слои стопкой внутри box: сетка, кривая, ручки. Дети ui.box
+        -- встают в 0,0 с собственным размером, поэтому порядок = z-order.
+        ui.box({
+          key = "eq-plot",
+          width = plotW,
+          height = chartH,
+          radius = 6,
+          fill = COLORS.bg,
+          border = COLORS.border,
+          borderWidth = 1,
+        }, {
+          ui.column({ key = "eq-grid", width = plotW, height = chartH, gap = 0 }, grid),
+          ui.graph({
+            key = "eq-curve",
+            width = plotW,
+            height = chartH,
+            values = KUF.eqCurve(gains, count),
+            color = COLORS.accent,
+            lineWidth = 2,
+            fillOpacity = 0.45,
+            onPointerMove = "eqGraphMove",
+            onPointerLeave = "eqGraphLeave",
+          }),
+          ui.row({ key = "eq-handles", width = plotW, height = chartH, gap = 0 }, handles),
+        }),
+        ui.row({ key = "eq-band-labels", width = plotW, height = 30, gap = 0 }, chips),
+      }),
+    }),
+  })
 end
 
 local function chipNode(kind, title)
@@ -3352,6 +3675,24 @@ local function pickerItems(s)
     end
   end
   return out
+end
+
+local function submitPlaylistPicker(ref)
+  if not plPicker then return end
+  local track=plPicker.track
+  if ref==nil then
+    plPicker=nil
+    startPlNaming(track)
+    return
+  end
+  for _,item in ipairs(pickerItems(snapshot)) do
+    if item.ref==ref then
+      if ref=="local:liked" then poke("rate","like:"..track)
+      else poke("pl","add:"..ref..":"..track) end
+      break
+    end
+  end
+  plPicker=nil
 end
 
 -- Поповер «в плейлист»: отдельного оверлей-слоя у panel.render нет,
@@ -3522,7 +3863,337 @@ local function searchTextNode()
   })
 end
 
+function KUF.minaOpenMenu(title, identity, entries)
+  endHold(); hints:cancel()
+  volumeKeys, typing = false, false
+  for _,entry in ipairs(entries) do
+    local fn=entry.fn
+    entry.fn=function() KUF.mina.menu=nil; fn(); draw() end
+  end
+  KUF.mina.menu = {title=title,identity=identity,entries=entries,cursor=1}
+  KUF.mina.confirm = nil
+  draw()
+end
+
+function KUF.minaConfirm(title, fn, valid)
+  endHold(); hints:cancel()
+  KUF.mina.menu = nil
+  KUF.mina.confirm = {title=title,fn=fn,valid=valid,apply=false}
+  draw()
+end
+
+function KUF.minaDelete(row)
+  if not row then return end
+  local event,payload,title
+  if view=="playlist" and row.kind=="track" and row.pos~=nil and playlistId~="local:liked" then
+    local prov=trackProvider(playlistId)
+    if isLocalProvider(prov) then event,payload="pl","rmat:"..playlistId..":"..row.pos
+    else
+      local caps=capsOfProvider(prov)
+      if type(caps)=="table" and caps.playlist_remove==true then
+        for _,pl in ipairs(snapshot.playlists or {}) do
+          if idOf(pl)==playlistId then event,payload="pl","rm:"..plRef(pl)..":"..row.id; break end
+        end
+      end
+    end
+    title="Убрать «"..row.title.."» из плейлиста?"
+  elseif view=="library" and row.plid and row.plid~="local:liked" then
+    local caps=capsOfProvider(row.provider)
+    if isLocalProvider(row.provider) or type(caps)=="table" and caps.playlist_delete==true then
+      event,payload,title="pl","del:"..row.plid,"Удалить плейлист «"..row.title.."»?"
+    end
+  end
+  if event then
+    local sourceTracks,sourcePlaylist=snapshot.tracks,playlistId
+    KUF.minaConfirm(title,function() poke(event,payload) end,
+      function() return snapshot.tracks==sourceTracks and playlistId==sourcePlaylist end)
+  end
+end
+
+function KUF.minaRadio(row)
+  local caps=capsOfProvider(providerByTrack(row))
+  return type(caps)=="table" and caps.radio==true
+end
+
+function KUF.minaTrackAction(action,row,index)
+  if not row then return end
+  local id=tostring(row.id or "")
+  if action=="radio" then poke("radio",id)
+  elseif action=="append" then poke("queue-append",id)
+  elseif action=="add" then endHold(); hints:cancel(); plPicker={track=id,cursor=1}; draw()
+  elseif action=="like" then poke("rate",(row.rating=="liked" and "none:" or "like:")..id)
+  elseif action=="menu" then
+    local entries={{key="play",title=row.open and "Открыть" or "Слушать",fn=function() activate(row,index) end}}
+    if row.kind=="track" then
+      table.insert(entries,{key="radio",title="Радио",enabled=KUF.minaRadio(row),fn=function() poke("radio",id) end})
+      table.insert(entries,{key="append",title="Добавить в очередь",fn=function() poke("queue-append",id) end})
+      table.insert(entries,{key="add",title="В плейлист…",fn=function() plPicker={track=id,cursor=1} end})
+      table.insert(entries,{key="like",title=row.rating=="liked" and "Убрать лайк" or "Нравится",
+        fn=function() KUF.minaTrackAction("like",row,index) end})
+      table.insert(entries,{key="dislike",title="Не нравится",fn=function() poke("rate","dislike:"..id) end})
+      table.insert(entries,{key="artist",title="Найти исполнителя",enabled=(row.subtitle or "")~="",
+        fn=function() submitSearch(type(row.artists)=="table" and row.artists[1] or row.subtitle) end})
+      table.insert(entries,{key="info",title="О треке",fn=function()
+        local track={}
+        for _,items in ipairs({snapshot.tracks or {},snapshot.queue or {},snapshot.results or {}}) do
+          for _,candidate in ipairs(items) do if idOf(candidate)==id then track=candidate; break end end
+        end
+        local provider=providerMeta[trackProvider(id)]
+        KUF.mina.info={title=row.title,lines={
+          {"Исполнитель",row.subtitle~="" and row.subtitle or "Неизвестно"},
+          {"Альбом",track.album or "Неизвестно"},
+          {"Длительность",track.duration and durationLabel(track.duration) or row.time or "Неизвестно"},
+          {"Источник",provider and provider.name or trackProvider(id)},
+          {"ID",id},
+        }}
+      end})
+    end
+    KUF.minaOpenMenu(row.title,view..":"..index..":"..id,entries)
+  end
+end
+
+function KUF.minaModalKey(chord,key)
+  local m=KUF.mina
+  if not m.active or not (m.menu or m.confirm or m.info) then return false end
+  if chord=="Escape" then m.menu,m.confirm,m.info=nil,nil,nil
+  elseif m.info then
+    if chord=="Return" then m.info=nil end
+  elseif m.confirm then
+    if chord=="Left" or key=="h" then m.confirm.apply=false
+    elseif chord=="Right" or key=="l" then m.confirm.apply=true
+    elseif chord=="Return" then local pending=m.confirm; m.confirm=nil; if pending.apply then pending.fn() end end
+  elseif key=="j" or chord=="Down" then m.menu.cursor=m.menu.cursor % #m.menu.entries+1
+  elseif key=="k" or chord=="Up" then m.menu.cursor=(m.menu.cursor-2) % #m.menu.entries+1
+  elseif chord=="Return" then
+    local entry=m.menu.entries[m.menu.cursor]
+    if entry and entry.enabled~=false then entry.fn() end
+  end
+  draw()
+  return true
+end
+
+function minaEqMove(x,y)
+  local m=KUF.mina
+  m.eqHover={index=math.clamp(math.floor((tonumber(x) or 0)*10)+1,1,10),y=tonumber(y) or .5}
+  if m.eqGrab then
+    local gain=KUF.eqGainAtY(y)
+    if m.eqDraft[m.eqGrab]~=gain then m.eqDraft[m.eqGrab]=gain; draw() end
+  end
+end
+
+function minaEqLeave()
+  local m=KUF.mina
+  local band=m.eqGrab
+  m.eqGrab,m.eqHover=nil,nil
+  if band and m.eqDraft[band]~=nil then poke("eq","band:"..band..":"..m.eqDraft[band]) end
+  if band then draw() end
+end
+
+function KUF.minaDraw()
+  local m,s=KUF.mina,snapshot
+  if m.confirm and m.confirm.valid and not m.confirm.valid() then m.confirm=nil end
+  KU,SC,KT=false,false,nil
+  COLORS.bg,COLORS.surface="#151217","#20171E"
+  COLORS.text,COLORS.muted,COLORS.accent="#E9DCCB","#BCAEAE","#D7AE91"
+  COLORS.selected,COLORS.border,COLORS.playing="#442330","#59414A","#542838"
+  local layout=m.layout(view)
+  GEO.viewH,GEO.bodyH,GEO.workspaceW=layout.height,layout.height,layout.main
+  LIST_WINDOW,QUEUE_WINDOW=layout.tracks,layout.queueRows
+  GRID_COLS=layout.columns
+  CARD_WINDOW=GRID_COLS
+  SHELF_WINDOW,HOME_CARD_WINDOW=layout.homeRows,3
+  clampQueue(s.queue or {})
+  local all=rows()
+  clampCursor(all)
+  local slice,first=visibleWindow(all)
+  local model={
+    view=view,sectionId=playlistNavigation.section(),focus=focusBuf,cursor=cursor,
+    snapshot=s,layout=layout,items=slice,first=first,total=view=="playlist" and #(s.tracks or {}) or #all,columns=GRID_COLS,
+    playlist={title=playlistTitle,id=playlistId,art=playlistArtPath},
+    naming=plNaming,name=plName,volume=volDraft or math.clamp(math.floor(tonumber(s.volume) or 0),0,100),
+    volumeKeys=volumeKeys,typing=typing,time=clock(seconds(s.position)).." / "..clock(seconds(s.duration)),
+    help=helpShown and helpNode() or nil,
+    queue={},home={},kinds={},providers={},frequencies=EQ_FREQ_LABELS,message="",error=tostring(s.error or ""),
+    queueFirst=queueWindowTop,
+    queuePage=function(direction)
+      followPlaying=false; focusBuf=3; typing=false; endHold()
+      queueCursor=math.clamp(queueCursor+direction*QUEUE_WINDOW,1,math.max(1,#(snapshot.queue or {})))
+      queueWindowTop=math.clamp(queueWindowTop+direction*QUEUE_WINDOW,1,math.max(1,#(snapshot.queue or {})-QUEUE_WINDOW+1))
+      draw()
+    end,
+    duration=seconds(s.duration),position=m.seekDraft or seconds(s.position),nowLiked=ratingOf(s,s.trackId)=="liked",
+    eqCurve=KUF.eqCurve,
+    eqFocus=function(i) cursor=i+2; focusBuf=2; m.resetEq(); draw() end,
+    eqClick=function()
+      if m.eqGrab then minaEqLeave(); return end
+      if not m.eqHover then return end
+      m.eqGrab=m.eqHover.index; cursor=m.eqGrab+2; focusBuf=2; typing=false; draw()
+    end,
+    nowLike=function() poke("rate",(ratingOf(snapshot,snapshot.trackId)=="liked" and "none:" or "like:")..tostring(snapshot.trackId)) end,
+    repeatNext=function() poke("repeat",REPEAT_CYCLE[tostring(snapshot.loop or "none")] or "none") end,
+    seekDraft=function(value) m.seekDraft=math.clamp(tonumber(value) or 0,0,seconds(s.duration)); draw() end,
+    seekCommit=function(value)
+      local position=m.seekDraft or tonumber(value) or seconds(s.position)
+      m.seekDraft=nil; poke("seek",tostring(math.clamp(position,0,seconds(s.duration)))); draw()
+    end,
+    compact=function()
+      panel.close()
+      noctalia.togglePanel("q/tmus:compact")
+    end,
+    command=poke,radio=KUF.minaRadio,auth=function(id) return providerMeta[id] end,
+    section=function(id) setView(id); focusBuf=2; draw() end,close=function() panel.close() end,
+    back=function() playlistNavigation.back(); draw() end,
+    select=function(i) cursor=i; focusBuf=2; typing=false; endHold(); draw() end,
+    activate=function(row,i) cursor=i; focusBuf=2; activate(row,i); draw() end,
+    trackAction=KUF.minaTrackAction,
+    redraw=draw,
+    toggleBuffer=function() typing=false; focusBuf=focusBuf==3 and 2 or 3; endHold(); draw() end,
+    cancel=function() m.confirm,m.info=nil,nil; draw() end,
+    confirm=function() local pending=m.confirm; m.confirm=nil; if pending then pending.fn() end; draw() end,
+    volumeFocus=function() hints:cancel(); typing=false; volumeKeys=true; endHold(); draw() end,
+    volumeDraft=function(v) volDraft=math.clamp(math.floor(tonumber(v) or 0),0,100); draw() end,
+    volumeCommit=function(v)
+      local value=volDraft or math.clamp(math.floor(tonumber(v) or tonumber(s.volume) or 0),0,100)
+      volDraft=nil; poke("vol-set",tostring(value)); draw()
+    end,
+    searchText=(query~="" or typing) and searchTextNode() or lbl("Поиск музыки",{key="mina-search-placeholder",grow=1}),
+    searchFocus=function() focusBuf=2; typing=true; volumeKeys=false; endHold(); draw() end,
+    searchSubmit=function() if noctalia.string.trim(query)~="" then doSearch(); typing=false; draw() end end,
+    playPlaylist=function() if playlistId~="" then poke("play-playlist",playlistId) end end,
+    presets=function()
+      local entries={}
+      for _,name in ipairs(EQ_PRESET_NAMES) do
+        table.insert(entries,{key="preset-"..tostring(#entries+1),title=name,fn=function() poke("eq","preset-on:"..name) end})
+      end
+      KUF.minaOpenMenu("Пресеты","eq-presets",entries)
+    end,
+    modes=function()
+      KUF.minaOpenMenu("Режимы очереди","queue-modes",{
+        {key="shuffle",title=s.shuffle and "Перемешивание ✓" or "Перемешивание",fn=function() poke("shuffle","toggle") end},
+        {key="repeat",title="Повтор · "..tostring(s.loop or "none"),fn=function() poke("repeat",REPEAT_CYCLE[tostring(s.loop or "none")] or "none") end},
+      })
+    end,
+    nowActions=function()
+      KUF.minaTrackAction("menu",{id=tostring(s.trackId or ""),kind="track",title=s.title,subtitle=s.artist,artists=s.artists,
+        event="play",payload=tostring(s.trackId or ""),rating=ratingOf(s,s.trackId)},0)
+    end,
+  }
+  if plPicker then
+    local choices=pickerItems(s)
+    plPicker.cursor=math.clamp(plPicker.cursor,1,#choices)
+    model.picker={cursor=plPicker.cursor,entries={}}
+    for i,item in ipairs(choices) do
+      local ref=item.ref
+      table.insert(model.picker.entries,{title=ref and item.title or "Новый плейлист…",fn=function() submitPlaylistPicker(ref); draw() end})
+    end
+  end
+  for _,entry in ipairs(SEARCH_KINDS) do
+    table.insert(model.kinds,{id=entry.id,title=({all="Все",track="Треки",artist="Исполнители",playlist="Плейлисты"})[entry.id] or entry.title,active=searchKind==entry.id,fn=function()
+      searchKind=entry.id; rowsCache=nil; cursor=1; windowTop=1; draw()
+    end})
+  end
+  table.insert(model.providers,{id="all",title="Все",active=searchProvider=="all",fn=function() searchProvider="all"; rowsCache=nil; cursor=1; windowTop=1; draw() end})
+  for _,p in ipairs(s.providers or {}) do
+    table.insert(model.providers,{id=p.id,title=p.name,active=searchProvider==p.id,fn=function() searchProvider=p.id; rowsCache=nil; cursor=1; windowTop=1; draw() end})
+  end
+  model.provider=function(row)
+    for _,p in ipairs(s.providers or {}) do if p.id==providerByTrack(row) then return p.name end end
+    return providerByTrack(row)
+  end
+  model.viewActionTitle,model.viewAction="Обновить",function() poke("home-refresh") end
+  if view=="library" then model.viewActionTitle,model.viewAction="Новый плейлист",function() startPlNaming(nil); draw() end
+  elseif view=="playlist" then model.viewActionTitle,model.viewAction="Плейлист…",function()
+    local target=all[cursor]
+    local caps=capsOfProvider(trackProvider(playlistId))
+    KUF.minaOpenMenu(playlistTitle,"playlist:"..playlistId,{
+      {key="refresh",title="Обновить треки",enabled=not s.tracksLoading,fn=function() poke("tracks-refresh",playlistId) end},
+      {key="remove",title="Убрать выбранный трек…",
+        enabled=target~=nil and target.kind=="track" and playlistId~="local:liked"
+          and (isLocalProvider(trackProvider(playlistId)) or type(caps)=="table" and caps.playlist_remove==true),
+        fn=function() if snapshot.tracks==s.tracks then KUF.minaDelete(target) end end},
+    })
+  end
+  elseif view=="clients" then model.viewActionTitle,model.viewAction="Сервис…",function()
+    KUF.minaOpenMenu("Сервис tmusd","service",{
+      {key="refresh",title="Обновить состояние",fn=function() poke("refresh") end},
+      {key="reconnect",title="Переподключить панель",fn=function() poke("reconnect") end},
+      {key="tui",title="Открыть TUI",fn=function() poke("tui"); panel.close() end},
+      {key="restart",title="Перезапустить tmusd…",fn=function()
+        KUF.minaConfirm("Перезапустить tmusd? Воспроизведение прервётся.",function() poke("restart-daemon") end)
+      end},
+    })
+  end
+  elseif view=="eq" then model.viewActionTitle,model.viewAction="Пресеты…",model.presets end
+  if view=="library" then
+    local collection=all[cursor]
+    model.preview={}
+    model.previewId=collection and collection.open
+    model.previewTitle=collection and collection.title or "Треки в коллекции"
+    model.openCollection=function() if collection then activate(collection,cursor); draw() end end
+    if collection then
+      if m.requestedCollection~=collection.open and s.linked then
+        m.requestedCollection=collection.open
+        poke("tracks",collection.open)
+      end
+      if tostring(s.tracksId or "")~=collection.open or s.tracksLoading then
+        model.previewMessage="Загрузка треков…"
+      elseif s.tracksError and s.tracksError~="" then model.previewMessage=tostring(s.tracksError)
+      else
+        for i=1,math.min(#(s.tracks or {}),layout.tracks) do
+          local track=s.tracks[i]
+          local id=idOf(track)
+          table.insert(model.preview,{id=id,title=track.title or "",art=track.art_path,kind="track",
+            subtitle=type(track.artists)=="table" and table.concat(track.artists,", ") or "",artists=track.artists,
+            time=durationLabel(track.duration),rating=ratingOf(s,id),event="play-playlist",payload=collection.open.."|"..id})
+        end
+        if #model.preview==0 then model.previewMessage="В коллекции пока нет треков" end
+      end
+    end
+  end
+  if not s.linked then model.message="tmusd не отвечает. Откройте «Источники → Сервис…»."
+  elseif view=="playlist" then
+    model.error=tostring(s.tracksError or "")
+    if tostring(s.tracksId or "")~=playlistId then model.message="Загрузка плейлиста…"
+    elseif #all==0 then model.message="В плейлисте пока нет треков" end
+  elseif view=="search" and #all==0 then model.message=searching and "Ищем…" or query=="" and "Введите запрос и нажмите Enter" or "Ничего не найдено"
+  elseif view=="library" and #all==0 then model.message="Плейлистов пока нет" end
+  clampHomeCursor()
+  for i=homeTop,math.min(#homeShelves(),homeTop+SHELF_WINDOW-1) do
+    local shelf=homeShelves()[i]
+    local entry={index=i,title=shelf.title,cards={}}
+    local left=homeLeft[i] or 1
+    for j=left,math.min(#shelf.cards,left+HOME_CARD_WINDOW-1) do
+      local row=shelf.cards[j]
+      table.insert(entry.cards,{index=j,row=row,chosen=i==homeShelf and j==homeItem,
+        select=function() homeShelf=i; homeItem=j; focusBuf=2; draw() end,
+        activate=function() homeShelf=i; homeItem=j; focusBuf=2; homeActivate(); draw() end})
+    end
+    table.insert(model.home,entry)
+  end
+  model.homeMessage=(homeFeed==nil or homeFeed.status=="loading") and "Загрузка рекомендаций…"
+    or homeFeed.status=="error" and tostring(homeFeed.error or "Рекомендации недоступны") or "Рекомендаций пока нет"
+  for i=queueWindowTop,math.min(#(s.queue or {}),queueWindowTop+QUEUE_WINDOW-1) do
+    local track=queueOrder.track(s,i)
+    if track then
+      local canonical=queueOrder.index(s,i)
+      table.insert(model.queue,{index=i,id=idOf(track),row=track,artist=type(track.artists)=="table" and table.concat(track.artists,", ") or "",
+        playing=canonical==tonumber(s.queueIndex),chosen=i==queueCursor,
+        select=function() queueCursor=i; followPlaying=false; focusBuf=3; typing=false; draw() end,
+        play=function() poke("queue-goto",tostring(canonical)); followPlaying=true end})
+    end
+  end
+  renderPanel(m.render(model))
+  panel.setCaptureCancel(hints:isActive() or hints:isStale() or m.menu~=nil or m.confirm~=nil or m.info~=nil or plNaming or plPicker~=nil or helpShown or typing or volumeKeys)
+end
+
+function onPanelGeometry(width,height)
+  KUF.mina.width,KUF.mina.height=math.max(1,width),math.max(1,height)
+  draw()
+end
+
 function draw()
+  KUF.mina.active=KUF.mina.enabled()
+  if KUF.mina.active then KUF.minaDraw(); return end
   -- Одно чтение рецепта на кадр. Семьи взаимоисключающи: Kumihimo
   -- проверяем первым, иначе stagecraft(). Токены — тоже на кадр, чтобы
   -- смена рецепта подхватывалась на ближайшем рендере. Бюджеты окон
@@ -3890,6 +4561,7 @@ local function handleViewKeys(key)
     -- round-trip состояния.
     local row = rows()[cursor]
     if row and row.kind == "eq-band" then
+      KUF.mina.resetEq()
       local gain = math.max(-EQ_GAIN_LIMIT, math.min(EQ_GAIN_LIMIT, row.gain + (key == "l" and 1 or -1)))
       poke("eq", string.format("band:%d:%g", row.index, gain))
     elseif row and row.kind == "eq-preset" then
@@ -4096,6 +4768,7 @@ function onKey(chord, pressed)
     draw()
     return
   end
+  if KUF.minaModalKey(chord,key) then return end
   if volumeKeys then
     if through then
       volumeKeys = false
@@ -4166,25 +4839,8 @@ function onKey(chord, pressed)
     if chord == "Escape" then
       plPicker = nil
     elseif chord == "Return" then
-      if plPicker.cursor == 1 then
-        -- «+ New playlist…»: плейлист создаётся ЛОКАЛЬНЫМ (сервис
-        -- шлёт `pl new <title>` без --provider), трек добавляется в
-        -- цепочке там же — id знает только сервис.
-        local track = plPicker.track
-        plPicker = nil
-        startPlNaming(track)
-      else
-        local item = items[plPicker.cursor]
-        if item and item.ref then
-          if item.ref == "local:liked" then
-            -- Виртуальный плейлист меняется через оценку трека.
-            poke("rate", "like:" .. plPicker.track)
-          else
-            poke("pl", "add:" .. item.ref .. ":" .. plPicker.track)
-          end
-        end
-        plPicker = nil
-      end
+      local item=items[plPicker.cursor]
+      if item then submitPlaylistPicker(item.ref) end
     elseif key == "j" or chord == "Down" then
       plPicker.cursor = plPicker.cursor % count + 1
     elseif key == "k" or chord == "Up" then
@@ -4611,6 +5267,16 @@ function onKey(chord, pressed)
   draw()
 end
 
+local function refreshHome(state)
+  homeFeed = type(state) == "table" and state or nil
+  rebuildHomeShelves()
+  if view == "home" then
+    clampHomeCursor()
+    maybeHomeMore()
+  end
+  draw()
+end
+
 local function refresh(state)
   snapshot = state or {}
   if lastSearchSerial == nil or snapshot.searchSerial ~= lastSearchSerial then
@@ -4631,6 +5297,12 @@ end
 -- действие»).
 local function clearTransient()
   hints:reset()
+  KUF.mina.menu, KUF.mina.confirm, KUF.mina.info = nil, nil, nil
+  KUF.mina.resetEq()
+  KUF.mina.seekDraft = nil
+  -- Захват полосы пережил бы закрытие панели: следующий открытый вид
+  -- начал бы менять эквалайзер на первом же движении мыши.
+  KUF.eqGrab, KUF.eqDraft = nil, {}
   panel.setCaptureCancel(false)
   volumeKeys = false
   plPicker = nil
@@ -4652,6 +5324,7 @@ function onOpen()
   queueWindowTop = 1
   followPlaying = true
   poke("refresh")
+  refreshHome(noctalia.state.get("tmus.home"))
   refresh(noctalia.state.get(KEY))
 end
 
@@ -4711,19 +5384,6 @@ noctalia.state.watch("tmus.spectrum", function(v)
   spectrum = (type(v) == "string" and v ~= "") and v or nil
   draw()
 end)
--- Home-лента рекомендаций: лёгкий ключ "tmus.home" (сервис публикует
--- status + полки; art_path декорирован у первых 14 карточек полки).
--- Рендер-модель полок перевычисляется ТОЛЬКО здесь — draw до 8 Гц
--- перебирать полки не должен. Сервис обязан быть обработчиком
--- onUpdateState: обновляем кэш и перерисовываем.
-noctalia.state.watch("tmus.home", function(v)
-  homeFeed = type(v) == "table" and v or nil
-  rebuildHomeShelves()
-  if view == "home" then
-    clampHomeCursor()
-    -- Лента догрузилась до конца окна при открытом home: если хвост
-    -- уже на экране — запросить продолжение сразу, не дожидаясь хода.
-    maybeHomeMore()
-  end
-  draw()
-end)
+-- Watches report changes only; also consume the feed published before this panel existed.
+noctalia.state.watch("tmus.home", refreshHome)
+refreshHome(noctalia.state.get("tmus.home"))
