@@ -38,7 +38,7 @@ local M = {}
 --: Толщина рейки blossom-рамки и размер угла, логические px.
 M.EDGE = 12
 --: Шрифт текста, подписей и метрик.
-M.FONT = "Noto Sans"
+M.FONT = "ComicShannsMono Nerd Font"
 --: Nerd-Font — только для глифов и числовых меток.
 M.MONO = "Agave Nerd Font"
 

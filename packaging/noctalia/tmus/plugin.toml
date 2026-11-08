@@ -1,6 +1,6 @@
 id = "q/tmus"
 name = "Музыка"
-version = "0.6.5"
+version = "0.6.7"
 # 32 = текущая версия хоста (kCurrentPluginApiVersion). Требуется не вообще
 # «32», а конкретные возможности, взятые по минимуму:
 #   22 — локальный require общего модуля ./desktop_skin.luau (kModuleRequire);
@@ -44,8 +44,11 @@ entry = "panel.luau"
 # Размер — ВХОД для бюджетов panel.luau: PANEL_W/PANEL_H там повторяют
 # эти числа, из них выводятся окна списка/сетки/очереди (за вычетом
 # рамки скина). Меняешь размер — правишь и константы панели.
-width = 1180
+width = 1120
 height = 760
+decoration = false
+placement = "attached"
+open_near_click = false
 # Захват расширен до полного алфавита: пока панель открыта, она модальна
 # по клавиатуре, а поисковый ввод ведётся самим плагином (см. TEXT_CHARS
 # в panel.luau) — захваченный Enter до ui.input не доходит, и родной
@@ -112,6 +115,18 @@ capture_keys = [
   "Shift+Cyrillic_HARDSIGN", "Shift+Cyrillic_YERU", "Shift+Cyrillic_SOFTSIGN",
   "Shift+Cyrillic_E", "Shift+Cyrillic_YU", "Shift+Cyrillic_YA",
 ]
+
+[[panel]]
+id = "compact"
+entry = "compact.luau"
+width = 360
+height = 200
+decoration = false
+placement = "floating"
+position = "bottom_right"
+persistent = true
+keyboard_focus = "none"
+dismiss_on_outside_click = false
 
 [[service]]
 id = "watch"

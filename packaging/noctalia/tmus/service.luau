@@ -943,6 +943,10 @@ function onIpc(event, payload)
     -- Ползунок панели шлёт абсолютное значение ("70"); tmus vol
     -- принимает и его.
     poke({ "vol", tostring(payload) })
+  elseif event == "seek" and payload then
+    poke({ "seek", tostring(payload) })
+  elseif event == "queue-append" and payload then
+    poke({ "queue-append", tostring(payload) })
   elseif event == "play" and payload then
     poke({ "play", payload })
   elseif event == "play-context" and payload then
