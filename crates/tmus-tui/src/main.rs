@@ -133,6 +133,8 @@ enum CliCmd {
     Radio { track: String },
     /// Перейти к треку очереди по индексу (0-базный) и играть.
     QueueGoto { index: usize },
+    /// Дописать треки в очередь без замены контекста и запуска.
+    QueueAppend { tracks: String },
     Loop {
         mode: String,
     },
@@ -381,6 +383,7 @@ async fn main() -> Result<()> {
             }
         },
         CliCmd::Queue { json } => return print_payload(client.call(Cmd::Queue).await?, json),
+        CliCmd::QueueAppend { tracks } => parse_queue_append(&tracks)?,
         CliCmd::QueueGoto { index } => {
             return print_payload(client.call(Cmd::QueueGoto { index }).await?, false)
         }
@@ -736,6 +739,11 @@ pub fn parse_track_id(s: &str) -> Result<TrackId> {
     Ok(TrackId::new(provider, id))
 }
 
+fn parse_queue_append(tracks: &str) -> Result<Cmd> {
+    let tracks = tracks.split(',').map(|id| parse_track_id(id.trim())).collect::<Result<Vec<_>>>()?;
+    Ok(Cmd::QueueAppend { tracks })
+}
+
 pub fn parse_playlist_id(s: &str) -> Result<PlaylistId> {
     let (provider, id) = split_provider(s)?;
     Ok(PlaylistId::new(provider, id))
@@ -998,6 +1006,28 @@ mod tests {
             _ => panic!("ожидалась подкоманда queue-goto"),
         }
         assert!(Cli::try_parse_from(["tmus", "queue-goto", "x"]).is_err());
+    }
+
+    #[test]
+    fn queue_append_accepts_mixed_tracks_without_a_playback_request() {
+        let parsed = Cli::try_parse_from([
+            "tmus",
+            "queue-append",
+            "ytmusic:first,soundcloud:second,ytmusic:first",
+        ]).expect("queue append command");
+        let Some(CliCmd::QueueAppend { tracks }) = parsed.cmd else {
+            panic!("expected queue append");
+        };
+        let Cmd::QueueAppend { tracks } = parse_queue_append(&tracks).expect("valid tracks") else {
+            panic!("append must not replace or play the queue");
+        };
+        assert_eq!(tracks.len(), 3);
+        assert_eq!(tracks[0], tracks[2]);
+        assert_eq!(tracks[1].provider, ProviderId::SOUNDCLOUD);
+        for invalid in ["", "ytmusic:first,", "nosuch:track"] {
+            assert!(parse_queue_append(invalid).is_err(), "{invalid}");
+        }
+        assert!(Cli::try_parse_from(["tmus", "queue-append"]).is_err());
     }
 
     #[test]
