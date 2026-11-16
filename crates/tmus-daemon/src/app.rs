@@ -759,6 +759,8 @@ mod tests {
     /// сетевой сбой с откатом.
     struct FakeProvider {
         id: ProviderId,
+        auth: std::sync::Mutex<AuthStatus>,
+        refresh_auth: std::sync::Mutex<AuthStatus>,
         audio: PathBuf,
         fail_rate: AtomicBool,
         /// Сбой плейлистных операций: отдельный флаг, чтобы не
@@ -801,10 +803,12 @@ mod tests {
             "Фейк"
         }
         fn auth(&self) -> AuthStatus {
-            AuthStatus::Ready
+            self.auth.lock().expect("auth").clone()
         }
         async fn refresh(&self) -> Result<AuthStatus, ProviderError> {
-            Ok(AuthStatus::Ready)
+            let auth = self.refresh_auth.lock().expect("refresh auth").clone();
+            *self.auth.lock().expect("auth") = auth.clone();
+            Ok(auth)
         }
     }
 
@@ -1015,6 +1019,8 @@ mod tests {
         let provider = Arc::new(FakeProvider {
             id: ProviderId::YTMUSIC,
             audio,
+            auth: std::sync::Mutex::new(AuthStatus::Ready),
+            refresh_auth: std::sync::Mutex::new(AuthStatus::Ready),
             fail_rate: AtomicBool::new(fail_rate),
             fail_playlist: AtomicBool::new(fail_playlist),
             playlist_calls: std::sync::Mutex::new(Vec::new()),
@@ -1046,6 +1052,8 @@ mod tests {
         let soundcloud = Arc::new(FakeProvider {
             id: ProviderId::SOUNDCLOUD,
             audio: youtube.audio.clone(),
+            auth: std::sync::Mutex::new(AuthStatus::Ready),
+            refresh_auth: std::sync::Mutex::new(AuthStatus::Ready),
             fail_rate: AtomicBool::new(false),
             fail_playlist: AtomicBool::new(false),
             playlist_calls: std::sync::Mutex::new(Vec::new()),
@@ -1088,6 +1096,30 @@ mod tests {
             ("ytmusic".into(), AuthStatus::Ready),
             ("ytmusic".into(), expired),
         ]);
+        app.player.mpv().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn auth_error_does_not_broadcast_expired_before_successful_reauth() {
+        let (app, fake, _dir) = app_full(false, false).await;
+        let expired = AuthStatus::Expired { hint: "Sign in again".into() };
+        *fake.auth.lock().expect("auth") = expired;
+        *fake.refresh_auth.lock().expect("refresh auth") = AuthStatus::Ready;
+        let provider = app.registry.get(ProviderId::YTMUSIC).expect("provider").clone();
+        let mut events = app.subscribe();
+        let error = ProviderError::Auth {
+            provider: ProviderId::YTMUSIC,
+            reason: "temporary rejection".into(),
+        };
+
+        app.report_auth_after_reauth(&provider, &error).await;
+
+        assert!(matches!(
+            events.try_recv().expect("ready event"),
+            Event::AuthChanged { provider, auth: AuthStatus::Ready }
+                if provider == "ytmusic"
+        ));
+        assert!(events.try_recv().is_err(), "stale Expired event was broadcast");
         app.player.mpv().shutdown().await;
     }
 
@@ -1209,6 +1241,8 @@ mod tests {
         let soundcloud = Arc::new(FakeProvider {
             id: ProviderId::SOUNDCLOUD,
             audio: youtube.audio.clone(),
+            auth: std::sync::Mutex::new(AuthStatus::Ready),
+            refresh_auth: std::sync::Mutex::new(AuthStatus::Ready),
             fail_rate: AtomicBool::new(false),
             fail_playlist: AtomicBool::new(false),
             playlist_calls: std::sync::Mutex::new(Vec::new()),

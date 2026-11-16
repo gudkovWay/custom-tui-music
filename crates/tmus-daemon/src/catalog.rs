@@ -233,10 +233,7 @@ impl App {
                 Ok(found) => out.extend(found),
                 Err(err) => {
                     tracing::warn!(provider = %target.id(), %err, "поиск не удался");
-                    self.report_auth(target, &err);
-                    if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
-                        self.try_reauth(target).await;
-                    }
+                    self.report_auth_after_reauth(target, &err).await;
                 }
             }
         }
@@ -270,10 +267,7 @@ impl App {
                 Ok(found) => remote.extend(found),
                 Err(err) => {
                     tracing::warn!(provider = %target.id(), %err, "библиотека не прочиталась");
-                    self.report_auth(target, &err);
-                    if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
-                        self.try_reauth(target).await;
-                    }
+                    self.report_auth_after_reauth(target, &err).await;
                 }
             }
         }
@@ -369,10 +363,7 @@ impl App {
             }
             Some(err) => {
                 tracing::warn!(playlist = %id, %err, "плейлист не прочитался");
-                self.report_auth(provider, &err);
-                if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
-                    self.try_reauth(provider).await;
-                }
+                self.report_auth_after_reauth(provider, &err).await;
                 if refresh {
                     return Err(err.into());
                 }
@@ -508,10 +499,7 @@ impl App {
                     tracing::warn!(
                         provider = %target.id(), %err, "страница лайков не прочиталась"
                     );
-                    self.report_auth(target, &err);
-                    if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
-                        self.try_reauth(target).await;
-                    }
+                    self.report_auth_after_reauth(target, &err).await;
                     let (cached, previous) = self.with_cache(|c| -> anyhow::Result<_> {
                         Ok((
                             c.playlist_tracks(liked)?,
@@ -608,10 +596,7 @@ impl App {
                     tracing::warn!(
                         provider = %target.id(), %err, "страница лайков не прочиталась"
                     );
-                    self.report_auth(target, &err);
-                    if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
-                        self.try_reauth(target).await;
-                    }
+                    self.report_auth_after_reauth(target, &err).await;
                 }
             }
         }
@@ -657,10 +642,7 @@ impl App {
                 Ok(found) => out.extend(found),
                 Err(err) => {
                     tracing::warn!(provider = %target.id(), %err, "лайки не прочитались");
-                    self.report_auth(target, &err);
-                    if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
-                        self.try_reauth(target).await;
-                    }
+                    self.report_auth_after_reauth(target, &err).await;
                 }
             }
         }
@@ -698,10 +680,7 @@ impl App {
                 }
                 Err(err) => {
                     tracing::warn!(provider = %target.id(), %err, "лайки не прочитались");
-                    self.report_auth(target, &err);
-                    if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
-                        self.try_reauth(target).await;
-                    }
+                    self.report_auth_after_reauth(target, &err).await;
                 }
             }
         }
@@ -772,10 +751,7 @@ impl App {
                 Err(err) => {
                     tracing::warn!(provider = %id, %err, "домашняя лента не прочиталась");
                     let target = self.targets(Some(&id))?.remove(0);
-                    self.report_auth(target, &err);
-                    if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
-                        self.try_reauth(target).await;
-                    }
+                    self.report_auth_after_reauth(target, &err).await;
                     // Без stale-фолбэка: ошибки уходят клиенту целиком.
                     return Err(err.into());
                 }
@@ -839,10 +815,7 @@ impl App {
                 // остаются как были, повторный home_more с тем же hN
                 // валиден. Списывание — только на успехе, ниже.
                 tracing::warn!(provider = %target.id(), %err, "продолжение домашней ленты не прочиталось");
-                self.report_auth(target, &err);
-                if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
-                    self.try_reauth(target).await;
-                }
+                self.report_auth_after_reauth(target, &err).await;
                 return Err(err.into());
             }
         };
@@ -935,10 +908,7 @@ impl App {
                 }
                 // Повторять курсор нечего: это была первая страница.
                 tracing::warn!(provider = %provider.id(), %err, "радио не запустилось");
-                self.report_auth(provider, &err);
-                if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
-                    self.try_reauth(provider).await;
-                }
+                self.report_auth_after_reauth(provider, &err).await;
                 return Err(err.into());
             }
         };
@@ -1058,10 +1028,7 @@ impl App {
                 // Ограниченный сбой: курсор не повторяем, автодополнение
                 // честно останавливается. Очередь продолжает играть.
                 tracing::warn!(provider = %provider_name, %err, "догрузка радио не удалась — автодополнение остановлено");
-                self.report_auth(provider, &err);
-                if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
-                    self.try_reauth(provider).await;
-                }
+                self.report_auth_after_reauth(provider, &err).await;
                 let mut radio = self.radio.lock().await;
                 if let Some(session) = radio.as_mut().filter(|s| s.generation == generation) {
                     session.exhausted = true;
@@ -1237,10 +1204,7 @@ impl App {
             }
             Err(err) => {
                 tracing::warn!(provider = %provider.id(), %err, "зеркало оценки не прошло; локальная отметка сохранена");
-                self.report_auth(provider, &err);
-                if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
-                    self.try_reauth(provider).await;
-                }
+                self.report_auth_after_reauth(provider, &err).await;
                 Err(err.into())
             }
         }
@@ -1272,10 +1236,7 @@ impl App {
         err: tmus_provider::ProviderError,
     ) -> anyhow::Error {
         tracing::warn!(provider = %provider.id(), %err, "плейлистная операция не принята");
-        self.report_auth(provider, &err);
-        if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
-            self.try_reauth(provider).await;
-        }
+        self.report_auth_after_reauth(provider, &err).await;
         err.into()
     }
 
@@ -1466,30 +1427,52 @@ impl App {
         }
     }
 
+    /// Сначала проверяем, не восстановились ли cookies сами. Иначе
+    /// краткий отказ `browse` успевает показать ложное «сессия отвергнута»,
+    /// хотя следующий запрос уже подтвердил живую сессию.
+    pub(crate) async fn report_auth_after_reauth(
+        &self,
+        provider: &Arc<dyn tmus_provider::Provider>,
+        err: &tmus_provider::ProviderError,
+    ) {
+        if matches!(err, tmus_provider::ProviderError::Auth { .. }) {
+            if !self.try_reauth(provider).await {
+                self.report_auth(provider, err);
+            }
+        } else {
+            self.report_auth(provider, err);
+        }
+    }
+
     /// Раз в `REAUTH_COOLDOWN` на провайдера: перечитать cookies
     /// браузера и проверить сессию. Человек мог перезалогиниться ещё до
     /// того, как демон заметил протухание — молчать об этом значило бы
     /// требовать рестарт демона.
-    async fn try_reauth(&self, provider: &Arc<dyn tmus_provider::Provider>) {
+    async fn try_reauth(&self, provider: &Arc<dyn tmus_provider::Provider>) -> bool {
         let id = provider.id().as_str().to_owned();
         // Кулдаун под замком: вторая параллельная auth-ошибка того же
         // провайдера не должна вторгаться в профиль браузера следом.
         {
             let mut retries = self.auth_retry.lock().expect("замок auth_retry");
             if retries.get(&id).is_some_and(|at| at.elapsed() < REAUTH_COOLDOWN) {
-                return;
+                return false;
             }
             retries.insert(id.clone(), Instant::now());
         }
         // refresh ходит в сеть до 30 с; клиент ждёт ответ, поэтому дольше
         // 10 с ждать бессмысленно — отдаём управление, а не блокируемся.
         match tokio::time::timeout(Duration::from_secs(10), provider.account().refresh()).await {
-            Ok(Ok(auth)) => self.emit(Event::AuthChanged { provider: id, auth }),
+            Ok(Ok(auth)) => {
+                self.emit(Event::AuthChanged { provider: id, auth });
+                true
+            }
             Ok(Err(err)) => {
                 tracing::debug!(provider = %id, %err, "перечитывание сессии не удалось");
+                false
             }
             Err(_) => {
                 tracing::debug!(provider = %id, "перечитывание сессии превысило 10 с");
+                false
             }
         }
     }
